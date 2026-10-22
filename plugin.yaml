@@ -1,0 +1,13 @@
+name: call-cli
+version: 0.2.3
+description: Personal ACPX task bridge using native Hermes background notifications.
+author: AlexCai and Hermes
+license: MIT
+manifest_version: 2
+provides_tools:
+  - call_cli
+config_schema:
+  enabled:
+    type: bool
+    default: false
+    description: Enable this profile's call_cli tool. Does not start background work at load time.
