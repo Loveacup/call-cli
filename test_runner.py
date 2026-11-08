@@ -81,7 +81,8 @@ if 'BLOCK' in text:
     raise SystemExit(255 if mode == 'exit255' else 0)
 if 'EMPTY' in text:raise SystemExit(0)
 answer='CALLCLI_QUESTION Which format?\n' if 'ASK' in text else 'CALLCLI_STAGE ready\nFAKE_ANSWER\n'
-for chunk in [answer[:8],answer[8:]]:
+chunks=json.loads(os.environ['ACPX_FAKE_CHUNKS']) if os.environ.get('ACPX_FAKE_CHUNKS') else [answer[:8],answer[8:]]
+for chunk in chunks:
     output({'params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':chunk}}}})
 output({'result':{'stopReason':'end_turn'}})
 ''')
@@ -178,6 +179,77 @@ output({'result':{'stopReason':'end_turn'}})
         calls=[__import__('json').loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
         self.assertEqual(sum('new' in c for c in calls),1)
         self.assertEqual(sum('prompt' in c for c in calls),2)
+
+    # Exact AGY wire chunk observed in real failed turns (prompt result was end_turn).
+    AGY_FATAL = '\n\u26a0 Agent execution terminated due to error.\n'
+
+    def run_agy(self, chunks, agent='agy'):
+        import json, os
+        from unittest.mock import patch
+        from runner import run_task
+        t = self.store.create(self.origin, 'local', agent, str(self.root), 'normal task', False)
+        t = self.store.update(t['id'], shell='posix', timeout=30)
+        with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS': json.dumps(chunks)}):
+            rc = run_task(self.store.path, t['id'])
+        return rc, self.store.get(t['id']), self.store.events(t['id'], self.origin)
+
+    def assert_agy_fatal_not_completed(self, chunks):
+        from runner import run_task
+        rc, state, events = self.run_agy(chunks)
+        self.assertEqual(rc, 1)
+        self.assertEqual(state['state'], 'unknown')
+        # Protocol ended normally; business outcome is explicitly not accepted.
+        self.assertEqual(state['stop_reason'], 'end_turn')
+        self.assertEqual(state['exit_code'], 0)
+        self.assertIn('AGY reported a fatal execution error', state['settlement_note'])
+        final = events[-1]
+        self.assertEqual(final['kind'], 'unknown')
+        self.assertIn('not completed', final['text'])
+        self.assertIn('no automatic replay', final['text'])
+        self.assertNotIn('completed', [e['kind'] for e in events])
+        # Not replayable: the settled turn cannot be claimed again.
+        before = (self.root / 'calls.jsonl').read_text()
+        with self.assertRaises(ValueError):
+            run_task(self.store.path, state['id'])
+        self.assertEqual((self.root / 'calls.jsonl').read_text(), before)
+        # Unknown fate refuses same-session continuation but still allows owned close.
+        with self.assertRaises(ValueError):
+            self.store.intervene(state['id'], self.origin, 'retry it', 'cmd-1')
+        with self.assertRaises(ValueError):
+            self.store.reply(state['id'], self.origin, state.get('question_id', ''), 'answer')
+        self.assertEqual(self.store.begin_close(state['id'], self.origin)['state'], 'closing')
+        return state, events
+
+    def test_agy_fatal_error_message_is_not_completed(self):
+        self.assert_agy_fatal_not_completed([self.AGY_FATAL])
+
+    def test_agy_fatal_error_split_across_chunks_is_not_completed(self):
+        self.assert_agy_fatal_not_completed(['\n\u26a0 Agent exec', 'ution terminated due', ' to error.', '\n'])
+
+    def test_agy_fatal_error_after_partial_output_is_not_completed(self):
+        self.assert_agy_fatal_not_completed(['CALLCLI_STAGE editing\npartial result', self.AGY_FATAL])
+
+    def test_agy_fatal_error_after_question_is_not_waiting_reply(self):
+        state, _ = self.assert_agy_fatal_not_completed(['CALLCLI_QUESTION Which format?\n', self.AGY_FATAL])
+        self.assertNotEqual(state['state'], 'waiting_reply')
+
+    def test_agy_normal_and_similar_text_still_complete(self):
+        cases = [
+            ['CALLCLI_STAGE ready\n', 'FAKE_ANSWER\n'],
+            ['The old log showed "\u26a0 Agent execution terminated due to error." and is fixed.\n'],
+            ['\u26a0 Agent execution terminated due to error.\n', 'Recovered after rerun of tests; DONE\n'],
+            ['\u26a0 Agent execution terminated due to error. Retried successfully.\n'],
+            ['Agent execution terminated due to errors in the fixture, now fixed.\n'],
+        ]
+        for chunks in cases:
+            with self.subTest(chunks=chunks):
+                rc, state, events = self.run_agy(chunks)
+                self.assertEqual((rc, state['state']), (0, 'completed'))
+                self.assertIsNone(state.get('settlement_note'))
+
+    def test_fatal_marker_is_scoped_to_agy(self):
+        rc, state, _ = self.run_agy([self.AGY_FATAL], agent='omp')
+        self.assertEqual((rc, state['state']), (0, 'completed'))
 
     def test_cancelling_one_parallel_task_does_not_cancel_the_other(self):
         import concurrent.futures,time

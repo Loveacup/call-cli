@@ -101,59 +101,13 @@ class Collaboration:
         return self.store.list(self.origin(client))
 
     def intervene(self, client, task_id, prompt, *, command_id=None):
-        origin = self.origin(client)
-        if not prompt.strip():
-            raise ValueError('Nonempty intervention required')
-        command_id = command_id or str(uuid.uuid4())
-        launch = False
-        with self.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            task = self.store._owned(db, task_id, origin)
-            commands = task.setdefault('commands', {})
-            if command_id in commands:
-                if commands[command_id]['prompt'] != prompt:
-                    raise ValueError('command_id already used for a different prompt')
-                return task
-            if task.get('intervention', {}).get('status') == 'pending':
-                raise ValueError('Another intervention is pending; wait or cancel it first')
-            if task['state'] not in {'queued', 'running', 'cancelling', 'cancelled', 'completed', 'waiting_reply'}:
-                raise ValueError('Task fate is not settled; intervention refused')
-            entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'], status='pending')
-            commands[command_id] = entry
-            task['intervention'] = entry
-            if task['state'] == 'queued':
-                task['prompt'] = prompt
-                entry.update(status='queued', target_turn=task['turn'])
-            elif task['state'] in {'running', 'cancelling'}:
-                # The existing runner owns cancel transport and settlement confirmation.
-                task['state'] = 'cancelling'
-            else:
-                self._resume(db, task, entry)
-                launch = True
-            self.store._save(db, task)
+        task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id)
         if launch:
             self._dispatch(task)
         return self.status(client, task_id)
 
-    def _resume(self, db, task, entry):
-        task.update(turn=task['turn']+1, state='queued', prompt=entry['prompt'],
-                    process_id='', runner_pid=0, question_id='', questions=[], answers={})
-        entry.update(status='queued', target_turn=task['turn'])
-        task['commands'][entry['command_id']] = entry
-        self.store._check_writers(db, task)
-
     def _advance(self, client, task_id):
-        origin = self.origin(client)
-        launch = False
-        with self.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            task = self.store._owned(db, task_id, origin)
-            entry = task.get('intervention', {})
-            if (entry.get('status') == 'pending' and entry['source_turn'] == task['turn']
-                    and task['state'] in {'cancelled', 'completed', 'waiting_reply'}):
-                self._resume(db, task, entry)
-                self.store._save(db, task)
-                launch = True
+        task, launch = self.store.advance_intervention(task_id, self.origin(client))
         if launch:
             self._dispatch(task)
         return self.status(client, task_id)
@@ -218,19 +172,7 @@ class Collaboration:
         return self.status(client, task_id)
 
     def cancel(self, client, task_id):
-        origin = self.origin(client)
-        with self.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            task = self.store._owned(db, task_id, origin)
-            entry = task.get('intervention', {})
-            if entry.get('status') in {'pending', 'queued'}:
-                entry['status'] = 'withdrawn'
-                task['commands'][entry['command_id']] = entry
-            if task['state'] == 'queued':
-                task.update(state='cancelled', prompt='')
-            elif task['state'] == 'running':
-                task['state'] = 'cancelling'
-            self.store._save(db, task)
+        self.store.request_cancel(task_id, self.origin(client))
         return self.status(client, task_id)
 
     def close(self, client, task_id):

@@ -43,15 +43,16 @@ metadata:
 
 ## AGY 模型与 effort
 
-按 [AGY 模型选择](references/agy-models.md) 在目标设备发现当前 ACP 候选，由发起端 Core CLI 选模型；用户指定优先，可选 JEV 只在真实候选内比较。新 AGY 任务必须显式传 `model`，可选 `effort` 必须匹配当前 `thought_level` 元数据；不猜后缀、不切 provider。模型和 effort 在同会话续轮保留，并核对每轮 `model` 事件。
+按 [AGY 模型选择](references/agy-models.md) 在目标设备发现当前 ACP 候选，由发起端 Core CLI 选模型；用户指定优先，可选 JEV 只在真实候选内比较。新 AGY 任务必须显式传 `model`，可选 `effort` 必须匹配当前 `thought_level` 元数据；不猜后缀、不切 provider。模型和 effort 在同会话续轮保留，并核对每轮 `model` 事件。AGY 以 `⚠ Agent execution terminated due to error.` 作为最终输出行时，即使协议 `end_turn` 也记 `unknown` 并附 `settlement_note`；向用户报告为出错／无法确定，不报完成，不自动重放或换模型。
 
 ## Hermes 宿主入口：call_cli 工具
 
-`call_cli` 提供 `start / list / status / events / reply / cancel / close`，是需单独安装并启用的可选 Hermes 模块，不因复制此技能而出现；新工具需要新会话加载，旧会话不要强改工具集。
+`call_cli` 提供 `start / list / status / events / reply / intervene / cancel / close`，是需单独安装并启用的可选 Hermes 模块，不因复制此技能而出现；新工具需要新会话加载，旧会话不要强改工具集。
 
 - `start` 指定 `agent`、`device`、执行端绝对 `cwd`、`prompt`；Windows 设备增加 `remote_shell: "powershell"`。只有已授权写入才设 `write: true`；同步目录或跨设备共享资源用同一 `resource` 标识。
 - 来源 profile/session/platform/chat/topic 由宿主真实上下文捕获，模型不可填写。返回后保留 `task.id` 和原生 process ID；后续动作只用精确 `task_id`。任务表按来源隔离，不用另一 topic 或 `/new` 冒认旧任务。
 - 先用 `events` 查看阶段、回答和问题；`reply` 带原始 `question_id`。多个问题逐条回答，全部记录后才启动续轮。取消必须等状态结算，再考虑续派；`unknown` 保留写目录占用，先查原 ACPX 会话与进程。
+- `intervene` 使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`，重试沿用同一 ID。运行期先取消旧轮，待结算后调用 `status` 或 `events` 驱动同 session 续轮；`pending/cancelling` 不代表生效，`unknown` 不续派。`cancel` 撤回尚未执行的介入。完成后再用同动作续轮只算普通续作，不算运行期介入。
 - 向用户汇报先说整体是否完成、是否已部署，再说当前阻塞和有意义的新证据；区分局部检查与完整交付，在授权范围内持续完成常规返工。
 - 完成／问题通过宿主原生 terminal/process registry 回注；有新增进度时约 60 秒合并一次，不逐 token 唤醒。仅在支持异步回注的长驻宿主会话适用；oneshot 不据此宣称能自动唤醒。真实跨 topic 投递验收状态见 [验证范围](references/verification.md)。
 - 一个任务只启动一次。工具失败时先按 task/process/session 对账，不自动改走原生命令再执行一遍；验收完成后用 `close` 关闭自有 ACPX 会话。

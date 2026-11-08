@@ -19,7 +19,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 跨设备使用协调主机已有 SSH 别名。Windows 目标增加 `--remote-shell powershell`，cwd 使用该设备上的绝对盘符路径。发起端的路径不会自动映射到目标；不要把损坏的盘符或引号“修好”后悄悄继续。
 
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。
-- `--agent` 取 `omp/codex/pi`：是真正的执行目标。
+- `--agent` 取 `omp/codex/pi/agy`：是真正的执行目标；AGY 另传当前发现的 `--model`。
 - `--write` 仅用于已经授权的文件编辑／测试，会使用 `approve-all`。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 
@@ -36,6 +36,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
 - `completed/cancelled`：对应轮已结算，仍需检查真实结果或残留。
 - `unknown`：保留任务与资源定位，先对账原会话和进程；不要重放。
+- AGY 一轮公开输出的最后一个非空行若恰为 `⚠ Agent execution terminated due to error.`，即使协议返回 `end_turn` / exit 0，也记为 `unknown`，并在 `settlement_note` 与最终事件中写明“AGY 报告致命执行错误、未完成、结果不明、不自动重放”。该判定只拒绝完成，不代表已知根因；引用、前后缀或其后仍有内容的同类文字按普通内容处理。
 - `busy: true, task: null`：数据库锁竞争，没有可信状态；保留游标，稍后再看。
 
 ```sh
@@ -58,6 +59,8 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 ```
 
 同一次提交的重试复用同一个 command ID。`pending/queued` 仅证明提交，不证明改向生效。实现语义是：请求介入 → 原轮取消 → 确认原轮结算 → 同目标会话续轮 → 读取修订结果。继续短 `wait` 驱动和观察状态转换，不宣称无损热修改。
+
+Hermes 原生工具使用 `{"action":"intervene","task_id":"TASK_ID","command_id":"UNIQUE_STABLE_COMMAND_ID","prompt":"修订要求"}`。后续调用 `status` 或 `events` 会在旧轮确认结算后启动同 session 新轮；取消回执本身不会启动新轮，`unknown` 不自动重放。来源仍由当前宿主捕获，不能从其他 session/topic 接管。后台进度回注依赖真实 Hermes terminal/process registry，通用事件可读不代表宿主已消费，更不代表 Telegram 已投递。
 
 ## 取消、验收、关闭
 

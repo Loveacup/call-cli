@@ -32,6 +32,19 @@ def capture_origin(get_env, profile):
                   get_env('HERMES_SESSION_CHAT_ID',''), get_env('HERMES_SESSION_THREAD_ID',''))
 
 
+# AGY ACP emits this exact public line, then a normal end_turn, when its model
+# execution fails. It is matched only as the final nonempty line of the turn's
+# concatenated public output (so chunk splits do not matter); quotes, prefixes,
+# suffixes or later content are ordinary text. A match denies completion only;
+# it is not a root cause and never authorizes replay.
+AGY_FATAL_LINE = '\u26a0 Agent execution terminated due to error.'
+
+
+def agy_fatal_error(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == AGY_FATAL_LINE
+
+
 class EventDecoder:
     """Only public assistant messages and minimal tool status reach the event log."""
     def __init__(self, shared_request_id=None):
@@ -193,6 +206,30 @@ class Store:
             self._save(db, task)
         return task
 
+    def claim_launch(self, task_id, turn):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
+            if (task['turn'] != turn or task['state'] != 'queued'
+                    or task.get('launch_turn') == turn):
+                raise ValueError('Turn already launched or not queued')
+            task.update(launch_turn=turn, launch_id=uuid.uuid4().hex)
+            self._save(db, task)
+        return task
+
+    def finish_launch(self, task_id, turn, launch_id, process_id=None):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
+            if task['turn'] == turn and task.get('launch_id') == launch_id:
+                if process_id is not None:
+                    task['process_id'] = process_id
+                elif task['state'] in {'queued', 'running', 'cancelling'}:
+                    # A missing dispatch receipt is uncertain, never permission to replay.
+                    task['state'] = 'unknown'
+                self._save(db, task)
+        return task
+
     def event(self, task_id, token, kind, text='', **metadata):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -220,8 +257,9 @@ class Store:
             if not row or row['owner'] != origin.key():
                 raise PermissionError('Task belongs to another Hermes session/topic')
             task = json.loads(row['data'])
-            if task['state'] not in {'waiting_reply','completed'}:
-                raise ValueError('Previous turn is not settled')
+            if (task['state'] not in {'waiting_reply','completed'}
+                    or task.get('intervention', {}).get('status') == 'pending'):
+                raise ValueError('Previous turn is not settled or intervention is pending')
             questions = task.get('questions', [])
             if questions and question_id not in questions:
                 raise ValueError('Reply must name the pending question_id')
@@ -247,10 +285,87 @@ class Store:
             raise PermissionError('Task belongs to another Hermes session/topic')
         return json.loads(row['data'])
 
+    @staticmethod
+    def _prepare_legacy_hermes_session(db, task):
+        fields = ('needs_session', 'acpx_created', 'session_creation_attempted')
+        if any(key in task for key in fields) or task.get('acpx_record_id'):
+            return
+        # Only this runner-authored first-turn event proves creation was never
+        # attempted. Missing fields, a cancelled state or no process ID do not.
+        proven = False
+        if task['turn'] == 1 and task['state'] == 'cancelled':
+            for row in db.execute('SELECT data FROM events WHERE task=?', (task['id'],)):
+                event = json.loads(row[0])
+                if (event.get('turn') == 1 and event.get('kind') == 'cancelled'
+                        and event.get('text') == 'Cancelled before provider launch'):
+                    proven = True
+                    break
+        if not proven:
+            raise ValueError('Legacy session creation is unverified; intervention refused. Use a new start after reconciling the old task.')
+        task.update(needs_session=True, acpx_created=False, session_creation_attempted=False)
+
+    def intervene(self, task_id, origin, prompt, command_id=None, *, legacy_hermes=False):
+        if not prompt.strip():
+            raise ValueError('Nonempty intervention required')
+        command_id = command_id or str(uuid.uuid4())
+        launch = False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._owned(db, task_id, origin)
+            commands = task.setdefault('commands', {})
+            if command_id in commands:
+                if commands[command_id]['prompt'] != prompt:
+                    raise ValueError('command_id already used for a different prompt')
+                return task, False
+            if task.get('intervention', {}).get('status') == 'pending':
+                raise ValueError('Another intervention is pending; wait or cancel it first')
+            if task['state'] not in {'queued', 'running', 'cancelling', 'cancelled', 'completed', 'waiting_reply'}:
+                raise ValueError('Task fate is not settled; intervention refused')
+            if legacy_hermes:
+                self._prepare_legacy_hermes_session(db, task)
+            entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'], status='pending')
+            commands[command_id] = entry
+            task['intervention'] = entry
+            if task['state'] == 'queued':
+                task['prompt'] = prompt
+                entry.update(status='queued', target_turn=task['turn'])
+            elif task['state'] in {'running', 'cancelling'}:
+                # The existing runner owns cancel transport and settlement confirmation.
+                task['state'] = 'cancelling'
+            else:
+                self._resume_intervention(db, task, entry)
+                launch = True
+            self._save(db, task)
+        return task, launch
+
+    def _resume_intervention(self, db, task, entry):
+        task.update(turn=task['turn']+1, state='queued', prompt=entry['prompt'],
+                    process_id='', runner_pid=0, question_id='', questions=[], answers={})
+        entry.update(status='queued', target_turn=task['turn'])
+        task['commands'][entry['command_id']] = entry
+        self._check_writers(db, task)
+
+    def advance_intervention(self, task_id, origin):
+        launch = False
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._owned(db, task_id, origin)
+            entry = task.get('intervention', {})
+            if (entry.get('status') == 'pending' and entry['source_turn'] == task['turn']
+                    and task['state'] in {'cancelled', 'completed', 'waiting_reply'}):
+                self._resume_intervention(db, task, entry)
+                self._save(db, task)
+                launch = True
+        return task, launch
+
     def request_cancel(self,task_id,origin):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=self._owned(db,task_id,origin)
+            entry = task.get('intervention', {})
+            if entry.get('status') in {'pending', 'queued'}:
+                entry['status'] = 'withdrawn'
+                task['commands'][entry['command_id']] = entry
             if task['state']=='queued':task.update(state='cancelled',prompt='')
             elif task['state']=='running':task['state']='cancelling'
             self._save(db,task)
@@ -276,13 +391,16 @@ class Store:
             self._save(db,task)
         return True
 
-    def finish_turn(self,task_id,turn,state,rc,stop_reason):
+    def finish_turn(self,task_id,turn,state,rc,stop_reason,note=None):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
             if task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
             if state=='completed' and task['question_id']:state='waiting_reply'
             task.update(state=state,exit_code=rc,stop_reason=stop_reason,runner_pid=0,prompt='')
+            # Per-turn: never carry an earlier turn's diagnosis forward.
+            task.pop('settlement_note',None)
+            if note:task['settlement_note']=note
             self._save(db,task)
         return True
 

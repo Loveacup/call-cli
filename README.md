@@ -109,7 +109,7 @@ A client ID is a local capability handle; `--runtime omp` is a declaration, not 
 | OMP, Codex or Pi | The `skill/` bundle + a configured entry | AI-operated collaboration; skills do not install dependencies or authenticate agents. |
 | Another machine | `remote-client.cjs` | One-shot SSH transport to the coordinator. |
 | A restricted Windows Codex environment | `remote-client.ps1` | Native PowerShell/.NET alternative to the observed Node SSH spawn `EPERM`; verified with a macOS coordinator only. |
-| Hermes | Optional `call_cli` plugin | Native source binding and background notifications; it does **not** expose the generic `intervene` action. |
+| Hermes | Optional `call_cli` plugin | Native source binding, background notifications and cancel/settle/same-session `intervene`; actual host consumption and Telegram delivery require separate verification. |
 
 **Terminal installation and in-CLI loading belong to the same setup path.** The [integration guide](docs/integrations.md) shows which layer to install, how the AI loads it, and how to verify the actual entry without stacking conflicting installs.
 

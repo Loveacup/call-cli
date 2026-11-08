@@ -106,7 +106,7 @@ client ID 是本地协作句柄；`--runtime omp` 只是声明，不是已认证
 | OMP、Codex、Pi | `skill/` 技能包 + 已配置的入口 | 由 AI 执行协作；技能本身不安装依赖，也不完成认证。 |
 | 其他机器 | `remote-client.cjs` | 通过一次性 SSH 调用协调主机。 |
 | Windows 受限 Codex 环境 | `remote-client.ps1` | 对已观察到的 Node spawn SSH `EPERM` 使用原生 PowerShell/.NET 替代；目前仅核验 macOS 协调端。 |
-| Hermes | 可选 `call_cli` 插件 | 原生来源绑定与后台通知；**不提供**通用 `intervene` 动作。 |
+| Hermes | 可选 `call_cli` 插件 | 原生来源绑定、后台通知与取消结算后同 session `intervene`；宿主实际消费和 Telegram 投递须单独验收。 |
 
 **终端安装与 CLI 内加载是同一条配置路径的不同步骤。** [集成手册](docs/integrations.md)说明应该安装哪一层、AI 如何加载它，以及怎样验证真实入口而不叠加冲突安装。
 

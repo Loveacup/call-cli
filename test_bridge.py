@@ -100,6 +100,39 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(continued['prompt'], 'JSON')
         self.assertEqual(continued['state'], 'queued')
 
+    def test_intervention_requires_settlement_and_preserves_exact_owner(self):
+        t = self.store.create(self.a, 'local', 'agy', '/probe', 'old', True)
+        self.store.update(t['id'], state='running', model='discovered-model', acpx_record_id='native-id')
+        with self.assertRaises(PermissionError):
+            self.store.intervene(t['id'], self.b, 'new', 'revision')
+        pending, launch = self.store.intervene(t['id'], self.a, 'new', 'revision')
+        self.assertFalse(launch)
+        self.assertEqual(pending['state'], 'cancelling')
+        self.assertFalse(self.store.advance_intervention(t['id'], self.a)[1])
+        self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled')
+        with self.assertRaises(ValueError):
+            self.store.reply(t['id'], self.a, '', 'bypass')
+        resumed, launch = self.store.advance_intervention(t['id'], self.a)
+        self.assertTrue(launch)
+        self.assertEqual((resumed['turn'], resumed['prompt']), (2, 'new'))
+        self.assertEqual(resumed['session'], t['session'])
+        self.assertEqual(resumed['acpx_record_id'], 'native-id')
+        self.assertEqual(resumed['model'], 'discovered-model')
+        self.assertFalse(self.store.intervene(t['id'], self.a, 'new', 'revision')[1])
+        self.assertFalse(self.store.advance_intervention(t['id'], self.a)[1])
+
+    def test_unknown_intervention_never_replays_and_cancel_withdraws(self):
+        t = self.store.create(self.a, 'local', 'agy', '/probe', 'old', True)
+        self.store.update(t['id'], state='running')
+        self.store.intervene(t['id'], self.a, 'new', 'revision')
+        self.store.finish_turn(t['id'], 1, 'unknown', None, None)
+        state, launch = self.store.advance_intervention(t['id'], self.a)
+        self.assertEqual((state['state'], state['turn'], launch), ('unknown', 1, False))
+        with self.assertRaises(ValueError):
+            self.store.intervene(t['id'], self.a, 'retry', 'another')
+        self.store.request_cancel(t['id'], self.a)
+        self.assertEqual(self.store.get(t['id'])['intervention']['status'], 'withdrawn')
+
 class ProtocolTests(unittest.TestCase):
     def test_host_context_captures_topic_and_session_not_model_input(self):
         from bridge import capture_origin

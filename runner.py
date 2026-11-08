@@ -13,9 +13,9 @@ import sys
 import threading
 import time
 try:
-    from .bridge import Store, EventDecoder
+    from .bridge import Store, EventDecoder, AGY_FATAL_LINE, agy_fatal_error
 except ImportError:
-    from bridge import Store, EventDecoder
+    from bridge import Store, EventDecoder, AGY_FATAL_LINE, agy_fatal_error
 
 
 def command(device, shell, argv):
@@ -237,8 +237,16 @@ def run_task(db_path, task_id):
                 (not cancelling and (not settled or decoder.stop_reason!='end_turn' or not decoder.text.strip()))):
             # Failure can be an uncertain effect; retain the workspace reservation.
             state='unknown'
-        store.finish_turn(task_id,turn,state,rc,decoder.stop_reason)
-        emit(state,'Prompt exited '+str(rc))
+        note=None
+        if task['agent']=='agy' and not cancelling and agy_fatal_error(decoder.text):
+            # Protocol settlement is not business success. Effects before the
+            # error are unknown, so keep the reservation and never replay.
+            state='unknown'
+            note=('AGY reported a fatal execution error (final line "'+AGY_FATAL_LINE+'") although the protocol ended '
+                  +str(decoder.stop_reason)+' with exit '+str(rc)+'; turn not completed, outcome unknown, '
+                  'no automatic replay. Root cause not reported by AGY ACP.')
+        store.finish_turn(task_id,turn,state,rc,decoder.stop_reason,note=note)
+        emit(state,note or 'Prompt exited '+str(rc))
         return 0 if state in {'completed','waiting_reply','cancelled'} else 1
     except Exception as exc:
         # Never infer remote worker death from an SSH transport failure.

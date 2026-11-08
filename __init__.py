@@ -10,9 +10,9 @@ from .runner import control, device_identity
 
 SCHEMA={
     'name':'call_cli',
-    'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/cancel/close; never guess the latest session.',
+    'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/intervene/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
-        'action':{'type':'string','enum':['start','list','status','events','reply','cancel','close']},
+        'action':{'type':'string','enum':['start','list','status','events','reply','intervene','cancel','close']},
         'task_id':{'type':'string'},
         'device':{'type':'string','description':'local or an existing SSH host alias from call-cli device table'},
         'remote_shell':{'type':'string','enum':['posix','powershell'],'default':'posix'},
@@ -21,6 +21,7 @@ SCHEMA={
         'effort':{'type':'string','description':'AGY advertised thought_level value; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
+        'command_id':{'type':'string','description':'Stable unique ID for an intervention; REQUIRED for intervene retries'},
         'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
@@ -43,6 +44,8 @@ class Coordinator:
         store=Store(self.home/'call-cli'/'tasks.sqlite3')
         action=args['action']
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
+        if action in {'status','events','reply','intervene','cancel','close'}:
+            task=store.get(args.get('task_id',''),origin)
         if action=='start':
             agent=args.get('agent');device=args.get('device','local');cwd=args.get('cwd','');prompt=args.get('prompt','')
             if agent not in {'omp','codex','pi','agy'} or not cwd or not prompt.strip():
@@ -57,12 +60,28 @@ class Coordinator:
             if not isinstance(timeout,int) or not 30<=timeout<=7200:raise ValueError('timeout must be 30..7200')
             task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device))
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout,
+                              needs_session=True,acpx_created=False,session_creation_attempted=False,
                               **({ 'model': args['model'] } if 'model' in args else {}),
                               **({ 'effort': args['effort'] } if 'effort' in args else {}))
             return self.launch(store,task)
-        task=store.get(args.get('task_id',''),origin)
-        if action=='status':return {'task':self.public(task)}
-        if action=='events':return {'task_id':task['id'],'events':store.events(task['id'],origin,args.get('after',0))}
+        if action=='intervene':
+            prompt=args.get('prompt','')
+            command_id=args.get('command_id','')
+            if not prompt.strip():raise ValueError('intervene requires prompt')
+            if not command_id:raise ValueError('intervene requires command_id')
+            task,launch=store.intervene(task['id'],origin,prompt,command_id=command_id,legacy_hermes=True)
+            if launch:return self.launch(store,task)
+            status=task.get('intervention',{}).get('status','')
+            note='Intervention pending cancellation settlement; use status or events to resume' if status=='pending' else f'Intervention status: {status or "none"}'
+            return {'task':self.public(task),'note':note}
+        if action in {'status','events'}:
+            task,launch=store.advance_intervention(task['id'],origin)
+            if launch:
+                result=self.launch(store,task)
+                task=store.get(task['id'],origin)
+                if action=='status':return {'task':self.public(task),'native_process':result.get('native_process'),'note':result.get('note')}
+            if action=='status':return {'task':self.public(task)}
+            return {'task_id':task['id'],'events':store.events(task['id'],origin,args.get('after',0))}
         if action=='reply':
             prompt=args.get('prompt','')
             if not prompt.strip():raise ValueError('reply requires prompt')
@@ -102,16 +121,18 @@ class Coordinator:
                                   '--db',str(store.path),'--task',task['id']]),
               'workdir':str(Path(__file__).parent),'background':True,'notify':True,
               'heartbeat':60,'timeout':task['timeout']+180}
+        task=store.claim_launch(task['id'],task['turn'])
+        turn,launch_id=task['turn'],task['launch_id']
         try:
             result=self.ctx.dispatch_tool('terminal',args)
             result=json.loads(result) if isinstance(result,str) else result
             process_id=result.get('session_id','')
             if not process_id:raise RuntimeError('Native terminal did not return a tracked process')
-            task=store.update(task['id'],process_id=process_id)
+            task=store.finish_launch(task['id'],turn,launch_id,process_id)
             return {'task':self.public(task),'native_process':result,
                     'note':'Completion wakes this original session; changed progress is batched by native heartbeat (60s).'}
         except Exception:
-            store.update(task['id'],state='unknown')
+            store.finish_launch(task['id'],turn,launch_id)
             raise
 
 

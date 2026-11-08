@@ -98,13 +98,13 @@ Call CLI 使用 ACPX 的原生 agent 解析。OMP 可通过自定义 agent comma
 
 这只是合并片段。核对该版本 ACPX 的全局 `~/.acpx/config.json` 与 cwd 内 `.acpxrc.json` 规则，合并所需字段，不把示例整份覆盖到现有配置。Codex／Pi 使用实际安装的 ACP 适配，发现缺口先确认适配器入口，不把普通交互 CLI 或 Codex `app-server` 直接当作 ACP 程序。
 
-新增设备别名不等于新增 CLI 后端；当前目标参数只接受 OMP、Codex、Pi。Windows Codex 在 SSH 服务上下文可能失败，其独立桌面入口见 [CODEX_SSH.md](../CODEX_SSH.md)，没有自动切换路由承诺。
+新增设备别名不等于新增 CLI 后端；当前目标参数接受 OMP、Codex、Pi、AGY，AGY 需显式传发现的模型 ID。Windows Codex 在 SSH 服务上下文可能失败，其独立桌面入口见 [CODEX_SSH.md](../CODEX_SSH.md)，没有自动切换路由承诺。
 
 ## 4. 选择入口与模块
 
 只需终端／脚本时，直接使用源码入口，无需修改 shell 配置、安装技能或启用 Hermes 模块。
 
-CLI 内让 AI 调用入口时，按[集成手册](integrations.md)安装技能并验证实际加载。Hermes 原生来源绑定／后台通知确有需要时，再安装其可选插件；需要 `intervene` 时应选择通用 CLI，因为原生 `call_cli` 工具没有该动作。
+CLI 内让 AI 调用入口时，按[集成手册](integrations.md)安装技能并验证实际加载。Hermes 原生来源绑定／后台通知确有需要时，再安装其可选插件；源码支持 `intervene`，安装副本与新会话加载状态须单独核对，不因源码变更视为已部署。
 
 远端发起端可使用 Node 客户端：
 

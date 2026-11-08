@@ -80,7 +80,11 @@ hermes plugins doctor call-cli
 
 保留真实返回的 `task.id` 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造这些来源字段。
 
-原生工具支持 `start/list/status/events/reply/cancel/close`。需要运行中 `intervene` 时选择通用 CLI，声明 `--runtime hermes` 也不产生原生来源绑定或通知能力。两条路径不能混称同一次验收。
+原生工具支持 `start/list/status/events/reply/intervene/cancel/close`。运行期介入使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`；重试复用相同 ID。`pending/cancelling` 不是生效证明：先等旧轮结算，再调用 `status` 或 `events` 推进同 session 续轮；重复查询不重复启动，`unknown` 不续派。`cancel` 撤回待执行介入。通用 CLI 声明 `--runtime hermes` 不产生原生来源绑定或通知能力，两条路径不能混称同一次验收。
+
+**Hermes 的 `status` / `events` 不是纯读操作**：它们会推进此前已由 `intervene` 授权、仍为 pending 的介入；旧轮确认结算后，查询可能启动同 session 的下一轮。没有已授权 pending 介入时不会自行派工；`unknown` 保留不确定结果，不自动重试。终端 dispatch 的迟到回执按 turn 与 launch identity 条件写回，不能覆盖新轮的状态或 process ID。
+
+升级前没有 `needs_session` / `acpx_created` / `session_creation_attempted` 的旧 Hermes 任务，仅凭 `cancelled`、空 process ID 或字段缺失不能推断会话尚未创建。已有 native record ID 则复用；没有 ID 时，只有第一轮取消终态及该轮 runner 持久事件 `Cancelled before provider launch` 同时存在，才允许续轮首次创建。证据不足会在记录介入或取消旧轮之前明确拒绝，提示先核对旧任务再使用新的 `start`，不猜测重建。取消发生在 runner 启动前、没有此事件的旧记录也遵循拒绝策略。
 
 ## 回报用户
 
