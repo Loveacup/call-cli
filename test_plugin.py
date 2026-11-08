@@ -44,6 +44,21 @@ class PluginTests(unittest.TestCase):
             ctx.enabled=False
             with self.assertRaises(PermissionError):coordinator.handle({'action':'list'})
 
+    def test_agy_schema_and_model_persist_through_hermes_reply(self):
+        mod = load_plugin()
+        self.assertIn('agy', mod.SCHEMA['parameters']['properties']['agent']['enum'])
+        self.assertIn('model', mod.SCHEMA['parameters']['properties'])
+        with tempfile.TemporaryDirectory() as d:
+            env = {'HERMES_SESSION_ID':'s1', 'HERMES_SESSION_KEY':'key'}
+            ctx = Ctx(); c = mod.Coordinator(ctx, Path(d), lambda k,x='':env.get(k,x))
+            task = c.handle({'action':'start','agent':'agy','cwd':d,'prompt':'inspect','model':'live-family','effort':'low'})['task']
+            store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
+            store.update(task['id'], state='completed')
+            resumed = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue'})['task']
+            self.assertEqual(resumed['model'], 'live-family')
+            self.assertEqual(resumed['effort'], 'low')
+            self.assertEqual(resumed['session'], task['session'])
+
     def test_register_exposes_real_bound_tool(self):
         mod=load_plugin();ctx=Ctx();mod.register(ctx)
         self.assertEqual(ctx.registration['name'],'call_cli')

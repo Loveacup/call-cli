@@ -16,7 +16,7 @@
 
 ---
 
-Call CLI connects **OMP, Codex and Pi** through a lightweight coordination layer. Start a fresh session, follow its progress, answer its questions and change direction while it works — **locally or over your existing SSH connections**.
+Call CLI connects **OMP, Codex, Pi and AGY** through a lightweight coordination layer. Start a fresh session, follow its progress, answer its questions and change direction while it works — **locally or over your existing SSH connections**.
 
 **No mandatory Hermes dependency. No additional always-on service. No takeover of your existing terminal sessions.**
 
@@ -45,7 +45,7 @@ https://github.com/Loveacup/call-cli, then set up Call CLI for this CLI.
 Discover the existing installation, SSH aliases, logins and workspaces first.
 Install only the entry, skill or module I need. Preserve existing files and
 credentials; do not create an always-on service. Explain the first-turn npm
-check and possible global ACPX patch update before starting a task.
+version check before starting a task; upgrades need separate authorization.
 
 Verify with a real read-only collaboration, close your test sessions,
 and report what works and what remains blocked.
@@ -60,7 +60,7 @@ The setup guide is **an execution manual for AI**, not a new configuration file 
 
 - **Coordinator:** POSIX Python with `fcntl`. The core path has been verified on macOS; Windows is a client/execution-device option, not a Python coordinator.
 - **Execution device:** Node.js, npm, ACPX and a configured, authenticated target CLI.
-- **Verified baseline:** ACPX **0.20.0**, which requires Node.js **22.13.0+**. See the [AI setup guide](docs/configuration.md) for adapter configuration and platform limits.
+- **Compatibility:** requires the public ACPX Shared Runtime; live AGY/model continuation verified with **0.22.0** (historical baseline: 0.20.0). No exact-version pin. See the [AI setup guide](docs/configuration.md) for adapter configuration and platform limits.
 
 ```sh
 git clone https://github.com/Loveacup/call-cli.git
@@ -97,7 +97,9 @@ A client ID is a local capability handle; `--runtime omp` is a declaration, not 
 
 </details>
 
-> **Before your first task:** v0.2.x checks npm's stable ACPX version and may globally install a compatible patch when its source, version and idle checks allow it. There is currently no disable-update switch. Review this behavior and obtain the needed authorization before using a frozen environment. [Details](docs/configuration.md#acpx-版本检查与更新)
+> **Version checks are not upgrades:** each logical task checks installed/latest once. Normal dispatch never installs packages. Separately authorized maintenance must wait until the device is idle. [Details](docs/configuration.md#acpx-版本检查与更新)
+
+**AGY:** run `node models.cjs /absolute/workdir` on the execution device, choose an exact advertised ACP ID, then pass `--agent agy --model ID` (Hermes: `agent: "agy", model: "ID"`). Optional `--effort VALUE` uses the advertised `thought_level`, not a guessed model suffix. The initiator chooses; explicit user choice wins. Selection is persisted and read back before each turn; unavailable choices fail without provider fallback. [Model workflow](skill/references/agy-models.md)
 
 ## Choose your entry
 
@@ -159,7 +161,7 @@ The Python core uses the standard library. The **v0.2.3 baseline** is 59 Python 
 
 ```sh
 python3 -B -m unittest discover -v
-node --test test_shared_prompt.cjs
+node --test test_shared_prompt.cjs test_models.cjs
 node --test test_codex_ssh.cjs
 # Optional: owned native ACPX sessions, synthetic endpoint, no model call
 RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest -v test_native_shared

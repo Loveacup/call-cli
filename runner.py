@@ -39,6 +39,16 @@ def protocol_prompt(text):
             'Do not include private reasoning. End with actual results, verification and remaining issues.\n\n'+text)
 
 
+def validate_selection(agent, model, effort):
+    if agent == 'agy' and model is None:
+        raise ValueError('AGY requires an explicit discovered model selected by the initiating CLI')
+    for value in (model, effort):
+        if value is not None and (not isinstance(value, str) or not value.strip() or value != value.strip()):
+            raise ValueError('model/effort must be nonempty literal IDs')
+    if effort is not None and agent != 'agy':
+        raise ValueError('effort is currently supported only for AGY')
+
+
 def shared_prompt_transport(task):
     """Send our small facade and private prompt on stdin, including over existing SSH."""
     request_id = task['id'] + ':' + str(task['turn'])
@@ -46,6 +56,9 @@ def shared_prompt_transport(task):
                    sessionName=task['session'], requestId=request_id, write=task['write'],
                    timeoutMs=task.get('timeout', 900) * 1000,
                    expectedVersion=task['execution_version'])
+    for key in ('model', 'effort'):
+        if task.get(key) is not None:
+            options[key] = task[key]
     payload = dict(source=Path(__file__).with_name('shared-prompt.cjs').read_text(),
                    options=options, prompt=protocol_prompt(task['prompt']))
     # Single quotes also avoid Windows PowerShell 5.1's native double-quote loss.
@@ -66,18 +79,43 @@ def device_identity(device):
 
 
 def control(task, action, timeout=20):
-    args = ['acpx','--cwd',task['cwd'],'--format','json',task['agent']]
+    args = ['acpx','--cwd',task['cwd'],'--format','json']
+    if action == 'new' and task.get('model') is not None:
+        args += ['--model', task['model']]
+    args += ['--agent', 'agy acp'] if task['agent'] == 'agy' else [task['agent']]
     if action == 'new':
         args += ['sessions','new','--name',task['session']]
     elif action in {'cancel','status'}:
         args += [action,'-s',task['session']]
     elif action == 'close':
         args += ['sessions','close',task['session']]
+    elif action in {'model', 'effort'}:
+        args += ['set', '-s', task['session'], 'model' if action == 'model' else 'thought_level', task[action]]
     elif action == 'show':
         args += ['sessions','show',task['session']]
     else:
         raise ValueError('Unknown control action')
     return subprocess.run(command(task['device'],task.get('shell','posix'),args),capture_output=True,timeout=timeout)
+
+
+def apply_selection(task):
+    selected = {k: task[k] for k in ('model', 'effort') if task.get(k) is not None}
+    if not selected:
+        return {}
+    for key in selected:
+        if control(task, key, timeout=60).returncode:
+            raise RuntimeError('Explicit '+key+' selection failed; no fallback or prompt submitted')
+    result = control(task, 'show')
+    if result.returncode:
+        raise RuntimeError('Cannot read back selected model')
+    record = json.loads(result.stdout)
+    state = record.get('acpx', {})
+    config = {o['id']: o.get('currentValue') for o in state.get('config_options', [])}
+    if (record.get('name') != task['session']
+            or ('model' in selected and state.get('current_model_id') != selected['model'])
+            or ('effort' in selected and config.get('thought_level') != selected['effort'])):
+        raise RuntimeError('Selected model/effort readback mismatch; no prompt submitted')
+    return selected
 
 
 def run_task(db_path, task_id):
@@ -111,8 +149,10 @@ def run_task(db_path, task_id):
         except ImportError:
             from updates import ensure_current, device_lock
         # Version maintenance happens once per new task, not on replies/status.
-        if turn == 1:
-            emit('version',json.dumps(ensure_current(store,task)))
+        if 'version_check' not in task and (turn == 1 or task.get('needs_session', False)):
+            checked = ensure_current(store, task)
+            store.update(task_id, version_check=checked)
+            emit('version', json.dumps(checked))
         # All turns, including replies, hold a shared installation lock until settlement.
         execution_lock=device_lock(task)
         execution_lock.__enter__()
@@ -151,6 +191,9 @@ def run_task(db_path, task_id):
         if version.returncode or not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', installed):
             raise RuntimeError('Cannot verify the current locked ACPX installation')
         task = store.update(task_id, execution_version=installed)
+        selected = apply_selection(task)
+        if selected:
+            emit('model', json.dumps(selected))
         argv, payload, request_id = shared_prompt_transport(task)
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         proc.stdin.write(payload);proc.stdin.close()

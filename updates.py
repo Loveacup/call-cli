@@ -49,7 +49,7 @@ def update_decision(installed, latest, official, busy):
     return 'deferred_busy' if busy else 'upgrade'
 
 
-def ensure_current(store,task):
+def ensure_current(store,task, *, allow_upgrade=False):
     def run(args,timeout=30):
         result=subprocess.run(command(task['device'],task.get('shell','posix'),args),capture_output=True,timeout=timeout)
         if result.returncode:raise RuntimeError('Version command failed with exit '+str(result.returncode))
@@ -60,6 +60,8 @@ def ensure_current(store,task):
             installed=run(['acpx','--version'])
             latest=registry_version(run(['npm','view','acpx','dist-tags.latest','--json']))
             outcome=update_decision(installed,latest,True,False)
+            if outcome=='upgrade' and not allow_upgrade:
+                outcome='update_available'
             if outcome=='upgrade':
                 with store.connect() as db:
                     tasks=[json.loads(r['data']) for r in db.execute('SELECT data FROM tasks')]

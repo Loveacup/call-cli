@@ -10,13 +10,15 @@ from .runner import control, device_identity
 
 SCHEMA={
     'name':'call_cli',
-    'description':'Coordinate OMP, Codex or Pi via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/cancel/close; never guess the latest session.',
+    'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
         'action':{'type':'string','enum':['start','list','status','events','reply','cancel','close']},
         'task_id':{'type':'string'},
         'device':{'type':'string','description':'local or an existing SSH host alias from call-cli device table'},
         'remote_shell':{'type':'string','enum':['posix','powershell'],'default':'posix'},
-        'agent':{'type':'string','enum':['omp','codex','pi']},
+        'agent':{'type':'string','enum':['omp','codex','pi','agy']},
+        'model':{'type':'string','description':'Exact discovered ACP model ID; required for AGY; preserved on replies'},
+        'effort':{'type':'string','description':'AGY advertised thought_level value; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
         'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
@@ -43,17 +45,20 @@ class Coordinator:
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
         if action=='start':
             agent=args.get('agent');device=args.get('device','local');cwd=args.get('cwd','');prompt=args.get('prompt','')
-            if agent not in {'omp','codex','pi'} or not cwd or not prompt.strip():
+            if agent not in {'omp','codex','pi','agy'} or not cwd or not prompt.strip():
                 raise ValueError('start needs agent, absolute cwd and a nonempty prompt')
             if not (Path(cwd).is_absolute() or PureWindowsPath(cwd).is_absolute()):
                 raise ValueError('cwd must be absolute on execution device')
             if device=='local':cwd=str(Path(cwd).resolve(strict=True))
-            from .runner import command
+            from .runner import command, validate_selection
+            validate_selection(agent, args.get('model'), args.get('effort'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
             timeout=args.get('timeout',900)
             if not isinstance(timeout,int) or not 30<=timeout<=7200:raise ValueError('timeout must be 30..7200')
             task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device))
-            task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout)
+            task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout,
+                              **({ 'model': args['model'] } if 'model' in args else {}),
+                              **({ 'effort': args['effort'] } if 'effort' in args else {}))
             return self.launch(store,task)
         task=store.get(args.get('task_id',''),origin)
         if action=='status':return {'task':self.public(task)}

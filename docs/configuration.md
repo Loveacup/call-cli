@@ -58,7 +58,9 @@ python3 /absolute/approved/call-cli/collab.py --help
 执行设备需有全局 npm 安装、可被 `npm root -g` 找到且导出 `acpx/runtime` 的 ACPX。v0.2.3 实测 ACPX 0.20.0，其要求 Node.js >=22.13.0。只在需要安装且获授权时执行：
 
 ```sh
-npm install -g acpx@0.20.0
+VERIFIED_VERSION="$(npm view acpx dist-tags.latest)"
+# 获授权、确认空闲及安装来源后，使用刚核实的明确稳定版本：
+npm install -g "acpx@$VERIFIED_VERSION"
 acpx --version
 npm root -g
 ```
@@ -126,7 +128,7 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 
 - CLI 用 `--db` 指定明确任务库；缺省为用户主目录下 `.hermes/plugin-data/call-cli/tasks.sqlite3`，这只是路径约定，并不要求安装 Hermes。
 - DB、client handle、任务正文、回答、SSH 信息和运行记录放在用户私有位置，不放进公开仓库。
-- 新建任务前说明首轮的 npm 查询及可能的全局 ACPX patch 更新，确认这类副作用在用户授权内。不要从项目维护者的个人环境推导当前用户授权。
+- 新建任务前说明首轮的 npm 版本查询；升级是单独维护动作，确认这类副作用在用户授权内。不要从项目维护者的个人环境推导当前用户授权。
 - 同一协作复用同一 DB 与 client handle。Hermes 插件的 DB 由宿主代码定位，没有独立的 DB 配置键；通用入口要复用其任务库时，先核对实际路径。
 - 源码不会替你把文件同步到执行设备；cwd 和产物都属于目标设备。
 - 默认只读；`--write` 使用 `approve-all`，不是路径沙箱。把获授权路径与完成标准写进任务，并保留目标 CLI 原有沙箱。
@@ -140,9 +142,9 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 
 ### ACPX 版本检查与更新
 
-首轮会查询执行端安装版本与 npm 稳定版；来源可识别为官方 npm 安装、无占用且版本主次号相同时，可能执行兼容 patch 更新。其他版本变化记录待核对，不升级 OMP／Codex／Pi。开始升级后验证失败会阻止业务启动。
+每个逻辑新任务查询执行端 installed/latest 一次并持久保存。正常派工只检查，不安装包；只在独立授权、确认无活动任务且来源已验证后维护升级。内部 patch 维护仍有安装锁及 busy 检查；跨主次版本先评估，不升级其他 agent 或改认证配置。
 
-这是现有代码行为，不是后台更新服务。当前没有 `--no-update` 或统一配置开关。用户要求严格冻结环境时，应说明此缺口，不承诺只靠填写配置即可禁用。续轮在共享安装锁内读当前安装版本，首轮 `version_check` 仅保留为历史。
+不绑定历史精确版本，按公共 runtime 能力验证。续轮不查 npm，但在共享安装锁内读取当前 CLI 版本，SDK 版本须与这个本次安装身份一致；这不是固定版本锁。AGY 使用原生 `agy acp`，先运行 `node models.cjs /absolute/workdir` 发现候选，传显式 `model` 和可选独立 `effort`；详见 [AGY 工作流](../skill/references/agy-models.md)。部署时将 `models.cjs` 与 `shared-prompt.cjs` 一并保留在 runner 同目录。
 
 ## 6. 验证并完成交付
 

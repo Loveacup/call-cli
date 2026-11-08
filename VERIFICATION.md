@@ -1,4 +1,15 @@
-# Verification — v0.2.3
+# Verification
+
+## AGY/model forwarding candidate — ACPX 0.22.0
+
+- Source supports native `agy acp` in generic collaboration and the Hermes schema, explicit `model`, and optional separately advertised `effort`. Task JSON preserves selection through continuation without migrating or adding fields to old tasks. Model IDs are discovered via public `inspectAgentModels`, not a baked-in catalog. Normal task dispatch checks versions but does not upgrade packages.
+- Default Python discovery: **67 cases, 65 passed, 2 opt-in integrations skipped**, exit 0. Node facade/model-discovery/Windows-SSH tests: **41 passed**, exit 0. New behavior had failing tests before implementation; Hermes schema/reply and busy-maintenance tests are post-implementation regression coverage.
+- `RUN_NATIVE_AGY_TESTS=1 CALLCLI_AGY_MODEL=gemini-3.8-flash CALLCLI_AGY_EFFORT=low python3 -B -m unittest test_native_agy -v`: **passed on installed ACPX 0.22.0 and AGY 1.5.3**. The model was selected from live ACP discovery, not inferred by stripping an effort suffix. Both real prompts returned the requested sentinel, both turns emitted model-selection readback, the native record ID stayed unchanged, only one latest-version check was recorded, and final session metadata confirmed model plus `thought_level=low`. Close/status readback succeeded. This is coordinator-driven read-only smoke, not native Codex initiation, GUI use or remote-device certification.
+- `RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_shared -v`: **passed on 0.22.0**; four synthetic protocol scenarios (callback-ID collision recovery, synthetic auth, genuine prompt failure, cancellation) retained expected outcomes and one prompt per scenario. All owned sessions closed. This is real ACPX transport with a synthetic endpoint, not model evidence.
+- An initial live spike failed before prompt because Shared Runtime control methods require a running owner. The failed session was closed. The retained implementation instead uses native CLI `set` plus exact-session `show` readback before submitting through Shared Runtime. Offline mocks alone did not reveal this boundary.
+- `gh issue view 1 --repo Loveacup/call-cli --json title,body,comments,state` confirmed the empty-notification report remains open with no comments at inspection. No call-cli-local notification defect was reproduced; no notification workaround or Hermes core changes were made. **Telegram is not claimed fixed**, and no external issue/comment was written by this implementation task.
+
+On the local macOS installation, the deployed runtime files match the candidate source. Parent-run installed `collab`/`runner` smoke passed two turns, model/effort readback and close for `gemini-3.8-flash` / low, `claude-opus-5-5` / medium, and `gemini-4-argon` / medium. This does not verify the fresh Hermes native plugin schema, remote devices, file tools, or Telegram. A prior AGY error text was emitted with `completed` despite failure: protocol completion is not evidence of business success; that observed behavior remains unresolved. See issues #1 and #2. Historical 0.20.0 results below are not retests of this candidate.
 
 ## v0.2.3: Shared Runtime settlement
 

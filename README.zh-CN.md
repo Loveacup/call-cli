@@ -16,7 +16,7 @@
 
 ---
 
-Call CLI 通过轻量协调层连接 **OMP、Codex 和 Pi**。新建协作会话、观察执行进展、回答对方的问题，并在执行期间调整方向——**既能在本机，也能通过你现有的 SSH 跨设备工作。**
+Call CLI 通过轻量协调层连接 **OMP、Codex、Pi 和 AGY**。新建协作会话、观察执行进展、回答对方的问题，并在执行期间调整方向——**既能在本机，也能通过你现有的 SSH 跨设备工作。**
 
 **不强制依赖 Hermes，不新增常驻服务，不接管你已经打开的终端会话。**
 
@@ -43,8 +43,7 @@ Call CLI 通过轻量协调层连接 **OMP、Codex 和 Pi**。新建协作会话
 docs/configuration.md，为当前 CLI 配置 Call CLI。
 
 先发现现有安装、SSH 别名、登录与工作目录，只安装我需要的入口、技能或模块。
-保留已有文件与凭据，不新建常驻服务。开始任务前，说明首轮 npm 检查和
-可能的全局 ACPX patch 更新，并确认在授权范围内。
+保留已有文件与凭据，不新建常驻服务。开始任务前，说明首轮 npm 版本检查；升级作为单独授权的维护动作。
 
 用真实只读协作验证安装，关闭自有测试会话，报告可用范围和剩余阻塞。
 ```
@@ -58,7 +57,7 @@ docs/configuration.md，为当前 CLI 配置 Call CLI。
 
 - **协调主机：** 能使用 `fcntl` 的 POSIX Python。核心路径已在 macOS 验证；Windows 可作为客户端／执行设备，不作为本项目的 Python 协调主机。
 - **执行设备：** Node.js、npm、ACPX，以及已配置适配并完成认证的目标 CLI。
-- **已验证基线：** ACPX **0.20.0**，要求 Node.js **22.13.0+**。适配配置与平台限制见 [AI 配置手册](docs/configuration.md)。
+- **版本兼容：** 需要 ACPX 公共 Shared Runtime；本轮 AGY 模型选择及续轮在 **0.22.0** 实测，历史基线为 0.20.0，不锁定精确版本。适配配置与平台限制见 [AI 配置手册](docs/configuration.md)。
 
 ```sh
 git clone https://github.com/Loveacup/call-cli.git
@@ -95,7 +94,9 @@ client ID 是本地协作句柄；`--runtime omp` 只是声明，不是已认证
 
 </details>
 
-> **首次派工前注意：** v0.2.x 会检查 npm 稳定版，并可能在来源、版本和空闲检查满足时全局安装兼容的 ACPX patch。目前没有禁用开关。严格冻结环境需先评估，并确认相关副作用在授权范围内。[查看细节](docs/configuration.md#acpx-版本检查与更新)
+> **版本检查不是升级：** 每个逻辑任务检查 installed/latest 一次。正常派工不安装包；独立授权的维护必须等设备空闲。[查看细节](docs/configuration.md#acpx-版本检查与更新)
+
+**AGY：** 在执行设备运行 `node models.cjs /absolute/workdir` 发现当前 ACP 候选，由发起端选择精确 ID，再传 `--agent agy --model ID`（Hermes 同样使用 `agent`/`model`）。可选 `--effort VALUE` 使用当前广告的 `thought_level`，不猜后缀。用户指定优先，续轮保留并读回选择，失败不切 provider。[模型选择流程](skill/references/agy-models.md)
 
 ## 选择接入方式
 

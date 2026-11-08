@@ -77,6 +77,8 @@ async function run(options, prompt, deps = {}) {
     // session-created record, not from a model-supplied provider session ID.
     const handle = {backend: 'acpx-shared', acpxRecordId: options.sessionId,
       sessionKey: options.sessionName, runtimeSessionName: options.sessionId, cwd: options.cwd};
+    // Selection is applied and read back by the runner before this transport.
+    // Shared control methods require an already running owner and cannot bootstrap it.
     const turn = runtime.startTurn({handle, text: prompt, mode: 'prompt', requestId,
       timeoutMs: options.timeoutMs});
     for await (const event of turn.events) {

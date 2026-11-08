@@ -11,7 +11,7 @@ Call CLI is an experimental, single-user coordination tool, not a multi-tenant e
 - The coordinator stores selected public events, not raw protocol streams. This does not guarantee that an assistant's public answer cannot contain sensitive task data; review exports and reports.
 - Cancellation acknowledgement is not termination. After disconnects or unknown results, reconcile the exact native session and process before retrying or transferring write ownership.
 - The Windows desktop bridge uses temporary loopback authentication and a one-shot scheduled task. It preserves the Codex sandbox but is not an OS user-isolation boundary; it requires the user's logged-in desktop.
-- A first turn may perform an ACPX patch update after the code's source/version/busy checks. There is currently no disable-update setting. Review this behavior before use in a frozen environment.
+- A new logical task queries installed/latest ACPX versions once. Normal dispatch never upgrades. Independently authorized patch maintenance must pass source/version/idle checks; do not upgrade during active sessions.
 
 ## Reporting
 

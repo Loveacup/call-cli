@@ -145,6 +145,18 @@ output({'result':{'stopReason':'end_turn'}})
         self.assertTrue(self.store.get(t['id'])['acpx_created'])
         self.assertFalse(self.store.get(t['id'])['needs_session'])
 
+    def test_revised_unlaunched_task_checks_versions_once(self):
+        from unittest.mock import patch
+        from runner import run_task
+        t = self.task('ASK')
+        self.store.update(t['id'], turn=2, needs_session=True, acpx_created=False)
+        with patch('updates.ensure_current', return_value={'decision':'current'}) as check:
+            self.assertEqual(run_task(self.store.path, t['id']), 0)
+            state = self.store.get(t['id'])
+            self.store.reply(t['id'], self.origin, state['question_id'], 'continue')
+            self.assertEqual(run_task(self.store.path, t['id']), 0)
+            self.assertEqual(check.call_count, 1)
+
     def test_real_runner_rejects_empty_exit_zero_and_does_not_replay(self):
         from runner import run_task
         t=self.task('EMPTY')
