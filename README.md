@@ -1,16 +1,15 @@
 <div align="center">
 
-<img src="docs/assets/call-cli-banner.png" alt="Call CLI — different CLIs, one conversation" width="100%">
+<img src="docs/assets/call-cli-banner.png" alt="Call CLI — Cross-CLI & cross-device collaboration across OMP, Codex, Pi and AGY (with optional Hermes integration)" width="100%">
 
 **Give your CLI a teammate, not just another subprocess.**
 
 <a href="README.md"><strong>English</strong></a> · <a href="README.zh-CN.md">简体中文</a>
 
-<a href="VERIFICATION.md"><img src="https://img.shields.io/badge/version-0.2.3-8b7cf8?style=flat-square&amp;labelColor=161b22" alt="Version 0.2.3"></a>
-<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/transport-ACPX-49c5b6?style=flat-square&amp;labelColor=161b22" alt="Powered by ACPX"></a>
+<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/transport-ACPX%200.22%2B-49c5b6?style=flat-square&amp;labelColor=161b22" alt="Powered by ACPX Shared Runtime"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8cbaff?style=flat-square&amp;labelColor=161b22" alt="MIT license"></a>
 
-[Quick start](#quick-start) · [Core capabilities](#capabilities) · [Choose your entry](#choose-your-entry) · [How it works](#how-it-works) · [Documentation](#documentation)
+[Quick start](#quick-start) · [Choose your entry](#choose-your-entry) · [Core capabilities](#capabilities) · [Architecture & lifecycle](#how-it-works) · [Evidence & boundaries](#evidence-and-boundaries) · [Documentation](#documentation)
 
 </div>
 
@@ -18,161 +17,250 @@
 
 Call CLI connects **OMP, Codex, Pi and AGY** through a lightweight coordination layer. Start a fresh collaboration session, follow its live progress, answer numbered questions, pass task-pinned skills and steer direction while it works — **locally or over your existing SSH connections**.
 
-**No mandatory Hermes dependency. No additional always-on service. No takeover of your manually opened terminal or GUI sessions.**
+**What it is not:** No mandatory Hermes dependency. No additional always-on service or daemon. No takeover of your manually opened terminal, TUI or desktop GUI sessions.
 
 ## Why Call CLI?
 
-You plan in one CLI. Another agent implements on the same machine or over SSH. A third reviews the result. Questions, skill bundles and mid-run course corrections travel through the initiating CLI instead of being copied between terminals by hand.
+You plan in one CLI. Another agent implements on the same machine or over SSH. A third reviews the result in parallel. Stage progress, numbered questions, pinned skill bundles and mid-run course corrections travel back and forth through the initiating CLI instead of being copied between terminals by hand.
 
 | | Capability | What you get |
 | :-- | :-- | :-- |
-| 💬 | **Multi-turn Q&A and live steering** | Answer numbered questions with `reply` or redirect a running turn with `intervene` in the same target session. |
-| 📡 | **Resumable event stream** | Cursor-based `wait` and `events` (`--after SEQ`) return public stages, deduplicated safe tool statuses, pending `question_ids` and terminal `answer_tail`. |
-| 🤝 | **Multi-CLI concurrency** | Run AGY, OMP, Codex and Pi in parallel under isolated task/client/session identities with single-writer workspace reservation (`--write`, `--resource`). |
-| 🤖 | **First-class AGY & default tool approval** | Discover exact advertised ACP models (`models.cjs`), run native `agy acp` with persisted default `approve-all` tool policy, and settle unrecovered tool failures honestly as `unknown`. |
-| 📦 | **Task-pinned skill passing** | Hermes or any initiating CLI can pass `required`, `optional` or `reference` skills from `origin` or `target`, pinned by SHA-256 across turns with `CALLCLI_SKILL` receipts. |
-| 🔌 | **Modular backend adapters** | Shared task/turn coordination (`bridge.py`, `runner.py`) is decoupled from ACPX and AGY adapters via `backends.py`; future backends do not require ACP. |
+| 💬 | **Continuous Q&A & live steering** | Answer numbered questions (`CALLCLI_QUESTION`) with `reply`, or redirect a running task with `intervene` (cancel → confirm settlement → resume in the same target session). |
+| 📡 | **Resumable event stream (`seq`)** | Bounded `wait` and `events --after SEQ` return public stages (`CALLCLI_STAGE`), deduplicated safe tool statuses, pending `question_ids` and terminal `answer_tail` committed atomically with turn state. |
+| 🤝 | **Parallel multi-CLI concurrency** | Run OMP, Codex, Pi and AGY side by side as parallel execution targets under isolated origin/client/task/session identities, guarded by single-writer workspace locks (`--write`, `--resource`). |
+| 🤖 | **First-class AGY & default tool approval** | Discover exact advertised ACP models (`models.cjs`), run native `agy acp` with persisted default `approve-all` tool policy (or explicit `approve-reads`), and settle unrecovered tool failures or fatal error markers honestly as `unknown`. |
+| 📦 | **Task-pinned skill passing** | Any initiating CLI or Hermes can attach `required`, `optional` or `reference` skills from `origin` or `target`, snapshotted by SHA-256 across turns with per-turn `CALLCLI_SKILL` self-reports. |
+| 🔌 | **Modular backend seam** | Shared task/turn/lock coordination (`bridge.py`, `runner.py`) is decoupled from ACPX and AGY policies via `backends.py`; additional backends can register without requiring ACP or a separate daemon. |
 
 <a id="quick-start"></a>
 ## Quick start
 
-### Ask your AI to set it up
+### Option 1: Ask your AI to set it up (Recommended)
 
-Paste this into the OMP, Codex, Pi or Hermes session you already use:
+Paste this prompt into the OMP, Codex, Pi or Hermes session you already use:
 
 ```text
-Read the README and docs/configuration.md in
-https://github.com/Loveacup/call-cli, then set up Call CLI for this CLI.
+Read README.md and docs/configuration.md in https://github.com/Loveacup/call-cli,
+then inspect collab.py and docs/integrations.md to set up Call CLI for this CLI.
 
-Discover the existing installation, SSH aliases, logins and workspaces first.
-Install only the entry, skill or module I need. Preserve existing files and
-credentials; do not create an always-on service. Explain the first-turn npm
-version check before starting a task; upgrades need separate authorization.
-
-Verify with a real read-only collaboration, close your test sessions,
-and report what works and what remains blocked.
+1. Discover first (read-only): check python3, node, npm, acpx, existing Call CLI
+   checkouts, SSH aliases, skill directories and target CLI logins before asking
+   for missing values. Preserve existing files, configurations and credentials.
+2. Prepare only what I need: install only the entry, skill or optional Hermes
+   module required for my workflow. Do not create an always-on service or daemon.
+   Explain the once-per-task npm version check before starting work; package
+   upgrades require separate authorization on an idle device.
+3. Verify safely and distinguish boundaries: run a local no-model check
+   (connect + list) first. Obtain approval before launching a real read-only
+   collaboration or external effects, close owned test sessions (confirming
+   no-session), and report source checks, host compatibility and real
+   end-to-end results separately.
 ```
 
-The setup guide is **an execution manual for your AI**, not a configuration file or questionnaire for you to fill out by hand. Detailed AI guides are maintained in **Simplified Chinese**; both README editions cover the exact same commands and boundaries.
+The linked [AI setup guide (`docs/configuration.md`, 简体中文)](docs/configuration.md) is **an execution manual written for your AI agent**, not a questionnaire for you to fill out by hand. Detailed AI reference manuals are maintained in **Simplified Chinese**; both README editions cover the exact same commands, parameters and boundaries.
 
-<details>
-<summary><strong>Prefer the terminal? Run directly from source.</strong></summary>
+<details open>
+<summary><strong>Option 2: Run directly from a POSIX terminal (continuous path)</strong></summary>
 
 #### Prerequisites
 
-- **Coordinator:** POSIX Python 3.9+ with `fcntl`. End-to-end coordination is verified on macOS; Windows is supported as a client or execution device, not as the Python coordinator host.
-- **Execution device:** Node.js, npm, ACPX and a configured, authenticated target CLI (`omp`, `codex`, `pi` or `agy`).
-- **Compatibility:** requires the public ACPX Shared Runtime (`acpx/runtime`). Local live AGY/OMP/skill sessions are verified on **0.22.0** (cross-device Windows SSH OMP on **0.21.1**; historical baseline **0.20.0**), without a hardcoded exact-version pin. See the [AI setup guide](docs/configuration.md) for adapter configuration and platform boundaries.
+- **Coordinator host:** POSIX Python 3.9+ with `fcntl` (standard library only; no `pip install`). End-to-end coordination is verified on macOS; Windows is supported as an initiating client or execution device, not as the Python coordinator host.
+- **Execution device (for Stage B live runs):** Node.js (>=22.13.0), npm, ACPX exposing the public Shared Runtime (`acpx/runtime`), and an installed, natively logged-in target CLI (`omp`, `codex`, `pi` or `agy`).
+- **ACPX compatibility:** Local live AGY (`1.5.3`), OMP and skill-passing sessions are verified on **ACPX 0.22.0** (cross-device Windows SSH OMP on **0.21.1**; Shared Runtime baseline **0.20.0**) without a hardcoded version lock.
+
+#### Stage A: Local coordinator smoke (no target model or credentials required)
+
+Clone into a new directory (or `cd` into an existing checkout) and verify the coordinator store in a single POSIX shell (does not call any target model; performs only local temporary file writes):
 
 ```sh
+# If you do not already have a checkout, clone into a new directory:
 git clone https://github.com/Loveacup/call-cli.git
 cd call-cli
+
+# 1. Inspect CLI entry points (read-only)
 python3 collab.py --help
 python3 collab.py start --help
-acpx --version
+
+# 2. Create an isolated SQLite task store and capability handle (local temporary write respecting TMPDIR)
+CALL_CLI_HOME="$PWD"
+CALL_CLI_DB="$(mktemp "${TMPDIR:-/tmp}/call-cli-quickstart.XXXXXX")"
+
+CLIENT_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" connect --runtime omp)"
+printf '%s\n' "$CLIENT_JSON"
+
+CLIENT_ID="$(printf '%s' "$CLIENT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["client_id"])')"
+
+# 3. Verify task listing with the issued handle
+python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" list
 ```
 
-Call CLI is source-distributed; there is no separate Call CLI npm/pip package or one-line global installer.
+**Observable success criteria (Stage A):**
+- `connect` exits `0` and prints JSON containing a UUID `client_id` and `"declared_runtime": "omp"`.
+- `list` exits `0` and prints `[]`, confirming local SQLite store initialization (`0600`) and capability-handle validation without calling any target model.
 
-#### Start a read-only collaboration
+#### Stage B: Real read-only collaboration (requires ACPX & logged-in target CLI)
 
-Run this in the same POSIX shell from the repository checkout. No write permission is granted:
+Continue in the **same shell** (reusing `CALL_CLI_HOME`, `CALL_CLI_DB` and `CLIENT_ID`) to launch a fresh read-only session:
 
 ```sh
-CALL_CLI_HOME="$PWD"
-CALL_CLI_DB="$HOME/.local/state/call-cli/tasks.sqlite3"
+# Check ACPX on the execution device
+acpx --version
 
-CLIENT_ID="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" \
-  connect --runtime omp | python3 -c 'import json,sys; print(json.load(sys.stdin)["client_id"])')"
+# Start a read-only OMP task in the current repository (no --write granted)
+TASK_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" \
+  --client "$CLIENT_ID" start --device local --agent omp --cwd "$CALL_CLI_HOME" \
+  --timeout 120 --prompt 'Read collab.py and summarize the CLI subcommands in 3 bullet points. Do not modify files.')"
+printf '%s\n' "$TASK_JSON"
 
-TASK_ID="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" \
-  --client "$CLIENT_ID" start --device local --agent omp --cwd "$PWD" \
-  --timeout 120 --prompt 'Read this project and summarize its main entry points. Do not modify files.' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+TASK_ID="$(printf '%s' "$TASK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
+# Bounded wait (up to 5s per call); repeat advancing --after with the returned cursor
 python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
   wait --task "$TASK_ID" --after 0 --timeout 5
 ```
 
-Keep the returned `client_id`, `id` (`TASK_ID`) and `after` cursor:
+**Observable success criteria & lifecycle follow-through (Stage B):**
+- **Start:** `start` returns JSON with a 16-hex `id` (`TASK_ID`), `"session": "call-<id>"`, `"state": "queued"` (or `"running"`) and `"turn": 1`.
+- **Progress & settlement:** Repeat `wait --task "$TASK_ID" --after "$AFTER" --timeout 5` using the returned `after` integer cursor. When the turn finishes, `task.state` becomes `"completed"` (or `"waiting_reply"` if the agent emitted `CALLCLI_QUESTION`), `task.exit_code` is `0`, `task.stop_reason` is `"end_turn"`, and `events` includes `"token": "1:settled"` with `answer_tail`.
+- **Answer or steer (when needed):**
+  - If `task.state` is `"waiting_reply"`, answer the exact token in `task.question_id`:
+    `python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" reply --task "$TASK_ID" --question-id "$QUESTION_ID" --prompt 'Your answer'`
+  - To redirect a running or settled turn in the same session, pass a retry-safe `--command-id`:
+    `python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" intervene --task "$TASK_ID" --command-id rev-1 --prompt 'Revised scope'`
+    then keep calling `wait` so the coordinator cancels the running turn, confirms settlement and launches turn 2.
+- **Target AGY or pass a task skill:** AGY requires an explicit model ID discovered on the execution device first (advertised models vary by device and account; do not assume any fixed ID is available everywhere). Optional `--effort` is omitted below so the default applies; when specified, its value must be verified against `thought_level.options` returned by `models.cjs`:
+  ```sh
+  # 1. Discover exact ACP model IDs and thought_level.options advertised on this execution device
+  node "$CALL_CLI_HOME/models.cjs" "$CALL_CLI_HOME"
 
-- **Follow progress / Q&A:** repeat short `wait` calls advancing `--after`. If the target asks a question (`waiting_reply`), answer the exact question ID with `reply --task "$TASK_ID" --question-id QUESTION_ID --prompt '...'`.
-- **Steer a running task:** submit `intervene --task "$TASK_ID" --command-id STABLE_ID --prompt '...'`, then continue short `wait` calls so the coordinator cancels the old turn, confirms settlement and launches the revised turn in the same session.
-- **Target AGY or attach a skill:** discover models first, then set `MODEL_ID` to an exact ID from that output. Replace the skill path below with a directory you have inspected and intend to share.
+  # 2. Set MODEL_ID to an exact availableModelIds value from this discovery run,
+  #    start an independent AGY task, wait until settled, and close it (confirming no-session)
+  MODEL_ID="gemini-4-argon"  # example; choose an exact ID returned on your execution device
+  AGY_TASK_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
+    start --device local --agent agy --model "$MODEL_ID" \
+    --cwd "$CALL_CLI_HOME" --skill reference="$CALL_CLI_HOME/skill" \
+    --prompt 'Read the passed skill as reference and list the supported actions.')"
+  printf '%s\n' "$AGY_TASK_JSON"
 
-```sh
-# Discover exact advertised ACP model IDs on the execution device first
-node "$CALL_CLI_HOME/models.cjs" "$PWD"
+  AGY_TASK_ID="$(printf '%s' "$AGY_TASK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
-# Start an AGY task with a pinned coordinator-side skill bundle
-python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
-  start --device local --agent agy --model "$MODEL_ID" --cwd "$PWD" \
-  --skill required=/absolute/path/to/skill-dir \
-  --prompt 'Follow the passed skill and inspect the repository read-only.'
-```
+  # Bounded wait (repeat advancing --after with the returned cursor until AGY_TASK_ID settles)
+  python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
+    wait --task "$AGY_TASK_ID" --after 0 --timeout 5
 
-- **Close when done:** after the turn settles (`completed` or `cancelled`), verify the result and run `close --task "$TASK_ID"`. Closing a running task is not a substitute for cancellation.
-
-A client ID is a local capability handle; `--runtime omp` is a caller declaration, not authenticated native provenance. See the [online collaboration guide](docs/usage.md) for the full lifecycle.
+  # Close AGY_TASK_ID after its task.state settles (completed or cancelled)
+  python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
+    close --task "$AGY_TASK_ID"
+  ```
+- **Close and verify cleanup:** Once the OMP task (`$TASK_ID`) is settled (`completed` or `cancelled`), close its session:
+  ```sh
+  python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" close --task "$TASK_ID"
+  ```
+  `close` returns `"state": "closed"` only after ACPX confirms `status_snapshot` / `no-session` and task-pinned skill snapshots are removed. Do not delete a shared `$CALL_CLI_DB` merely because one task closed—avoid unverified `rm -f` steps before confirming via `list` that all tasks in that database (such as `$TASK_ID` and `$AGY_TASK_ID`) are closed, so no live AGY or OMP session is orphaned.
 
 </details>
 
-> **Version checks are not upgrades:** each logical new task queries `installed`/`latest` once and persists the result. Normal dispatch never installs packages; separately authorized maintenance must wait until the device is idle. [Details](docs/configuration.md#acpx-版本检查与更新)
-
-<a id="capabilities"></a>
-## Core capabilities
-
-### 1. AGY support & default tool approval
-
-- **Live model discovery:** run `node models.cjs /absolute/workdir` on the execution device to inspect advertised ACP models via `inspectAgentModels`, then pass `--agent agy --model ID` (Hermes: `agent: "agy", model: "ID"`). Optional `--effort VALUE` uses the advertised `thought_level` option—never guess or strip model suffixes. Explicit user choice wins; otherwise the initiating CLI selects a candidate, persists it and verifies readback before each turn without silent provider fallback.
-- **Default `approve-all` policy vs. write reservation:** new AGY tasks persist `agy_approval: "approve-all"` by default (even when `write` is `false`), allowing authorized shell and native tools within task scope while prompt guidance still prefers native read/search tools. For strict read-only approvals, pass `--agy-approval approve-reads` (Hermes: `agy_approval: "approve-reads"`) so shell/write permission prompts are denied non-interactively. Approvals are permission policies, **not** a filesystem sandbox; pass `--write` separately for authorized edits and workspace reservation. Replies and interventions preserve the task's policy; legacy tasks without the field keep their original `write` mapping, and OMP/Codex/Pi defaults (`approve-reads` unless `--write`) are unchanged.
-- **Honest outcome settlement:** if an AGY tool fails and the turn ends with neither a final answer nor a pending question—or if the final non-empty output line matches the exact fatal marker `⚠ Agent execution terminated due to error.`—the turn settles as `unknown` (no automatic replay) even when the protocol reports `end_turn` / exit `0`. Pending questions remain answerable (`waiting_reply`) unless overridden by the fatal line; a recovered tool failure followed by a final answer can complete. Only safe tool identifiers, categories and statuses are retained; public Shared Runtime events do not expose permission decisions, so diagnostics report `unobservable` rather than guessing a denial cause. See the [AGY model & approval workflow](skill/references/agy-models.md).
-
-### 2. Task skill passing (Hermes or any initiating CLI)
-
-- **Initiator-agnostic contract:** Hermes, OMP, Codex, Pi or terminal scripts can select and pass task skills through the same `start` interface: repeatable `--skill MODE=PATH` (`location: "origin"`), `--target-skill MODE=PATH` (`location: "target"`, including Windows absolute paths), or `--skills-json ARRAY` (`skills` in Hermes / Python `Collaboration.start`).
-- **Local-first selection & public discovery signals:** the initiating CLI checks local skills first and reads `SKILL.md`, relative references/scripts and target dependencies before dispatching. When searching public repositories (e.g. `hermes skills search` or GitHub search), repository stars and recent substantive updates (distinguishing real workflow/code updates from license-only or formatting commits) serve as discovery signals rather than the sole measure of quality. Selected public skills are pinned to an exact commit SHA in scratch (`source` metadata) without running global installs.
-- **Modes (`required` / `optional` / `reference`):**
-  - `required`: target must read `SKILL.md` and needed resources and follow applicable instructions, or report `not_applicable` / `unavailable` with a specific reason. If staging a `required` skill fails, no business prompt is submitted.
-  - `optional`: target reads and adopts the skill when useful, or reports `not_adopted` with its reason.
-  - `reference`: target reads the bundle as non-binding reference material.
-- **Pinned `origin` vs. `target` staging & receipts:** `origin` skills are snapshotted on the coordinator at task creation with a per-file SHA-256 manifest (skipping dotfiles, `node_modules`, `__pycache__`, symlinks and common credential files; capped at 4 MiB/file, 16 MiB/bundle, 1000 files) and staged over the existing local/SSH channel into the execution device's temporary directory (`call-cli-skills/<task>/<skill>/<sha>/`) before each turn. `target` skills pin and verify an existing directory on the execution device. Continuations (`reply`, `intervene`) reuse the pinned bundle; `close` removes the coordinator snapshot and cleans up the target temporary directory. Each turn records `CALLCLI_SKILL <id> <read|adopted|not_adopted|not_applicable|unavailable> <reason>` self-reports (`reported` vs. `unverified` when a `required` report is missing, without overwriting valid business completion).
-- **Read boundary:** ACPX 0.22.0's `fs/read_text_file` callback only permits paths inside the `cwd` subtree, whereas agent-native file tools (verified with OMP on macOS/Windows and AGY on macOS) read staged temporary bundles directly without modifying `cwd`. Callback-only targets report `unavailable` rather than expanding permissions or writing into user workspaces. See the [skill passing guide](skill/references/skill-passing.md).
-
-### 3. Multi-CLI concurrency, resumable events & modular backends
-
-- **Concurrent multi-CLI tasks:** run multiple CLIs (such as AGY and OMP) simultaneously on the same host or across SSH under separate client/task/session identities. Single-writer reservations (`--write` and optional shared `--resource`) block conflicting writers while allowing read-only tasks (including AGY `approve-all` with `write: false`) to run alongside an active writer.
-- **Resumable events & atomic settlement:** runner notifications and `events`/`wait` share durable `seq` cursors. Repeated status updates for the same tool are deduplicated (ordinary tool notices are bounded per turn while all tool failures and full `events` queries remain intact). Turn completion commits task state and a single `<turn>:settled` event (`question_ids`, `answer_tail`, and pending-intervention next action) in one SQLite transaction so cursor reads recover settlement even if stdout observation was interrupted.
-- **Pluggable backend seam:** `bridge.py` and `runner.py` manage task ownership, state transitions, turns, interventions and writer reservations independently of ACPX. `backends.py` registers adapters implementing `prepare_start(model, effort, approval)`, `run(store, task, emit)` and `control(task, action, timeout)`. `acpx_backend.py` and `agy.py` implement ACPX Shared Runtime and AGY policies today; non-ACP backends can register in the same table without adding daemons or separate stores (verified by the fake non-ACP lifecycle contract in `test_backends.py`). See the [backend extension interface](docs/integrations.md#后端扩展接口).
+> [!NOTE]
+> **Version checks are not automatic upgrades:** Each logical new task queries `acpx --version` and `npm view acpx dist-tags.latest` once and persists `version_check`. Normal task dispatch never installs packages; separately authorized maintenance upgrades (`updates.py`) require an idle device lock and verified official repository metadata.
 
 <a id="choose-your-entry"></a>
 ## Choose your entry
 
-| You work in… | Use | Scope |
+| You work in… | Entry point | Role & current verification boundary |
 | :-- | :-- | :-- |
-| A terminal or script | `python3 collab.py` | Complete generic coordination CLI (`connect`, `start`, `list`, `status`, `events`, `wait`, `reply`, `intervene`, `cancel`, `close`). |
-| OMP, Codex or Pi | The `skill/` bundle + a configured entry | AI-operated collaboration and skill passing; skills do not install dependencies or authenticate agents. |
-| Another machine | `remote-client.cjs` | One-shot SSH transport to the coordinator host. |
-| A restricted Windows Codex environment | `remote-client.ps1` | Native PowerShell/.NET alternative to the observed Node SSH spawn `EPERM`; verified with a macOS coordinator only. |
-| Hermes | Optional `call_cli` plugin | Native origin binding, background notifications, skill passing and cancel/settle/same-session `intervene`. New tool schemas require a fresh Hermes session; live current-chat consumption and Telegram delivery (Issue #1) require separate host verification. |
+| **A POSIX terminal or script** | `python3 collab.py` | Complete generic coordinator CLI (`connect`, `start`, `list`, `status`, `events`, `wait`, `reply`, `intervene`, `cancel`, `close`). `connect --runtime {omp,codex,pi,hermes}` records a caller declaration (`client_id` capability handle), not authenticated native host identity. |
+| **OMP, Codex or Pi** | `skill/` bundle + configured entry | Guides the initiating AI through environment discovery, online coordination and skill passing. Skills do not install dependencies or replace native target CLI logins. |
+| **Another machine over SSH** | `remote-client.cjs` | Single-file Node SSH transport forwarding JSON actions to `collab.py` on the POSIX coordinator host. |
+| **Restricted Windows Codex** | `remote-client.ps1` / `codex-ssh.cjs` | `remote-client.ps1` avoids the observed Node `spawn(ssh) EPERM` in the Windows Codex sandbox (verified against a macOS coordinator). `codex-ssh.cjs` runs a fresh desktop-context Codex via a one-shot InteractiveToken task to avoid Session 0 `0xC0000142`. |
+| **Hermes host** | Optional `call_cli` plugin (`__init__.py`, `plugin.yaml`) | Captures native `HERMES_SESSION_*` origin identity, dispatches background runners via the host terminal tool, and advances authorized `intervene` on `status`/`events`. Loading updated tool schemas requires refreshing the tool table via a host-supported method or opening a new Hermes session (an existing session's tool snapshot may remain stale); live current-chat consumption and Telegram delivery (Issue #1) require separate host verification. |
 
-**Terminal installation and in-CLI loading belong to the same setup path.** The [integration guide](docs/integrations.md) explains which runtime files must be installed together, how the AI loads the skill or plugin, and how to verify the active entry without stacking conflicting copies.
+**Terminal installation and in-CLI skill/plugin loading are two steps of one setup path.** See the [integration guide (`docs/integrations.md`, 简体中文)](docs/integrations.md) for the exact 14-file runtime deployment list and in-CLI loading commands.
+
+<a id="capabilities"></a>
+## Core capabilities
+
+### 1. First-class AGY support & persistent tool approval (`agy.py`, `models.cjs`)
+
+- **Live ACP model & effort discovery:** Run `node models.cjs /absolute/workdir` on the execution device to query `inspectAgentModels` from the public ACPX runtime. Available models vary by execution device and account; select an exact ID returned in that device's current `availableModelIds` via `--agent agy --model ID` (Hermes: `agent: "agy", model: "ID"`), and if passing optional `--effort VALUE`, verify it against `thought_level.options` returned by `models.cjs` (verified live on **AGY 1.5.3 / ACPX 0.22.0** with `gemini-4-argon` / `medium`, `claude-opus-5-5` / `medium`, and `gemini-3.8-flash` / `low`). Never guess or strip suffixes from display names. The coordinator applies the selection via native CLI `set`, verifies exact readback via `sessions show` before submitting the prompt, and refuses silent model/provider fallback.
+- **Default `approve-all` vs. workspace write reservation:** New AGY tasks persist `agy_approval: "approve-all"` by default (even when `write` is `false`), permitting authorized shell and native tool calls within task scope while prompt guidance prioritizes native read/search tools. For strict read-only tool approvals, pass `--agy-approval approve-reads` (Hermes: `agy_approval: "approve-reads"`), which denies shell/write permission requests non-interactively. **Tool approval policies and `write: false` are not OS or filesystem sandboxes;** pass `--write` separately to declare edit authorization and reserve the workspace. `reply` and `intervene` preserve the task's `agy_approval`; legacy tasks without the field keep their original `write` mapping, and OMP/Codex/Pi defaults (`approve-reads` unless `--write`) remain unchanged.
+- **Honest outcome settlement:** Protocol `end_turn` / exit `0` alone does not prove business success. For AGY, if any tool call reports `failed` and the turn ends with neither a final answer after the last tool event nor a pending question—or if the final non-empty public line is the exact fatal marker `⚠ Agent execution terminated due to error.`—the turn settles as `unknown` with a `settlement_note` (no automatic replay). Pending questions remain answerable (`waiting_reply`) unless overridden by the fatal final line; a tool failure recovered before a final answer can still settle `completed`. Public events retain only safe tool identifiers, categories and statuses; because public Shared Runtime events do not expose permission decisions, `permission_diagnostics.permission_decisions` is recorded as `unobservable` rather than inferring permission denial from tool failure. Details: [`skill/references/agy-models.md` (简体中文)](skill/references/agy-models.md).
+
+### 2. Task-pinned skill passing (`skills.py`, `skill-stage.cjs`)
+
+- **Initiator-agnostic contract:** Pass task skills from `collab.py` or Hermes through the same task model: repeatable `--skill MODE=PATH` (`location: "origin"` on the coordinator), `--target-skill MODE=PATH` (`location: "target"` on the execution device, including Windows paths), or `--skills-json ARRAY` (`skills` array in Hermes / Python `Collaboration.start` with optional `source` provenance).
+- **Local-first selection & public discovery signals:** The initiating CLI inspects local skills first (`SKILL.md`, relative `references/`/`scripts/` and target dependencies). When local skills are insufficient and public repositories are searched, repository star counts and recent substantive content commits (distinguishing real workflow/script updates from license-only or formatting commits) serve as selection signals rather than an automatic quality guarantee. Selected public bundles are pinned to an exact commit SHA in scratch without running global installs.
+- **Modes (`required` / `optional` / `reference`):**
+  - `required`: Target must read `SKILL.md` and needed resources and follow applicable instructions, or report `not_applicable` / `unavailable` with a concrete reason. If staging a `required` skill fails, no business prompt is submitted.
+  - `optional`: Target reads and adopts the skill when useful, or reports `not_adopted` with its reason.
+  - `reference`: Target consults the bundle as non-binding reference material.
+- **SHA-256 snapshotting, temporary staging & per-turn receipts:** `origin` skills are snapshotted (`0700`/`0600`) at task creation with a per-file SHA-256 manifest—automatically skipping dotfiles, symlinks, `node_modules`, `__pycache__`, `.pem`/`.key`, `id_*`, `credentials*` and `auth.json`, and enforcing caps of **4 MiB/file, 16 MiB/bundle and 1000 files**. Before each turn, bundles are staged over existing local/SSH stdin into `<os.tmpdir()>/call-cli-skills/<task>/<skill>/<sha>/`. `reply` and `intervene` reuse the exact pinned bundle; `close` removes the coordinator snapshot and cleans up the target temporary directory. Every turn records `CALLCLI_SKILL <id> <read|adopted|not_adopted|not_applicable|unavailable> <reason>` self-reports (`skill_verification: "reported"` vs. `"unverified"` when a `required` report is missing, without downgrading valid business completion to `unknown`).
+- **Read boundary:** ACPX 0.22.0's `fs/read_text_file` callback restricts reads to the `cwd` subtree, whereas agent-native file tools (verified on macOS/Windows OMP and macOS AGY) read the temporary skill directory directly without polluting `cwd`. Callback-only targets report `unavailable` honestly. Details: [`skill/references/skill-passing.md` (简体中文)](skill/references/skill-passing.md).
+
+### 3. Parallel multi-CLI concurrency, resumable events & modular backends
+
+- **Parallel multi-CLI execution & single-writer locks:** Run multiple target CLIs (for example AGY and OMP) concurrently on the same host or across SSH. Each task owns an isolated client/task/session identity. `--write` and optional cross-device `--resource` enforce single-writer workspace reservation while allowing read-only tasks (including AGY `approve-all` with `write: false`) to run in parallel alongside an active writer.
+- **Durable `seq` cursors & atomic settlement (`bridge.py`, `runner.py`, `events.py`):** Runner stdout notifications and `events`/`wait` share durable SQLite `rowid` (`seq`) cursors. Repeated identical statuses for the same tool call are deduplicated (ordinary tool notices on stdout are capped at 12 per turn while all tool failures and full `events` queries remain intact). Turn completion commits the task state and a single `<turn>:settled` event (`question_ids`, `answer_tail` up to 1000 chars, and pending-intervention `next_action`) in one SQLite transaction, preventing close/intervene races from dropping settlement notifications.
+- **Pluggable backend seam (`backends.py`, `acpx_backend.py`):** Task ownership, turn transitions, interventions and writer locks live in `bridge.py` and `runner.py`. `backends.py` maps agent names to adapters implementing `prepare_start(model, effort, approval)`, `run(store, task, emit)` and `control(task, action, timeout)`. Non-ACP backends can register in `BACKENDS` without adding daemons or separate stores (verified via the fake non-ACP lifecycle contract in `test_backends.py`). Details: [`docs/integrations.md#后端扩展接口` (简体中文)](docs/integrations.md#后端扩展接口).
 
 <a id="how-it-works"></a>
-## How it works
+## Architecture & collaboration lifecycle
+
+<div align="center">
+
+<img src="docs/assets/call-cli-architecture.png" alt="Call CLI conceptual architecture: an initiating CLI entry coordinates through the Call CLI POSIX bridge and fans out in parallel to independent target CLIs (OMP, Codex, Pi, AGY) locally or over SSH" width="100%">
+
+</div>
+
+[Open the full-resolution architecture diagram](docs/assets/call-cli-architecture.png) — on a phone, open the image and zoom in for module labels.
+
+*Conceptual architecture diagram (not a live runtime screenshot): one initiating entry owns the task in Call CLI (`bridge.py` / `runner.py`), which dispatches turns to **parallel, isolated target CLI sessions** (`OMP`, `Codex`, `Pi`, `AGY`) locally or over SSH. Target CLIs are shown side by side as parallel targets—the diagram lines do not represent sequential target-to-target dependencies (this does not prohibit user-authorized hierarchical coordination)—and Call CLI never attaches to manually opened terminals.*
+
+### Single-task turn & intervention sequence
 
 ```text
-Initiating CLI                   Call CLI                       Target CLI
-   │                                │                               │
-   ├──── start (+ optional skills) ─►│──── local / SSH + ACPX ──────►│
-   │◄─── stages / tools / questions ─┤◄─── public events (seq) ──────┤
-   ├──── reply / intervene ─────────►│──── same-session + pinned ───►│
-   │◄─── result + skill receipts ────┤◄─── authoritative turn.result ┤
+Initiating CLI                   Call CLI (Store + Runner)            Target CLI (via ACPX / Backend)
+      │                                      │                                       │
+      ├──── 1. start (+ optional skills) ───►├──── lock + session + stage skills ───►│
+      │◄─── 2. wait / events (--after seq) ──┤◄─── CALLCLI_STAGE / tool / QUESTION ──┤
+      ├──── 3a. reply (--question-id) ──────►├──── turn+1 in same native session ───►│
+      ├──── 3b. intervene (--command-id) ───►├──── cancel turn → confirm settled ───►│
+      │     (next wait/status advances) ────►├──── launch revised turn + skills ────►│
+      │◄─── 4. <turn>:settled + close ───────┼◄─── turn.result + close (no-session) ─┤
 ```
 
-The coordinator owns a small SQLite task store and bounded per-turn runners. ACPX supplies native session lifecycle and queue-owner serialization, while its public `acpx/runtime` API provides the authoritative `turn.result`. Public events drive progress, tool visibility, skill receipts and numbered Q&A—never guesses about final settlement.
+**Control semantics (`steer` vs. `queue` vs. `cancel+resume`):** Public ACPX 0.22.0 `startTurn` rejects in-turn `steer`, and in-process queueing waits for the active turn to finish rather than redirecting it mid-flight. Call CLI `intervene` therefore implements explicit **cancel-and-resume**: it records a retry-safe `command_id`, requests cancellation of the running turn, waits for authoritative cancellation settlement, and only then launches the revised prompt in the **same native session** on the next `wait` (generic CLI) or `status`/`events` call (Hermes). `pending`/`queued` means recorded, not yet applied; `unknown` results are preserved for reconciliation and never replayed automatically.
 
-Runtime intervention follows an explicit contract: **request `intervene` → cancel the running turn → confirm cancellation settlement → continue in the same native session → verify the revised result**. It is not a claim of universal lossless hot-editing or arbitrary child-process pause/resume.
+<a id="evidence-and-boundaries"></a>
+## Evidence layers & verification boundaries
+
+Call CLI separates **source implementation, offline/synthetic tests, locally installed runtime checks, live cross-CLI execution and end-user host delivery** ([`skill/references/core-requirements.md`](skill/references/core-requirements.md), [`VERIFICATION.md`](VERIFICATION.md)):
+
+| Layer | Verified scope | Explicit boundary / not claimed |
+| :-- | :-- | :-- |
+| **Source & offline test suites** | Python stdlib unit suite (`111` cases: `107` passed, `4` opt-in live/native skipped) and Node test suite (`46` passed across `test_skill_stage.cjs`, `test_shared_prompt.cjs`, `test_models.cjs`, `test_codex_ssh.cjs`). | Uses fake transports/endpoints; does not prove live model behavior or host notification routing. |
+| **Native ACPX transport (`RUN_NATIVE_ACPX_TESTS=1`)** | `2` opt-in suites (`test_native_skills`, `test_native_shared`) on real **ACPX 0.22.0** queue-owner with a synthetic ACP endpoint: callback ID collision recovery, synthetic auth, prompt error, cancellation, 3 skill modes across 2 turns, and `no-session` close. | Proves real ACPX Shared Runtime & queue-owner protocol handling; uses a synthetic endpoint rather than a live LLM provider. |
+| **Live local & SSH collaborations** | Exercised on macOS with **ACPX 0.22.0** and **AGY 1.5.3** (`gemini-4-argon` / `medium`, `claude-opus-5-5` / `medium`, `gemini-3.8-flash` / `low`) plus local **OMP**: model/effort readback, concurrent AGY + OMP execution, mid-turn `intervene` cancel+resume, and `origin`/public PDF skill passing. Cross-device Windows SSH **OMP** (`ACPX 0.21.1`) and **Pi**/**Codex** paths verified for their tested scenarios. | Each probe certifies only the exact CLI, model, entry point and device exercised—not every untested CLI/device permutation, arbitrary child-process kill, or GUI automation. |
+| **Host session & Telegram delivery** | Optional Hermes plugin (`__init__.py`) implements origin capture, background runner launch, skill schema and `intervene` state transitions in source and unit tests. | **Not claimed as end-to-end verified:** loading updated tool schemas requires a host-supported tool-table refresh or a new Hermes session (an existing session snapshot may remain stale, and in-session reload is not claimed verified here); live in-chat notification consumption, Telegram empty-notification delivery (**Issue #1**), upstream AGY error reporting (**Issue #2**), and idle wakeup after leaving a collaboration remain open / separate scope. |
+
+```sh
+# Run the standard offline verification suites (no model credentials or network required)
+python3 -B -m unittest discover -v
+node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs
+
+# Optional: real local ACPX queue-owner + synthetic ACP endpoint (no live LLM calls)
+RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_shared -v
+```
+
+<details>
+<summary><strong>Scope and safety — read before granting access</strong></summary>
+
+- **Fresh sessions only:** Call CLI never attaches to or injects input into manually opened terminals, TUIs or desktop GUIs.
+- **Approvals are not sandboxes:** OMP/Codex/Pi use `approve-reads` by default and `approve-all` with `--write`. New AGY tasks persist `agy_approval: "approve-all"` by default (or explicit `--agy-approval approve-reads`). Neither approval mode nor `write: false` is an OS/filesystem sandbox; SSH and target CLIs run with your OS account's permissions.
+- **Reconcile before retry:** `queued`/`pending` means submitted, not applied. If a turn settles as `unknown` or a client returns `do_not_replay: true`, inspect the existing session and workspace before retrying.
+- **Skill bundle hygiene:** Snapshot staging skips dotfiles, symlinks, `node_modules`, `__pycache__` and common private key filenames and enforces size/file caps, but it is **not** a malware sandbox or automated privacy scrubber. Only pass directories intended for the target model.
+- **Single-coordinator state:** Keep SQLite task databases, `client_id` handles, prompts and credentials in private user directories. One POSIX coordinator owns the SQLite store and locks; distributed multi-host locking, crash stdout replay and offline idle wakeup are not promised.
+
+</details>
 
 <a id="documentation"></a>
 ## Documentation
@@ -181,47 +269,24 @@ Runtime intervention follows an explicit contract: **request `intervene` → can
 
 | Guide | What it covers | Language |
 | :-- | :-- | :-- |
-| [Installation & configuration](docs/configuration.md) | Environment discovery, SSH, adapters, authentication, permissions and acceptance checks. | 简体中文 |
-| [CLI & module integration](docs/integrations.md) | Skill installation, optional Hermes plugin, runtime file list and backend adapter interface. | 简体中文 |
-| [Online collaboration](docs/usage.md) | Progress cursors, Q&A, runtime intervention, cancellation, verification and closure. | 简体中文 |
-| [Task skill passing](skill/references/skill-passing.md) | Local-first selection, public repo signals, `required`/`optional`/`reference` modes, staging and `CALLCLI_SKILL` receipts. | 简体中文 |
-| [AGY models & approvals](skill/references/agy-models.md) | `models.cjs` discovery, explicit `model`/`effort`, persistent `agy_approval` and outcome diagnostics. | 简体中文 |
-| [Windows Codex SSH](CODEX_SSH.md) | Desktop-context execution and native PowerShell client templates. | 简体中文 |
+| [Installation & configuration (`docs/configuration.md`)](docs/configuration.md) | Environment discovery, SSH aliases, ACPX agent config, auth, permissions, version checks and acceptance steps. | 简体中文 |
+| [CLI & module integration (`docs/integrations.md`)](docs/integrations.md) | OMP/Codex/Pi skill installation, in-CLI loading, optional Hermes plugin, 14-file runtime list and backend seam (`backends.py`). | 简体中文 |
+| [Online collaboration (`docs/usage.md`)](docs/usage.md) | `seq` cursor polling, multi-question `reply`, `intervene` cancel+resume, cancellation, verification and `close`. | 简体中文 |
+| [Core requirements (`skill/references/core-requirements.md`)](skill/references/core-requirements.md) | Canonical maintenance requirements for continuous bidirectional collaboration and layered evidence accounting. | 简体中文 |
+| [Task skill passing (`skill/references/skill-passing.md`)](skill/references/skill-passing.md) | Local-first selection, public repo signals, `required`/`optional`/`reference` modes, staging limits and `CALLCLI_SKILL` receipts. | 简体中文 |
+| [AGY models & approvals (`skill/references/agy-models.md`)](skill/references/agy-models.md) | `models.cjs` discovery, explicit `model`/`effort`, persistent `agy_approval` and `unknown` outcome diagnostics. | 简体中文 |
+| [Maintenance & version checks (`skill/references/maintenance.md`)](skill/references/maintenance.md) | Once-per-task source/installation checks and idle-only ACPX maintenance boundaries. | 简体中文 |
+| [Windows Codex SSH (`CODEX_SSH.md`)](CODEX_SSH.md) | Desktop-context `codex-ssh.cjs` bridge and native PowerShell client (`remote-client.ps1`). | 简体中文 |
 
 ### For users and contributors
 
-[Verification](VERIFICATION.md) · [Roadmap](ROADMAP.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
+[Verification (`VERIFICATION.md`, English)](VERIFICATION.md) · [Roadmap (`ROADMAP.md`, 简体中文)](ROADMAP.md) · [Security (`SECURITY.md`, English)](SECURITY.md) · [Contributing (`CONTRIBUTING.md`, English)](CONTRIBUTING.md) · [License (`LICENSE`)](LICENSE)
 
-<details>
-<summary><strong>Scope and safety — read before granting access</strong></summary>
-
-- **Fresh collaboration sessions only.** Call CLI never takes over manually opened terminals, TUIs or desktop GUIs.
-- `queued` / `pending` means submitted, not applied. Reconcile `unknown` / `DO_NOT_REPLAY` against the existing session and workspace before retrying.
-- OMP/Codex/Pi use `approve-reads` by default and select `approve-all` with `--write`. New AGY tasks persist `agy_approval: "approve-all"` by default (or explicit `approve-reads`). Neither approval policy nor `write: false` is an OS/filesystem sandbox; SSH and the target CLI run with the configured OS account's permissions.
-- Skill staging filters dotfiles, symlinks, `node_modules`, `__pycache__` and common key filenames, and enforces size/file-count caps, but it is **not** a malware sandbox or automated privacy audit. Only pass directories and resources intended for the target model.
-- Keep task databases, client handles, prompts, answers and authentication private. “Public event” means non-internal coordinator output, not redacted user data.
-- One POSIX coordinator owns state and locks. Distributed locking across multiple coordinators, crash/restart notification replay and automatic wakeup after leaving a collaboration are not promised.
-- Source tests, locally installed runtime checks, cross-device probes and live host/Telegram delivery prove different claims. See [VERIFICATION.md](VERIFICATION.md).
-
-</details>
-
-<a id="development"></a>
-## Development & verification
-
-The Python coordinator uses the standard library. New capabilities—including AGY model/effort forwarding and persistent default `approve-all`, modular backend adapters, resumable settlement events, concurrent AGY + OMP runs, and task skill passing—have been installed locally and exercised in real local collaborations, alongside source-level cross-device Windows SSH OMP skill-passing checks and offline/synthetic test suites. Fresh in-memory Hermes sessions require reload to expose updated tool schemas, and live Telegram empty-notification delivery (Issue #1) and upstream AGY error reporting (Issue #2) remain open; see [VERIFICATION.md](VERIFICATION.md) for exact evidence boundaries.
-
-```sh
-python3 -B -m unittest discover -v
-node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs
-# Optional: owned native ACPX sessions with synthetic endpoint (no live model call)
-RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_shared -v
-```
-
-Live model and cross-device verification require explicit execution authorization and existing target CLI logins; private run journals are excluded from Git. The optional banner generator in `docs/assets/` uses Pillow and is **not** a runtime dependency.
+*Note: `docs/assets/render_banner.py` uses Pillow only when regenerating repository artwork; Pillow is not a runtime or test dependency of Call CLI.*
 
 ## Acknowledgements
 
-Built on [ACPX](https://github.com/openclaw/acpx) and the native capabilities of the target CLIs. Call CLI is not affiliated with those projects.
+Built on [ACPX](https://github.com/openclaw/acpx) and the native capabilities of OMP, Codex, Pi, AGY and Hermes. Call CLI is an independent project and is not affiliated with those upstream tools.
 
 <div align="center">
 
