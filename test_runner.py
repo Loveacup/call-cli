@@ -1,5 +1,5 @@
 import unittest
-from runner import command, protocol_prompt
+from transport import command, protocol_prompt
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -53,6 +53,8 @@ def output(message):
         stop=message['result']['stopReason']
         print(json.dumps({'type':'callcli.shared.result','requestId':request,'status':'failed'if failed else ('cancelled'if stop=='cancelled'else'completed'),'stopReason':stop}),flush=True);return
     update=message['params']['update']
+    if update.get('sessionUpdate') in {'tool_call', 'tool_call_update'}:
+        print(json.dumps({'type':'callcli.shared.event','requestId':request,'event':dict(update,type='tool_call',title=update.get('title',''))}),flush=True);return
     print(json.dumps({'type':'callcli.shared.event','requestId':request,'event':{'type':'text_delta','stream':'output','tag':'agent_message_chunk','text':update['content']['text']}}),flush=True)
 with (root/'calls.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 if '--version' in args:
@@ -80,11 +82,17 @@ if 'BLOCK' in text:
         output({'result':{'stopReason':'end_turn' if mode == 'end_turn' else 'cancelled'}})
     raise SystemExit(255 if mode == 'exit255' else 0)
 if 'EMPTY' in text:raise SystemExit(0)
+for tool in json.loads(os.environ.get('ACPX_FAKE_TOOLS','[]')):
+    output({'params':{'update':dict(tool,sessionUpdate='tool_call_update')}})
 answer='CALLCLI_QUESTION Which format?\n' if 'ASK' in text else 'CALLCLI_STAGE ready\nFAKE_ANSWER\n'
 chunks=json.loads(os.environ['ACPX_FAKE_CHUNKS']) if os.environ.get('ACPX_FAKE_CHUNKS') else [answer[:8],answer[8:]]
 for chunk in chunks:
     output({'params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':chunk}}}})
+for tool in json.loads(os.environ.get('ACPX_FAKE_TRAILING_TOOLS','[]')):
+    output({'params':{'update':dict(tool,sessionUpdate='tool_call_update')}})
+if os.environ.get('ACPX_FAKE_RESULT_FAILED'):output({'error':{'code':-1,'message':'transport failed'}})
 output({'result':{'stopReason':'end_turn'}})
+raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
 ''')
         fake.chmod(0o700)
         node=self.root/'node';node.write_bytes(fake.read_bytes());node.chmod(0o700)
@@ -104,6 +112,119 @@ output({'result':{'stopReason':'end_turn'}})
     def task(self,prompt):
         t=self.store.create(self.origin,'local','omp',str(self.root),prompt,False)
         return self.store.update(t['id'],shell='posix',timeout=30)
+    def test_intervention_advance_keeps_settlement_event_and_cursor(self):
+        import contextlib, io, json
+        from unittest.mock import patch
+        from backends import TurnResult, backend_for
+        from bridge import Store
+        from runner import run_task
+        task = self.task('old task')
+        self.store.update(task['id'], needs_session=True, acpx_created=False)
+        finish = Store.finish_turn
+        observed = []
+        def cancelled(store, current, emit):
+            self.store.intervene(task['id'], self.origin, 'normal task', 'revision')
+            return TurnResult('cancelled', 0, 'cancelled')
+        def advance_after_commit(store, *args, **kwargs):
+            settled = finish(store, *args, **kwargs)
+            observed.extend(self.store.events(task['id'], self.origin))
+            resumed, launch = self.store.advance_intervention(task['id'], self.origin)
+            self.assertTrue(launch)
+            self.assertEqual((resumed['state'], resumed['turn']), ('queued', 2))
+            return settled
+        output = io.StringIO()
+        with patch.object(backend_for('omp'), 'run', cancelled), \
+                patch.object(Store, 'finish_turn', advance_after_commit), contextlib.redirect_stdout(output):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        self.assertEqual([(e['turn'], e['kind']) for e in observed], [(1, 'started'), (1, 'cancelled')])
+        frames = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([f['event'] for f in frames], ['cancelled'])
+        terminal = frames[0]
+        persisted = self.store.events(task['id'], self.origin, terminal['seq']-1)
+        self.assertEqual([(e['seq'], e['token'], e['kind']) for e in persisted],
+                         [(terminal['seq'], terminal['event_id'], 'cancelled')])
+        self.assertIn('resume', terminal['next_action'])
+        self.assertFalse(self.store.finish_turn(task['id'], 1, 'cancelled', 0, 'cancelled'))
+        with self.assertRaises(ValueError):
+            self.store.reply(task['id'], self.origin, '', 'bypass')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        resumed_events = self.store.events(task['id'], self.origin, terminal['seq'])
+        self.assertTrue(all(e['turn'] == 2 for e in resumed_events))
+        self.assertEqual([e['text'] for e in resumed_events if e['kind'] == 'answer'], ['FAKE_ANSWER'])
+        final = self.store.get(task['id'])
+        self.assertEqual((final['state'], final['turn'], final['session']), ('completed', 2, task['session']))
+        self.assertEqual(final['intervention']['target_turn'], 2)
+        self.assertEqual([e['kind'] for e in self.store.events(task['id'], self.origin)].count('cancelled'), 1)
+
+    def test_rejected_runner_settlement_never_broadcasts_a_terminal_event(self):
+        import contextlib, io
+        from unittest.mock import patch
+        from backends import TurnResult, backend_for
+        from runner import run_task
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                task = self.task('old task')
+                def already_settled(store, current, emit):
+                    store.finish_turn(task['id'], 1, 'completed', 0, 'end_turn')
+                    if raises:
+                        raise RuntimeError('late error')
+                    return TurnResult('cancelled', 0, 'cancelled')
+                output = io.StringIO()
+                with patch.object(backend_for('omp'), 'run', already_settled), contextlib.redirect_stdout(output):
+                    self.assertEqual(run_task(self.store.path, task['id']), 1 if raises else 0)
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(self.store.get(task['id'])['state'], 'completed')
+                self.assertEqual([e['kind'] for e in self.store.events(task['id'], self.origin)],
+                                 ['started', 'completed'])
+
+    def test_concurrent_close_does_not_replace_terminal_settlement_notification(self):
+        import contextlib, io, json
+        from unittest.mock import patch
+        from bridge import Store
+        from runner import run_task
+        task = self.task('normal task')
+        finish = Store.finish_turn
+        def close_after_settlement(store, *args, **kwargs):
+            settled = finish(store, *args, **kwargs)
+            store.begin_close(task['id'], self.origin)
+            return settled
+        output = io.StringIO()
+        with patch.object(Store, 'finish_turn', close_after_settlement), contextlib.redirect_stdout(output):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        self.assertEqual(self.store.get(task['id'])['state'], 'closing')
+        terminal = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(terminal['event'], 'completed')
+        self.assertIn('FAKE_ANSWER', terminal['answer_tail'])
+
+    def test_notifications_resume_by_cursor_and_keep_questions_answers_and_tools(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        task = self.task('ASK')
+        tool = {'toolCallId':'read1','title':'read_file','kind':'read','status':'in_progress'}
+        output = io.StringIO()
+        with patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([tool, tool, dict(tool,status='completed')])}), contextlib.redirect_stdout(output):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        frames = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertTrue(any(f['event']=='tool' and 'read_file' in f['text'] for f in frames))
+        for frame in frames:
+            persisted = self.store.events(task['id'], self.origin, frame['seq']-1)[0]
+            self.assertEqual((persisted['seq'], persisted['token']), (frame['seq'], frame['event_id']))
+        tools = [e for e in self.store.events(task['id'], self.origin) if e['kind']=='tool']
+        self.assertEqual([e['text'] for e in tools], ['read1 read_file read in_progress', 'read1 read_file read completed'])
+        question = next(f for f in frames if f['event']=='question')
+        self.assertEqual(frames[-1]['question_ids'], [question['event_id']])
+        cursor = frames[-1]['seq']
+        self.store.reply(task['id'], self.origin, question['event_id'], 'normal task')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        resumed = self.store.events(task['id'], self.origin, cursor)
+        self.assertTrue(all(e['turn']==2 for e in resumed))
+        self.assertEqual([e['text'] for e in resumed if e['kind']=='answer'], ['FAKE_ANSWER'])
+        self.assertIn('FAKE_ANSWER', json.loads(output.getvalue().splitlines()[-1])['answer_tail'])
+
 
     def test_prompt_uses_shared_runtime_and_persists_native_record_identity(self):
         import json
@@ -250,6 +371,78 @@ output({'result':{'stopReason':'end_turn'}})
     def test_fatal_marker_is_scoped_to_agy(self):
         rc, state, _ = self.run_agy([self.AGY_FATAL], agent='omp')
         self.assertEqual((rc, state['state']), (0, 'completed'))
+    def test_agy_failed_tool_without_final_answer_is_unknown_not_completed(self):
+        import os, json
+        from unittest.mock import patch
+        from runner import run_task
+        for chunks in ([], ['CALLCLI_STAGE attempting shell\n']):
+            with self.subTest(chunks=chunks), patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([
+                    {'toolCallId':'shell1','title':'run_command','kind':'execute','status':'failed',
+                     'rawInput':'PRIVATE_INPUT','rawOutput':'PRIVATE_OUTPUT'}])}):
+                rc, state, events = self.run_agy(chunks)
+                self.assertEqual((rc, state['state'], state['stop_reason'], state['exit_code']),
+                                 (1, 'unknown', 'end_turn', 0))
+                self.assertIn('tool failed without a final answer', state['settlement_note'])
+                self.assertIn('permission decisions are not observable', state['settlement_note'])
+                tools = [e['text'] for e in events if e['kind']=='tool']
+                self.assertTrue(any('run_command' in text and 'execute' in text and 'failed' in text for text in tools))
+                self.assertNotIn('PRIVATE', json.dumps(events))
+                with self.assertRaises(ValueError):
+                    run_task(self.store.path, state['id'])
+
+    def test_agy_transport_failure_keeps_direct_failure_explanation(self):
+        import os, json
+        from unittest.mock import patch
+        for transport in ({'ACPX_FAKE_EXIT':'1'}, {'ACPX_FAKE_RESULT_FAILED':'1'}):
+            with self.subTest(transport=transport), patch.dict(os.environ, dict(transport,
+                    ACPX_FAKE_TOOLS=json.dumps([{'toolCallId':'shell1','kind':'execute','status':'failed'}]))):
+                rc, state, events = self.run_agy(['CALLCLI_STAGE attempting shell\n'])
+                self.assertEqual((rc, state['state']), (1, 'unknown'))
+                self.assertIsNone(state.get('settlement_note'))
+                self.assertEqual(events[-1]['text'], 'Prompt exited '+str(state['exit_code']))
+                self.assertNotIn('permission', events[-1]['text'])
+
+    def test_agy_fatal_line_retains_precedence_on_nonzero_transport_exit(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'ACPX_FAKE_EXIT':'1'}):
+            rc, state, _ = self.run_agy([self.AGY_FATAL])
+        self.assertEqual((rc, state['state'], state['exit_code']), (1, 'unknown', 1))
+        self.assertIn('fatal execution error', state['settlement_note'])
+
+    def test_duplicate_tool_status_after_answer_still_invalidates_final_answer_window(self):
+        import os, json
+        from unittest.mock import patch
+        failed = {'toolCallId':'shell1','kind':'execute','status':'failed'}
+        with patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([failed]),
+                                    'ACPX_FAKE_TRAILING_TOOLS':json.dumps([failed])}):
+            rc, state, events = self.run_agy(['Partial result before repeated tool update.\n'])
+        self.assertEqual((rc, state['state']), (1, 'unknown'))
+        self.assertIn('tool failed without a final answer', state['settlement_note'])
+        self.assertEqual([e['text'] for e in events if e['kind']=='tool'], ['shell1 execute failed'])
+
+    def test_agy_tool_failure_can_recover_with_final_answer(self):
+        import os, json
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([
+                {'toolCallId':'read1','title':'read_file','kind':'read','status':'failed'},
+                {'toolCallId':'read2','title':'read_file','kind':'read','status':'completed'}])}):
+            rc, state, _ = self.run_agy(['Recovered using alternate file; result is 42.\n'])
+            self.assertEqual((rc, state['state']), (0, 'completed'))
+            self.assertIsNone(state.get('settlement_note'))
+
+    def test_agy_failed_tool_can_ask_and_receive_reply(self):
+        import os, json
+        from unittest.mock import patch
+        from runner import run_task
+        with patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([
+                {'toolCallId':'read1','title':'read_file','kind':'read','status':'failed'}])}):
+            rc, state, _ = self.run_agy(['CALLCLI_QUESTION Which file should I read?\n'])
+        self.assertEqual((rc, state['state']), (0, 'waiting_reply'))
+        self.store.reply(state['id'], self.origin, state['question_id'], 'Use the supplied answer instead')
+        self.assertEqual(run_task(self.store.path, state['id']), 0)
+        self.assertEqual(self.store.get(state['id'])['state'], 'completed')
+
 
     def test_cancelling_one_parallel_task_does_not_cancel_the_other(self):
         import concurrent.futures,time

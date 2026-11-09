@@ -149,3 +149,43 @@ test('credential-loader exceptions fail before native submission without leaking
   assert.equal(frames.at(-1).status, 'failed');
   assert.doesNotMatch(JSON.stringify(frames), /SYNTHETIC_PRIVATE_CREDENTIAL/);
 });
+
+test('safe tool identifiers survive projection but tool bodies and command titles do not', async () => {
+  const frames = [];
+  await run({...options, permissionMode: 'approve-all'}, 'task', {
+    loadAuth: async () => ({authCredentials: {}, authPolicy: 'skip'}),
+    loadRuntime: async () => ({createSharedAcpRuntime: () => ({
+      startTurn: () => ({events: (async function* () {
+        yield {type:'tool_call', toolCallId:'shell1', title:'run_command', kind:'execute', status:'failed',
+          text:'PRIVATE_SUMMARY', rawInput:'PRIVATE_INPUT', rawOutput:'PRIVATE_OUTPUT', content:['PRIVATE_CONTENT']};
+        yield {type:'tool_call', toolCallId:'shell2', title:'printf PRIVATE_ARG', kind:'execute', status:'completed'};
+        yield {type:'tool_call', toolCallId:'123', title:'private/path', status:'failed'};
+      })(), result:Promise.resolve({status:'completed', stopReason:'end_turn'})}),
+      shutdown: async () => {}
+    })}),
+    send: async frame => frames.push(frame)
+  });
+  assert.deepEqual(frames[0].event, {type:'tool_call', toolCallId:'shell1', title:'run_command', kind:'execute', status:'failed'});
+  assert.equal(frames[2].event.toolCallId, '123');
+  assert.equal(frames[2].event.title, undefined);
+  assert.doesNotMatch(JSON.stringify(frames), /PRIVATE/);
+});
+
+test('explicit approval wins over write while legacy mapping stays supported', async () => {
+  for (const [input, expected] of [
+    [{...options, permissionMode:'approve-all'}, 'approve-all'],
+    [{...options, write:true, permissionMode:'approve-reads'}, 'approve-reads'],
+    [{...options, write:true}, 'approve-all']
+  ]) {
+    let policy;
+    const code = await run(input, 'task', {
+      loadAuth: async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime: async () => ({createSharedAcpRuntime: config => {
+        policy = config.permissionMode;
+        return {startTurn: () => ({events:(async function* () {})(), result:Promise.resolve({status:'completed',stopReason:'end_turn'})}), shutdown:async () => {}};
+      }}), send:async () => {}
+    });
+    assert.equal(code, 0);
+    assert.equal(policy, expected);
+  }
+});

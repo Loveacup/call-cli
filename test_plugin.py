@@ -53,13 +53,19 @@ class PluginTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             env = {'HERMES_SESSION_ID':'s1', 'HERMES_SESSION_KEY':'key'}
             ctx = Ctx(); c = mod.Coordinator(ctx, Path(d), lambda k,x='':env.get(k,x))
-            task = c.handle({'action':'start','agent':'agy','cwd':d,'prompt':'inspect','model':'live-family','effort':'low'})['task']
+            task = c.handle({'action':'start','agent':'agy','cwd':d,'prompt':'inspect','model':'live-family','effort':'low',
+                             'agy_approval':'approve-reads'})['task']
             store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
             store.update(task['id'], state='completed')
             resumed = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue'})['task']
             self.assertEqual(resumed['model'], 'live-family')
             self.assertEqual(resumed['effort'], 'low')
             self.assertEqual(resumed['session'], task['session'])
+            self.assertEqual(resumed['agy_approval'], 'approve-reads')
+            default = c.handle({'action':'start','agent':'agy','cwd':d,'prompt':'inspect','model':'live-family'})['task']
+            self.assertEqual(default['agy_approval'], 'approve-all')
+            with self.assertRaises(ValueError):
+                c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect','agy_approval':'approve-all'})
 
     def test_hermes_intervention_waits_for_confirmation_then_resumes_once(self):
         mod=load_plugin()

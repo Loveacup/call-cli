@@ -32,120 +32,8 @@ def capture_origin(get_env, profile):
                   get_env('HERMES_SESSION_CHAT_ID',''), get_env('HERMES_SESSION_THREAD_ID',''))
 
 
-# AGY ACP emits this exact public line, then a normal end_turn, when its model
-# execution fails. It is matched only as the final nonempty line of the turn's
-# concatenated public output (so chunk splits do not matter); quotes, prefixes,
-# suffixes or later content are ordinary text. A match denies completion only;
-# it is not a root cause and never authorizes replay.
-AGY_FATAL_LINE = '\u26a0 Agent execution terminated due to error.'
 
 
-def agy_fatal_error(text):
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return bool(lines) and lines[-1] == AGY_FATAL_LINE
-
-
-class EventDecoder:
-    """Only public assistant messages and minimal tool status reach the event log."""
-    def __init__(self, shared_request_id=None):
-        self.text = ''
-        self.pending = ''
-        self.stop_reason = None
-        self.failed = False
-        self.prompt_id = None
-        self.read_callbacks = set()
-        self.shared_request_id = shared_request_id
-        self.shared_result_seen = False
-
-    def _shared_message(self, frame):
-        # The facade emits a terminal frame only after the native turn.result settles.
-        if frame.get('requestId') != self.shared_request_id or self.shared_result_seen:
-            self.failed = True
-            return None
-        if frame.get('type') == 'callcli.shared.result':
-            self.shared_result_seen = True
-            pair = (frame.get('status'), frame.get('stopReason'))
-            if pair in {('completed', 'end_turn'), ('cancelled', 'cancelled')}:
-                self.stop_reason = frame['stopReason']
-            else:
-                self.failed = True
-            return None
-        if frame.get('type') != 'callcli.shared.event':
-            self.failed = True
-            return None
-        event = frame.get('event', {})
-        if (event.get('type') == 'text_delta' and event.get('stream') == 'output'
-                and event.get('tag') == 'agent_message_chunk' and isinstance(event.get('text'), str)):
-            update = {'sessionUpdate': 'agent_message_chunk',
-                      'content': {'type': 'text', 'text': event['text']}}
-        elif event.get('type') == 'tool_call':
-            update = {'sessionUpdate': 'tool_call_update',
-                      'toolCallId': event.get('toolCallId', ''), 'status': event.get('status', '')}
-        else:
-            return None
-        return {'params': {'update': update}}
-
-    def feed(self, event):
-        if self.shared_request_id is not None:
-            message = self._shared_message(event)
-            if message is None:
-                return []
-        else:
-            message = event.get('message', event)
-        self._legacy_rpc(message)
-        update = message.get('params', {}).get('update', {})
-        kind = update.get('sessionUpdate')
-        if kind in {'tool_call','tool_call_update'}:
-            # Text blocks often omit a trailing newline. A tool boundary ends
-            # the preceding public block; publish it before the tool runs.
-            out = self.finish()
-            return out + [('tool', str(update.get('toolCallId',''))+' '+str(update.get('status','')))]
-        if kind != 'agent_message_chunk':
-            return []
-        content = update.get('content', {})
-        chunk = content.get('text','') if isinstance(content,dict) else ''
-        self.text = (self.text + chunk)[-64000:]
-        self.pending = (self.pending + chunk)[-64000:]
-        out = []
-        while '\n' in self.pending:
-            line, self.pending = self.pending.split('\n',1)
-            out.extend(self.line(line))
-        return out
-
-    def _legacy_rpc(self, message):
-        rpc_id, method = message.get('id'), message.get('method')
-        if method == 'session/prompt':
-            self.prompt_id = rpc_id
-        if method and rpc_id is not None:
-            self.read_callbacks.discard(rpc_id)
-            if method == 'fs/read_text_file':
-                self.read_callbacks.add(rpc_id)
-        if message.get('error'):
-            # A failed read callback may be recovered by the agent. Only ignore
-            # a correlated read response distinct from the active prompt ID;
-            # unclassified errors and bidirectional ID collisions fail closed.
-            recovered_read = (self.prompt_id is not None and rpc_id != self.prompt_id
-                              and rpc_id in self.read_callbacks)
-            if not recovered_read:
-                self.failed = True
-        if 'error' in message or 'result' in message:
-            self.read_callbacks.discard(rpc_id)
-        result = message.get('result', {})
-        if isinstance(result,dict) and 'stopReason' in result:
-            self.stop_reason = result['stopReason']
-
-    @staticmethod
-    def line(line):
-        line = line.strip()
-        for prefix,kind in [('CALLCLI_STAGE ','stage'),('CALLCLI_QUESTION ','question')]:
-            if line.startswith(prefix):
-                return [(kind,line[len(prefix):][:8000])]
-        return [('answer',line[:8000])] if line else []
-
-    def finish(self):
-        out = self.line(self.pending)
-        self.pending = ''
-        return out
 
 
 class Store:
@@ -167,7 +55,7 @@ class Store:
         finally:
             db.close()
 
-    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None):
+    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None, skills=None):
         task_id = uuid.uuid4().hex[:16]
         data = dict(id=task_id, session='call-'+task_id, origin=dataclasses.asdict(origin),
                     device=device, device_key=device_key or device, agent=agent, cwd=cwd, prompt=prompt, write=write,
@@ -175,6 +63,12 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             self._check_writers(db, data)
+            if skills is not None:
+                try:
+                    from .skills import snapshot
+                except ImportError:
+                    from skills import snapshot
+                data['skills'] = snapshot(skills, self.path, task_id)
             db.execute('INSERT INTO tasks VALUES (?,?,?)', (task_id, origin.key(), json.dumps(data)))
         return data
 
@@ -239,16 +133,24 @@ class Store:
                 return False
             # Dedupe happens before mutating task state.
             event = dict(token=token, kind=kind, text=text[:8000], **metadata)
-            count = db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?)', (task_id, token, json.dumps(event))).rowcount
-            if not count:
+            inserted = db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?)', (task_id, token, json.dumps(event)))
+            if not inserted.rowcount:
                 return False
+            if kind == 'skill':
+                parts = text.split(None, 2)
+                ids = {s['id'] for s in task.get('skills', [])}
+                if (len(parts) >= 2 and parts[0] in ids and
+                        parts[1] in {'read', 'adopted', 'not_adopted', 'not_applicable', 'unavailable'}):
+                    task.setdefault('skill_reports', {}).setdefault(str(task['turn']), {})[parts[0]] = dict(
+                        status=parts[1], reason=parts[2][:4000] if len(parts) == 3 else '', token=token)
+                    self._save(db, task)
             if kind == 'question':
                 task['question_id'] = token
                 task.setdefault('questions', []).append(token)
                 if task['state'] == 'queued':
                     task['state'] = 'waiting_reply'
                 self._save(db, task)
-        return True
+        return inserted.lastrowid
 
     def reply(self, task_id, origin, question_id, prompt):
         with self.connect() as db:
@@ -391,18 +293,32 @@ class Store:
             self._save(db,task)
         return True
 
-    def finish_turn(self,task_id,turn,state,rc,stop_reason,note=None):
+    def finish_turn(self,task_id,turn,state,rc,stop_reason,note=None,*,text=None,answer_tail=''):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
             if task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
             if state=='completed' and task['question_id']:state='waiting_reply'
             task.update(state=state,exit_code=rc,stop_reason=stop_reason,runner_pid=0,prompt='')
+            if task.get('skills'):
+                reports = task.get('skill_reports', {}).get(str(turn), {})
+                task['skill_report_missing'] = [s['id'] for s in task['skills']
+                                                if s['mode'] == 'required' and s['id'] not in reports]
+                task['skill_verification'] = 'unverified' if task['skill_report_missing'] else 'reported'
             # Per-turn: never carry an earlier turn's diagnosis forward.
             task.pop('settlement_note',None)
             if note:task['settlement_note']=note
+            # Persist before another caller can advance the turn or close the task.
+            event = dict(token=str(turn)+':settled', kind=state,
+                         text=(text if text is not None else note or 'Prompt exited '+str(rc))[:8000],
+                         turn=turn, question_ids=task.get('questions', []), answer_tail=answer_tail)
+            if task.get('intervention', {}).get('status') == 'pending':
+                event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
+            inserted = db.execute('INSERT INTO events VALUES (?,?,?)',
+                                  (task_id, event['token'], json.dumps(event)))
+            event['seq'] = inserted.lastrowid
             self._save(db,task)
-        return True
+        return event
 
     def events(self, task_id, origin, after=0):
         self.get(task_id, origin)

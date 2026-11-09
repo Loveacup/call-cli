@@ -14,6 +14,7 @@ from pathlib import Path
 from bridge import Store, Origin
 from runner import control as runner_control
 from updates import device_lock
+from backends import BACKENDS, prepare_start
 
 DEFAULT_DB = Path.home()/'.hermes/plugin-data/call-cli/tasks.sqlite3'
 
@@ -69,25 +70,23 @@ class Collaboration:
         return client
 
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
-              remote_shell='posix', write=False, resource='', timeout=900, model=None, effort=None):
-        from runner import device_identity
+              remote_shell='posix', write=False, resource='', timeout=900, model=None, effort=None,
+              agy_approval=None, skills=None):
+        from transport import device_identity
         origin = self.origin(client)
-        if agent not in {'omp', 'codex', 'pi', 'agy'} or remote_shell not in {'posix', 'powershell'}:
+        if remote_shell not in {'posix', 'powershell'}:
             raise ValueError('Invalid agent or remote shell')
         if not prompt.strip() or not cwd or not 0 < timeout <= 86400:
             raise ValueError('Nonempty prompt/cwd and timeout in (0,86400] required')
-        from runner import validate_selection
-        validate_selection(agent, model, effort)
+        fields = prepare_start(agent, model, effort, agy_approval)
         from pathlib import PurePosixPath, PureWindowsPath
         path_type=Path if device=='local' else (PureWindowsPath if remote_shell=='powershell' else PurePosixPath)
         if not path_type(cwd).is_absolute():
             raise ValueError('cwd must be absolute on the execution device; disable shell path conversion')
         task = self.store.create(origin, device, agent, cwd, prompt, write, resource,
-                                 device_key=device_identity(device))
+                                 device_key=device_identity(device), skills=skills)
         task = self.store.update(task['id'], shell=remote_shell, timeout=timeout,
-                                 needs_session=True, acpx_created=False, session_creation_attempted=False,
-                                 **({ 'model': model } if model is not None else {}),
-                                 **({ 'effort': effort } if effort is not None else {}))
+                                 needs_session=True, acpx_created=False, session_creation_attempted=False, **fields)
         self._dispatch(task)
         return self.status(client, task['id'])
 
@@ -201,6 +200,9 @@ class Collaboration:
                                        and snapshot.get('status') == 'no-session')
         finally:
             self.store.finish_close(task_id, task['turn'], success)
+            if success:
+                from skills import cleanup
+                cleanup(self.store, task)
         return self.status(client, task_id)
 
     def origin(self, client):
@@ -222,15 +224,20 @@ def main(argv=None):
                          help='Declared caller runtime (not verified native provenance)')
     start = sub.add_parser('start')
     start.add_argument('--device', default='local')
-    start.add_argument('--agent', choices=['omp', 'codex', 'pi', 'agy'], default='codex')
+    start.add_argument('--agent', choices=list(BACKENDS), default='codex')
     start.add_argument('--model', help='Exact advertised ACP model ID; required for AGY')
     start.add_argument('--effort', help='Exact advertised thought_level value (AGY)')
+    start.add_argument('--agy-approval', choices=['approve-all', 'approve-reads'],
+                       help='AGY only: new tasks default to approve-all; approve-reads denies shell/write requests')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
     start.add_argument('--write', action='store_true')
     start.add_argument('--resource', default='')
     start.add_argument('--timeout', type=float, default=900)
     start.add_argument('--prompt', required=True)
+    start.add_argument('--skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot a coordinator-side skill directory')
+    start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
+    start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
     sub.add_parser('list')
     for action in ['status', 'events', 'wait', 'reply', 'intervene', 'cancel', 'close']:
         p = sub.add_parser(action)
@@ -254,6 +261,18 @@ def main(argv=None):
         if action != 'connect' and not client:
             raise ValueError('--client is required for this action')
         c = Collaboration(db)
+        if action == 'start':
+            skills = json.loads(opts.pop('skills_json') or '[]')
+            if not isinstance(skills, list):
+                raise ValueError('--skills-json must be an array')
+            for key, location in [('skill', 'origin'), ('target_skill', 'target')]:
+                for value in opts.pop(key):
+                    mode, sep, path = value.partition('=')
+                    if not sep:
+                        raise ValueError('Use MODE=PATH for skill selections')
+                    skills.append(dict(mode=mode, path=path, location=location))
+            if skills:
+                opts['skills'] = skills
         if action == 'connect':
             result = c.connect(**opts)
         else:

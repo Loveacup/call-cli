@@ -86,6 +86,22 @@ hermes plugins doctor call-cli
 
 升级前没有 `needs_session` / `acpx_created` / `session_creation_attempted` 的旧 Hermes 任务，仅凭 `cancelled`、空 process ID 或字段缺失不能推断会话尚未创建。已有 native record ID 则复用；没有 ID 时，只有第一轮取消终态及该轮 runner 持久事件 `Cancelled before provider launch` 同时存在，才允许续轮首次创建。证据不足会在记录介入或取消旧轮之前明确拒绝，提示先核对旧任务再使用新的 `start`，不猜测重建。取消发生在 runner 启动前、没有此事件的旧记录也遵循拒绝策略。
 
+## 后端扩展接口
+
+`bridge.py` 只管理任务归属、状态机、轮次、问题、介入、游标和 writer 占用；`runner.py` 认领一轮、持久化公开事件并通过宿主原有 stdout 通知。`backends.py` 是唯一后端注册表，两个入口共用 `prepare_start`，CLI choices 与 Hermes schema 从注册表生成。
+
+一个适配器提供三个方法：`prepare_start(model, effort, approval)` 返回持久选择字段；`run(store, task, emit)` 执行已认领轮次，发出安全的 `stage/answer/question/tool` 事件并返回 `TurnResult(state, exit_code, stop_reason, note)`；`control(task, action, timeout)` 提供精确会话控制与关闭后的 `status_snapshot/no-session` 读回。执行中检查共享任务的 `cancelling`，只有执行真正结算才能返回 cancelled；未知结果返回 unknown，不重放。适配器不修改归属、轮次或 writer 占用；现有设备锁可以复用，不新增进程服务或状态库。新增后端只需实现并注册它，随 runner 安装，不必修改其他后端；不要求使用 ACP。
+
+当前扩展边界：公共 start 仍显式接受 AGY 专用 `agy_approval`，并以第三个 `approval` 参数交给适配器；不存在通用后端私有参数字典。close 仍沿用 ACPX 风格约定：CLI 要求 JSON `action=status_snapshot`、`status=no-session`；Hermes 端检查 stdout 的 `no-session` / `not running` 字符串。非 ACP 适配器必须归一化到此控制返回格式。这不阻碍已实现的 fake 后端；未来出现实际专属参数或关闭格式需求时再扩展公共契约，不代表任意新后端零入口修改。
+
+结算状态与该轮唯一 `<turn>:settled` 事件在同一事务提交，事件带持久 seq、问题 ID、回答摘要和适用的介入续作提示。runner 仅打印事务接受的结算事件；即使其后轮次已推进或进入关闭，也不会丢弃这个已合法结算的通知。被拒绝的旧 runner 不广播终态，普通旧轮事件过滤保持不变；游标补读可恢复已入库事件，不承诺进程崩溃后的 stdout 重放。
+
+当前 `acpx_backend.py` 负责 ACPX 命令、会话创建、模型读回、共享安装锁与 Shared Runtime 传输；`transport.py` 保留通用本机/SSH 命令和协作协议；`events.py` 规范化 ACP 公开事件。OMP/Codex/Pi 使用该适配器原默认策略，AGY 在 `agy.py` 局部覆盖 raw command、显式 model/effort、默认 approve-all、提示与结果判断。`test_backends.py` 用非 ACP fake 后端通过同一公开协调入口完成问答、运行期介入、续轮、隔离、writer 冲突和关闭；这不是模型或宿主通知验收。
+
+公共 start 可选 `skills` 数组，两个入口通过 Store 创建固定快照；ACPX 后端每轮在 prompt 前经现有目标命令暂存并加入技能路径/模式提示。其他后端可复用 `skills.stage(store, task, emit)` 与 `skills.guidance(task)`，不使用时不得声称支持读取。目标 `CALLCLI_SKILL` 行规范化为独立 skill 事件，Store 按轮次记录实际自报；required 缺报只标未验证，不改业务结算。契约、限制和选择策略见[技能传递](../skill/references/skill-passing.md)。
+
+运行时安装必须一起包含 `__init__.py`、`collab.py`、`bridge.py`、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`、`models.cjs`。源码变更不会自动更新已安装副本或已加载 schema。
+
 ## 回报用户
 
 简短说明安装的是哪一层、所在设备／profile、实际入口、技能是否加载、真实任务结果和未解决项。安装文件、Doctor、一次模型执行、跨设备闭环分别报告。自动唤醒或 Telegram 多 topic 投递未独立验收时不顺带声称已通过。

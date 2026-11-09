@@ -32,6 +32,8 @@ You plan in one CLI. Another agent implements on a different machine. A third re
 | 🌐 | **Local or cross-device** | One POSIX coordinator reaches execution devices through existing SSH. |
 | 🔒 | **Honest execution state** | Authoritative Shared Runtime results; unknown outcomes are not silently replayed. |
 
+Pass selected skills as required, optional or reference bundles, pinned across turns and staged on the execution device; inspect actual read/adoption receipts. See [skill passing](skill/references/skill-passing.md).
+
 ## Quick start
 
 ### Ask your AI to set it up
@@ -101,6 +103,10 @@ A client ID is a local capability handle; `--runtime omp` is a declaration, not 
 
 **AGY:** run `node models.cjs /absolute/workdir` on the execution device, choose an exact advertised ACP ID, then pass `--agent agy --model ID` (Hermes: `agent: "agy", model: "ID"`). Optional `--effort VALUE` uses the advertised `thought_level`, not a guessed model suffix. The initiator chooses; explicit user choice wins. Selection is persisted and read back before each turn; unavailable choices fail without provider fallback. [Model workflow](skill/references/agy-models.md)
 
+New AGY tasks persist `agy_approval: "approve-all"` by default, including when `write` is false. For explicit read-only approvals use `--agy-approval approve-reads` (Hermes: `agy_approval: "approve-reads"`); shell/write permission requests then deny non-interactively. This is an approval policy, not a filesystem sandbox. Set `--write` separately for authorized edits and workspace reservation. Replies/interventions preserve the policy; old tasks missing the field keep their original `write` mapping. OMP/Codex/Pi defaults are unchanged. Native read/search tools are preferred; authorized shell remains available.
+
+AGY tool failure with neither a final answer nor a pending question, or its exact fatal final line, settles as `unknown` even after protocol `end_turn`/exit 0; no automatic replay. A pending question stays `waiting_reply` and can be answered; the fatal final line still overrides it. A recovered tool failure with a final answer can complete. Safe tool identifiers/categories/status are retained, never raw inputs/outputs or thoughts. Public Shared Runtime events do not expose permission decisions: diagnostics say **unobservable**, not an invented denial cause.
+
 ## Choose your entry
 
 | You work in… | Use | Scope |
@@ -148,7 +154,7 @@ Intervention is explicit: **request → cancel the old turn → confirm settleme
 
 - **Fresh collaboration sessions only.** No takeover of manually opened terminals, TUIs or desktop GUIs.
 - `queued`/`pending` means submitted, not applied. Reconcile `unknown`/`DO_NOT_REPLAY` before retrying.
-- `--write` selects ACPX `approve-all`. It is an approval policy, **not a filesystem sandbox**; SSH and the target agent retain the configured OS user's permissions.
+- OMP/Codex/Pi keep `approve-reads` by default and `--write` selects `approve-all`. New AGY tasks use the explicit persisted policy described above. Neither policy nor `write: false` is a filesystem sandbox; SSH and the target agent retain the configured OS user's permissions.
 - Keep databases, handles, prompts, answers and authentication private. “Public event” does not mean sanitized content.
 - One coordinator owns state and locks. Distributed locking across coordinators, restart recovery and automatic wakeup after leaving the collaboration are not promised.
 - Source tests, installed-entry checks and complete platform/CLI coverage are different claims. See [verification](VERIFICATION.md).
@@ -158,6 +164,8 @@ Intervention is explicit: **request → cancel the old turn → confirm settleme
 ## Development
 
 The Python core uses the standard library. The **v0.2.3 baseline** is 59 Python discovery cases (58 passed, one opt-in native integration skipped), 11 Node facade cases, and four separately run native integration scenarios. The native endpoint is a clearly synthetic fixture, not a live model.
+
+Backend adapters own invocation, model/permission policy and event/result normalization; the shared coordinator owns tasks, turns, origin isolation and reservations. See the [backend interface](docs/integrations.md) and the non-ACP fake lifecycle contract in `test_backends.py`. No daemon, additional store or mandatory ACP interface is introduced.
 
 ```sh
 python3 -B -m unittest discover -v

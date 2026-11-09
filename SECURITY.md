@@ -4,7 +4,7 @@ Call CLI is an experimental, single-user coordination tool, not a multi-tenant e
 
 ## Trust boundaries
 
-- SSH and the target agent run as the configured operating-system user. `--write` selects ACPX `approve-all`; it does not constrain writes to a directory.
+- SSH and the target agent run as the configured operating-system user. OMP/Codex/Pi keep the original `write` approval mapping; new AGY tasks default to persisted `agy_approval: approve-all`, with explicit `approve-reads` available. `write` separately declares authorized edits and reserves the workspace. Approval policies and `write: false` are not filesystem sandboxes and do not constrain writes to a directory.
 - Treat prompts, workspaces, project ACPX configuration, agent commands, skills and remote hosts as trusted execution inputs. A project configuration can affect what program is launched.
 - Client IDs are local capability handles, not authenticated user identities. Keep the task database, handles, prompts and answers private; do not expose the CLI as an unauthenticated public API.
 - ACPX authentication is resolved on the execution device. Never put real credentials into task payloads, examples, issue reports or Git. Target agents may separately retain their own sessions and logs.

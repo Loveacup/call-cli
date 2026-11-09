@@ -6,7 +6,10 @@ from pathlib import Path, PureWindowsPath
 import shlex
 import sys
 from .bridge import Store, capture_origin
-from .runner import control, device_identity
+from .runner import control
+from .transport import device_identity
+from .backends import BACKENDS, prepare_start
+from .skills import SKILLS_SCHEMA
 
 SCHEMA={
     'name':'call_cli',
@@ -16,14 +19,16 @@ SCHEMA={
         'task_id':{'type':'string'},
         'device':{'type':'string','description':'local or an existing SSH host alias from call-cli device table'},
         'remote_shell':{'type':'string','enum':['posix','powershell'],'default':'posix'},
-        'agent':{'type':'string','enum':['omp','codex','pi','agy']},
+        'agent':{'type':'string','enum':list(BACKENDS)},
         'model':{'type':'string','description':'Exact discovered ACP model ID; required for AGY; preserved on replies'},
         'effort':{'type':'string','description':'AGY advertised thought_level value; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
         'command_id':{'type':'string','description':'Stable unique ID for an intervention; REQUIRED for intervene retries'},
         'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
+        'agy_approval':{'type':'string','enum':['approve-all','approve-reads'],'description':'AGY only: new tasks default to approve-all; approve-reads denies shell/write permission requests. Not a filesystem sandbox; independent of write reservation.'},
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
+        'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
         'after':{'type':'integer','default':0},
         'timeout':{'type':'integer','minimum':30,'maximum':7200,'default':900}
@@ -48,21 +53,19 @@ class Coordinator:
             task=store.get(args.get('task_id',''),origin)
         if action=='start':
             agent=args.get('agent');device=args.get('device','local');cwd=args.get('cwd','');prompt=args.get('prompt','')
-            if agent not in {'omp','codex','pi','agy'} or not cwd or not prompt.strip():
+            if not agent or not cwd or not prompt.strip():
                 raise ValueError('start needs agent, absolute cwd and a nonempty prompt')
             if not (Path(cwd).is_absolute() or PureWindowsPath(cwd).is_absolute()):
                 raise ValueError('cwd must be absolute on execution device')
             if device=='local':cwd=str(Path(cwd).resolve(strict=True))
-            from .runner import command, validate_selection
-            validate_selection(agent, args.get('model'), args.get('effort'))
+            from .transport import command
+            fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
             timeout=args.get('timeout',900)
             if not isinstance(timeout,int) or not 30<=timeout<=7200:raise ValueError('timeout must be 30..7200')
-            task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device))
+            task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'))
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout,
-                              needs_session=True,acpx_created=False,session_creation_attempted=False,
-                              **({ 'model': args['model'] } if 'model' in args else {}),
-                              **({ 'effort': args['effort'] } if 'effort' in args else {}))
+                              needs_session=True,acpx_created=False,session_creation_attempted=False,**fields)
             return self.launch(store,task)
         if action=='intervene':
             prompt=args.get('prompt','')
@@ -107,6 +110,9 @@ class Coordinator:
                 success=True
             finally:
                 store.finish_close(task['id'],task['turn'],success)
+                if success:
+                    from .skills import cleanup
+                    cleanup(store, task)
             return {'task':self.public(store.get(task['id'],origin))}
         raise ValueError('Unknown action')
 

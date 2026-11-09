@@ -48,8 +48,13 @@ function publicEvent(event) {
     return {type: event.type, stream: 'output', tag: event.tag, text: event.text};
   }
   if (event?.type === 'tool_call') {
-    return {type: 'tool_call', toolCallId: typeof event.toolCallId === 'string' ? event.toolCallId : '',
-      status: typeof event.status === 'string' ? event.status : ''};
+    const identifier = value => typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_.:-]{0,79}$/.test(value) ? value : '';
+    const toolId = typeof event.toolCallId === 'string' && /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,159}$/.test(event.toolCallId) ? event.toolCallId : '';
+    const projected = {type: 'tool_call', toolCallId: toolId,
+      status: ['pending', 'in_progress', 'completed', 'failed'].includes(event.status) ? event.status : ''};
+    if (identifier(event.title)) projected.title = event.title;
+    if (['read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other'].includes(event.kind)) projected.kind = event.kind;
+    return projected;
   }
 }
 
@@ -67,10 +72,12 @@ async function run(options, prompt, deps = {}) {
         || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(options.sessionId)
         || typeof options.sessionName !== 'string' || !options.sessionName
         || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) throw Error('INVALID_INPUT');
+    const permissionMode = options.permissionMode ?? (options.write ? 'approve-all' : 'approve-reads');
+    if (!['approve-all', 'approve-reads'].includes(permissionMode)) throw Error('INVALID_PERMISSION_MODE');
     const sdk = await (deps.loadRuntime ?? loadRuntime)(options.expectedVersion);
     const auth = await (deps.loadAuth ?? loadAuth)(options.cwd);
     runtime = sdk.createSharedAcpRuntime({cwd: options.cwd,
-      permissionMode: options.write ? 'approve-all' : 'approve-reads',
+      permissionMode,
       nonInteractivePermissions: 'deny', timeoutMs: options.timeoutMs,
       authCredentials: auth.authCredentials, authPolicy: auth.authPolicy});
     // This serializable public handle is restored from the coordinator's native

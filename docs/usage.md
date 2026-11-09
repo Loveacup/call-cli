@@ -20,8 +20,9 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。
 - `--agent` 取 `omp/codex/pi/agy`：是真正的执行目标；AGY 另传当前发现的 `--model`。
-- `--write` 仅用于已经授权的文件编辑／测试，会使用 `approve-all`。
+- `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
+- `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
 
 ## 观察、提问与回复
 
@@ -32,11 +33,16 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 保存返回的 `after`，下一次接续它。观察状态、轮次与公开事件：
 
+runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标相同；截尾或重新接入后用 `events(after=seq)` 补读，按任务、轮次与 event ID 去重，不把重复宿主回执当成新派工。重要 stage、answer、question 与终态仍通知；started/version/model/permissions 只入库。工具仅保留安全 ID/name/category/status，同一工具重复状态不再产出事件；每轮最多通知 12 条普通工具状态，失败不受此上限，全部变化仍可 events 查询。不是逐 token 通知或 exactly-once 宿主投递承诺。
+
+终态通知携带 `question_ids` 和最近 1000 字公开回答 `answer_tail`；有 pending 介入时附带下一步动作。宿主截尾仍可能丢内容，应补读 events，不用占位回答代替读取。宿主/Telegram 的静默消费与真实路由须独立验收，不能据此关闭 issue #1。
+
 - `running`：结合真实阶段、工具状态和产物判断进展；静默不等于卡死。
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
 - `completed/cancelled`：对应轮已结算，仍需检查真实结果或残留。
 - `unknown`：保留任务与资源定位，先对账原会话和进程；不要重放。
 - AGY 一轮公开输出的最后一个非空行若恰为 `⚠ Agent execution terminated due to error.`，即使协议返回 `end_turn` / exit 0，也记为 `unknown`，并在 `settlement_note` 与最终事件中写明“AGY 报告致命执行错误、未完成、结果不明、不自动重放”。该判定只拒绝完成，不代表已知根因；引用、前后缀或其后仍有内容的同类文字按普通内容处理。
+- AGY 工具 failed 且最后一个工具事件后无最终回答、也无待答问题时，仅在传输 exit 0、未失败且 end_turn 的情况下，记 `unknown` 并附 `settlement_note`；stage 不算回答。传输失败保留直接的退出说明，不改称工具失败或权限拒绝。正常提问保留 `waiting_reply`，可用准确 question ID 回复；既有 fatal 最终行仍覆盖提问。工具失败后恢复并给出最终回答可 `completed`。协议结束、工具失败和业务结果分别核对。
 - `busy: true, task: null`：数据库锁竞争，没有可信状态；保留游标，稍后再看。
 
 ```sh
@@ -89,7 +95,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 | connect 无完整回复／`do_not_replay` | 保存已知 client/task，先查同一调用的效果，不重发业务 |
 | SSH 中找不到 acpx/node | 发现该设备非交互 PATH 和实际入口，不复制另一机器的内部安装路径 |
 | agent 已安装但认证失败 | 让用户走该设备原生登录，不在任务包内传 token |
-| 只读工具被拒 | 核对任务是否真需执行 shell／写入；不把权限拒绝当模型能力失败 |
+| 工具 failed／疑似权限拒绝 | 先核对持久审批：新 AGY 默认 `approve-all`，可显式 `approve-reads`；OMP/Codex/Pi 默认 `approve-reads`，`write: true` 才选 `approve-all`；旧 AGY 缺字段沿用原 `write` 映射。公开 SDK 不暴露权限决策，不能从 failed 推断 deny；必要时仅查精确自有原生记录。不要把权限拒绝当模型能力失败，也不要自动重放。 |
 | Windows Codex `0xC0000142` | 核对 SSH 服务窗口站问题与独立桌面入口，不关闭沙箱或扩大 ACL |
 | Codex 沙箱内 Node spawn SSH `EPERM` | 使用已配置的 PowerShell 原生客户端，不自动重复已启动业务 |
 | 资源耗尽／多次控制命令超时 | 暂停新派工，按设备和精确进程身份排查，不盲重试或广泛 kill |

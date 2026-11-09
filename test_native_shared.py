@@ -1,7 +1,7 @@
 """Opt-in real ACPX shared-owner tests using a synthetic ACP agent, not a model."""
 import concurrent.futures,contextlib,io,json,os,pathlib,shlex,subprocess,sys,tempfile,time,unittest
 from unittest.mock import patch
-from bridge import EventDecoder
+from events import EventDecoder
 from collab import Collaboration
 from runner import run_task
 
@@ -30,7 +30,7 @@ class NativeSharedTests(unittest.TestCase):
                 # Synthetic endpoints must never receive the user's real auth config.
                 environment=patch.dict(os.environ,{'HOME':str(home)});environment.start()
                 try:
-                    with patch('runner.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'integration-uses-existing'}),contextlib.redirect_stdout(io.StringIO()):
+                    with patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'integration-uses-existing'}),contextlib.redirect_stdout(io.StringIO()):
                         if mode=='block':
                             with concurrent.futures.ThreadPoolExecutor(max_workers=1)as pool:
                                 future=pool.submit(run_task,c.store.path,t['id']);deadline=time.monotonic()+25

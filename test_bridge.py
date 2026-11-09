@@ -147,7 +147,7 @@ class ProtocolTests(unittest.TestCase):
             capture_origin(lambda k,d='': '', 'default')
 
     def test_event_decoder_joins_fragments_and_excludes_thought_and_raw_tools(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         decoder = EventDecoder()
         def event(kind, content):
             return {'params':{'update':{'sessionUpdate':kind,'content':{'type':'text','text':content}}}}
@@ -168,8 +168,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_PROVIDER_ERROR', decoder.text)
 
 
+    def test_numeric_tool_ids_keep_failure_attribution_and_private_titles_are_dropped(self):
+        from events import EventDecoder
+        d = EventDecoder(shared_request_id='owned:1')
+        def tool(**fields):
+            return d.feed({'type':'callcli.shared.event', 'requestId':'owned:1',
+                           'event':dict(type='tool_call', **fields)})
+        tool(toolCallId='1', title='read_file', kind='read', status='in_progress')
+        tool(toolCallId='2', title='run_command', kind='execute', status='in_progress')
+        self.assertEqual(tool(toolCallId='1', status='failed'), [('tool','1 read_file read failed')])
+        self.assertNotIn('private/path', str(tool(toolCallId='3', title='private/path', status='failed')))
+
     def test_tool_boundary_publishes_unterminated_stage_before_tool_finishes(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         decoder=EventDecoder()
         self.assertEqual(decoder.feed({'params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'CALLCLI_STAGE ready_for_intervention'}}}}),[])
         seen=decoder.feed({'params':{'update':{'sessionUpdate':'tool_call','toolCallId':'sleep','status':'in_progress'}}})
@@ -177,7 +188,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(decoder.finish(),[])
 
     def test_recovered_read_callback_error_does_not_fail_successful_prompt(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         d=EventDecoder()
         d.feed({'jsonrpc':'2.0','id':2,'method':'session/prompt','params':{}})
         d.feed({'jsonrpc':'2.0','id':0,'method':'fs/read_text_file','params':{'path':'/missing/optional-skill.md'}})
@@ -188,7 +199,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(d.stop_reason,'end_turn')
 
     def test_unclassified_write_and_consumed_callback_errors_still_fail(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         for mode in ['unclassified','write','consumed','no_prompt']:
             with self.subTest(mode=mode):
                 d=EventDecoder()
@@ -200,7 +211,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertTrue(d.failed)
 
     def test_shared_runtime_result_is_authoritative_not_raw_callback_ids(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         d = EventDecoder(shared_request_id='task:1')
         d.feed({'type': 'callcli.shared.event', 'requestId': 'task:1',
                 'event': {'type': 'text_delta', 'stream': 'output',
@@ -212,7 +223,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(d.text, 'checked\n')
 
     def test_shared_runtime_rejects_foreign_duplicate_failed_and_raw_results(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         for mode in ['foreign', 'duplicate', 'failed', 'raw', 'inconsistent']:
             with self.subTest(mode=mode):
                 d = EventDecoder(shared_request_id='task:1')
@@ -227,7 +238,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertTrue(d.failed)
 
     def test_shared_text_cannot_forge_receipt_or_leak_thought_and_tools(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         d = EventDecoder(shared_request_id='task:1')
         for event in [
             {'type': 'text_delta', 'stream': 'thought', 'tag': 'agent_thought_chunk', 'text': 'PRIVATE_THOUGHT'},
@@ -241,7 +252,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', d.text)
 
     def test_prompt_error_is_fatal_even_when_callback_id_collides(self):
-        from bridge import EventDecoder
+        from events import EventDecoder
         d=EventDecoder()
         d.feed({'id':2,'method':'session/prompt','params':{}})
         d.feed({'id':2,'method':'fs/read_text_file','params':{}})

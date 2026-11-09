@@ -32,6 +32,8 @@ Call CLI 通过轻量协调层连接 **OMP、Codex、Pi 和 AGY**。新建协作
 | 🌐 | **本机或跨设备** | 一个 POSIX 协调主机，经现有 SSH 连接执行设备。 |
 | 🔒 | **如实表达执行状态** | 依靠 Shared Runtime 的权威结果结算，结果不明不悄悄重放。 |
 
+支持按 required、optional、reference 传递选定技能及引用脚本，在执行设备暂存、续轮固定版本并记录实际读取/采用回执；见[技能传递](skill/references/skill-passing.md)。
+
 ## 快速开始
 
 ### 让 AI 帮你配置
@@ -98,6 +100,10 @@ client ID 是本地协作句柄；`--runtime omp` 只是声明，不是已认证
 
 **AGY：** 在执行设备运行 `node models.cjs /absolute/workdir` 发现当前 ACP 候选，由发起端选择精确 ID，再传 `--agent agy --model ID`（Hermes 同样使用 `agent`/`model`）。可选 `--effort VALUE` 使用当前广告的 `thought_level`，不猜后缀。用户指定优先，续轮保留并读回选择，失败不切 provider。[模型选择流程](skill/references/agy-models.md)
 
+新 AGY 任务默认持久化 `agy_approval: "approve-all"`，即使 `write: false` 也允许任务范围内的 shell。显式只读审批用 `--agy-approval approve-reads`（Hermes 同名字段），shell／写入请求会非交互拒绝。审批不是文件沙箱；获授权编辑仍须另设 `--write` 以声明写权限和占用目录。reply/intervene 保留策略，旧任务缺字段仍沿用原 `write` 映射，OMP/Codex/Pi 默认不变。提示优先原生 read/search，不妨碍已授权 shell。
+
+AGY 工具 failed 且没有最终回答、也无待答问题，或出现既有精确 fatal 最终行时，即使 `end_turn`／exit 0 也记 `unknown`，不自动重放；正常提问保留 `waiting_reply` 可回复，fatal 最终行仍覆盖提问。工具失败后恢复并给出最终回答仍可完成。只保存安全工具标识、类别及状态，不保存 rawInput/rawOutput／思维链。公开 Shared Runtime 事件不提供权限决策，诊断明确标为不可观测，不猜 deny 原因。
+
 ## 选择接入方式
 
 | 你在哪里工作 | 使用方式 | 能力范围 |
@@ -145,7 +151,7 @@ client ID 是本地协作句柄；`--runtime omp` 只是声明，不是已认证
 
 - **只新建协作会话。** 不接管已经手动打开的终端、TUI 或桌面 GUI。
 - `queued`／`pending` 仅表示提交，不表示生效。`unknown`／`DO_NOT_REPLAY` 先对账，再决定是否重试。
-- `--write` 使用 ACPX `approve-all`，是审批策略，**不是文件系统沙箱**；SSH 与目标 CLI 仍使用相应系统账号的权限。
+- OMP/Codex/Pi 默认 `approve-reads`，`--write` 选 `approve-all`；新 AGY 使用上文独立持久策略。审批和 `write: false` 都**不是文件系统沙箱**；SSH 与目标 CLI 仍使用相应系统账号的权限。
 - 任务库、句柄、正文、回答与认证保存在私有位置。“公开事件”不等于内容已脱敏。
 - 由一个协调主机持有状态与锁，不承诺跨协调主机分布式互斥、重启恢复或离开当前协作后的自动唤醒。
 - 源码测试、已安装入口和全部平台／CLI 覆盖是不同结论，详见[验证说明](VERIFICATION.md)。
@@ -155,6 +161,8 @@ client ID 是本地协作句柄；`--runtime omp` 只是声明，不是已认证
 ## 开发与验证
 
 Python 核心使用标准库。**v0.2.3 基线**为 Python discovery 59 项（58 通过、1 项原生集成默认跳过）、Node facade 11 项，以及另行运行的四类原生集成场景。原生 endpoint 是明确标注的合成 fixture，不冒称真实模型。
+
+后端适配器负责命令、模型/审批与事件/结果规范化，公共协调层负责任务、轮次、来源隔离和目录占用。接口见[后端扩展说明](docs/integrations.md)，非 ACP fake 完整生命周期契约见 `test_backends.py`；不新增 daemon、状态库，也不要求未来后端采用 ACP。
 
 ```sh
 python3 -B -m unittest discover -v

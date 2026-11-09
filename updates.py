@@ -8,9 +8,9 @@ import subprocess
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
 try:
-    from .runner import command
+    from .transport import command
 except ImportError:
-    from runner import command
+    from transport import command
 
 
 DEFAULT_LOCK_ROOT = Path.home()/'.hermes/cache/call-cli-locks'

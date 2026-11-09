@@ -84,7 +84,7 @@ class ReviewRegressions(unittest.TestCase):
         def uncertain(current, action, **kw):
             observed.append(self.c.status(self.client, task['id']).get('session_creation_attempted'))
             raise TimeoutError('creation result lost')
-        with patch('runner.control', side_effect=uncertain):
+        with patch('acpx_backend.AcpxBackend.control', side_effect=uncertain):
             self.assertEqual(runner.run_task(self.c.store.path, task['id']), 1)
         self.assertEqual(observed, [True])
         self.assertEqual(self.c.status(self.client, task['id'])['state'], 'unknown')

@@ -131,7 +131,7 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 - 新建任务前说明首轮的 npm 版本查询；升级是单独维护动作，确认这类副作用在用户授权内。不要从项目维护者的个人环境推导当前用户授权。
 - 同一协作复用同一 DB 与 client handle。Hermes 插件的 DB 由宿主代码定位，没有独立的 DB 配置键；通用入口要复用其任务库时，先核对实际路径。
 - 源码不会替你把文件同步到执行设备；cwd 和产物都属于目标设备。
-- 默认只读；`--write` 使用 `approve-all`，不是路径沙箱。把获授权路径与完成标准写进任务，并保留目标 CLI 原有沙箱。
+- OMP/Codex/Pi 默认 `approve-reads`，`--write` 使用 `approve-all`。新 AGY 默认持久化 `agy_approval: approve-all`；显式只读审批传 `--agy-approval approve-reads`。旧任务缺字段沿用原 `write` 映射，续轮保留策略。审批不是路径沙箱；`write` 仍用于写入授权与目录占用。把授权范围写进任务，保留目标 CLI 原有沙箱。
 - 不因创建另一 DB 就认定旧 writer 已停；先按原任务对账，不启动竞争写者。
 
 ### 认证
@@ -144,7 +144,7 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 
 每个逻辑新任务查询执行端 installed/latest 一次并持久保存。正常派工只检查，不安装包；只在独立授权、确认无活动任务且来源已验证后维护升级。内部 patch 维护仍有安装锁及 busy 检查；跨主次版本先评估，不升级其他 agent 或改认证配置。
 
-不绑定历史精确版本，按公共 runtime 能力验证。续轮不查 npm，但在共享安装锁内读取当前 CLI 版本，SDK 版本须与这个本次安装身份一致；这不是固定版本锁。AGY 使用原生 `agy acp`，先运行 `node models.cjs /absolute/workdir` 发现候选，传显式 `model` 和可选独立 `effort`；详见 [AGY 工作流](../skill/references/agy-models.md)。部署时将 `models.cjs` 与 `shared-prompt.cjs` 一并保留在 runner 同目录。
+不绑定历史精确版本，按公共 runtime 能力验证。续轮不查 npm，但在共享安装锁内读取当前 CLI 版本，SDK 版本须与这个本次安装身份一致；这不是固定版本锁。AGY 使用原生 `agy acp`，先运行 `node models.cjs /absolute/workdir` 发现候选，传显式 `model` 和可选独立 `effort`；详见 [AGY 工作流](../skill/references/agy-models.md)。部署时按[完整运行时清单](integrations.md#后端扩展接口)一起保留后端模块、`models.cjs` 与 `shared-prompt.cjs`，不能只复制 runner。
 
 ## 6. 验证并完成交付
 

@@ -39,11 +39,15 @@ metadata:
 2. **做成什么**：目标、输入、可改范围、产物和验证方式。小任务一段话即可；复杂任务用 [任务模板](templates/task.md)。
 3. **如何接着看**：保存 `设备 + cwd + agent + session name`；后台运行再记 Hermes 返回的 process ID，不用“最近会话”猜目标。
 
+需要把特定方法、引用或脚本交给目标 CLI 时，先按[技能选择与传递](references/skill-passing.md)本地优先选择，内容不足才发现公开候选；相关性优先，核对仓库 star、实质更新、内容和依赖。通过公共 start 的 skills 传递 required/optional/reference，核对目标实际读取回执，续轮保持固定版本。
+
 沿用用户现有登录和模型。缺依赖／认证时说明具体缺口，不静默切设备、复制凭据或改默认配置；只准备用户当前需要的目标 CLI，不因 ACPX 有其他内置入口就自动安装。
 
-## AGY 模型与 effort
+## AGY 模型、审批与结果
 
-按 [AGY 模型选择](references/agy-models.md) 在目标设备发现当前 ACP 候选，由发起端 Core CLI 选模型；用户指定优先，可选 JEV 只在真实候选内比较。新 AGY 任务必须显式传 `model`，可选 `effort` 必须匹配当前 `thought_level` 元数据；不猜后缀、不切 provider。模型和 effort 在同会话续轮保留，并核对每轮 `model` 事件。AGY 以 `⚠ Agent execution terminated due to error.` 作为最终输出行时，即使协议 `end_turn` 也记 `unknown` 并附 `settlement_note`；向用户报告为出错／无法确定，不报完成，不自动重放或换模型。
+按 [AGY 工作流](references/agy-models.md) 在目标设备发现当前 ACP 候选，由发起端 Core CLI 选模型；用户指定优先。新 AGY 必传 `model`，可选 `effort` 须匹配 `thought_level` 元数据；不猜后缀、不切 provider。新任务默认持久化 `agy_approval: approve-all`，显式只读审批选 `approve-reads`；两者都不是文件沙箱，编辑另设 `write: true`。旧任务缺字段维持原权限，OMP/Codex/Pi 默认不变。续轮保留选择；优先原生 read/search，已授权 shell 可用。
+
+协议 `end_turn`／exit 0 不等于任务成功：AGY 工具 failed 且无最终回答、也无待答问题，或既有精确 fatal 最终行，记 `unknown` 并附 `settlement_note`，不报完成、不重放；正常提问保留 `waiting_reply` 可回复，fatal 最终行仍覆盖提问。失败后恢复并给有效最终回答可完成。诊断只含安全工具标识／类别／状态；当前 SDK 不公开权限决策，明确报不可观测，不能凭 failed 推断 deny。AGY 工具名也可能被 SDK 丢弃；命令正文 title 不作为安全工具名输出。
 
 ## Hermes 宿主入口：call_cli 工具
 
