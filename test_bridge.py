@@ -100,6 +100,79 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(continued['prompt'], 'JSON')
         self.assertEqual(continued['state'], 'queued')
 
+    def test_numbered_question_restatement_needs_only_one_reply_after_reopening(self):
+        from events import EventDecoder
+        task = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+        decoder = EventDecoder(shared_request_id='fixture:1')
+        source = [
+            dict(type='text_delta', stream='output', tag='agent_message_chunk',
+                 messageId='message-a', text='CALLCLI_STAGE checked\nCALLCLI_QUESTION Q1 Which format?'),
+            dict(type='tool_call', toolCallId='tool-1', kind='other', status='pending'),
+            dict(type='tool_call', toolCallId='tool-1', status='completed'),
+            dict(type='text_delta', stream='output', tag='agent_message_chunk',
+                 messageId='message-b', text='CALLCLI_QUESTION Q1 Which format?'),
+        ]
+        decoded = []
+        for event in source:
+            decoded.extend(decoder.feed(dict(type='callcli.shared.event', requestId='fixture:1', event=event)))
+        decoded.extend(decoder.finish())
+        for n, (kind, text) in enumerate(decoded, 1):
+            self.store.event(task['id'], '1:'+str(n), kind, text, turn=1)
+        reopened = Store(self.store.path)
+        questions = [e for e in reopened.events(task['id'], self.a) if e['kind'] == 'question']
+        self.assertEqual([e['token'] for e in questions], ['1:2'])
+        self.assertEqual([e['kind'] for e in reopened.events(task['id'], self.a)],
+                         ['stage', 'question', 'tool', 'tool'])
+        continued = reopened.reply(task['id'], self.a, '1:2', 'JSON')
+        self.assertEqual((continued['turn'], continued['state'], continued['prompt']), (2, 'queued', 'JSON'))
+        self.assertEqual(continued['session'], task['session'])
+
+    def test_independent_identical_questions_each_require_an_answer(self):
+        for texts in [('Q1 Same?', 'Q2 Same?'), ('Same?', 'Same?')]:
+            with self.subTest(texts=texts):
+                task = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+                for n, text in enumerate(texts, 1):
+                    self.store.event(task['id'], '1:q:'+str(n), 'question', text, turn=1)
+                partial = self.store.reply(task['id'], self.a, '1:q:1', 'first')
+                self.assertEqual((partial['turn'], partial['questions']), (1, ['1:q:2']))
+                # Recovery/replay cannot resurrect the already answered logical question.
+                reopened = Store(self.store.path)
+                replay_token = '1:q:3' if texts[0].startswith('Q1 ') else '1:q:1'
+                self.assertFalse(reopened.event(task['id'], replay_token, 'question', texts[0], turn=1))
+                final = reopened.reply(task['id'], self.a, '1:q:2', 'second')
+                self.assertEqual((final['turn'], final['state']), (2, 'queued'))
+                self.assertIn('1:q:1: first', final['prompt'])
+                self.assertIn('1:q:2: second', final['prompt'])
+
+    def test_numbered_question_is_new_in_next_turn_and_stale_replay_is_ignored(self):
+        task = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+        self.store.event(task['id'], '1:q', 'question', 'Q1 Same?', turn=1)
+        self.store.reply(task['id'], self.a, '1:q', 'one')
+        self.assertFalse(self.store.event(task['id'], '1:late', 'question', 'Q1 Same?', turn=1))
+        self.assertTrue(self.store.event(task['id'], '2:q', 'question', 'Q1 Same?', turn=2))
+        current = self.store.get(task['id'])
+        self.assertEqual((current['turn'], current['questions']), (2, ['2:q']))
+        self.assertEqual(self.store.reply(task['id'], self.a, '2:q', 'two')['turn'], 3)
+
+    def test_conflicting_question_label_does_not_silently_merge(self):
+        task = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+        self.store.event(task['id'], '1:q', 'question', 'Q1 Format?', turn=1)
+        self.assertTrue(self.store.event(task['id'], '1:conflict', 'question', 'Q1 Language?', turn=1))
+        self.assertEqual(self.store.get(task['id'])['questions'], ['1:q', '1:conflict'])
+        events = self.store.events(task['id'], self.a)
+        self.assertEqual([e['text'] for e in events], ['Q1 Format?', 'Q1 Language?'])
+        self.assertIn('question_note', events[1])
+        self.assertFalse(self.store.event(task['id'], '1:restated', 'question', 'Q1 Language?', turn=1))
+
+    def test_long_question_same_token_replay_is_idempotent_before_body_checks(self):
+        task = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+        text = 'Q1 '+'x'*7997+'A'
+        self.assertTrue(self.store.event(task['id'], '1:q', 'question', text, turn=1))
+        self.assertFalse(self.store.event(task['id'], '1:q', 'question', text, turn=1))
+        self.assertFalse(self.store.event(task['id'], '1:q', 'question', text+'changed', turn=1))
+        self.assertFalse(self.store.event(task['id'], '1:repeat', 'question', text, turn=1))
+        self.assertEqual(self.store.get(task['id'])['questions'], ['1:q'])
+
     def test_intervention_requires_settlement_and_preserves_exact_owner(self):
         t = self.store.create(self.a, 'local', 'agy', '/probe', 'old', True)
         self.store.update(t['id'], state='running', model='discovered-model', acpx_record_id='native-id')
@@ -120,6 +193,78 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(resumed['model'], 'discovered-model')
         self.assertFalse(self.store.intervene(t['id'], self.a, 'new', 'revision')[1])
         self.assertFalse(self.store.advance_intervention(t['id'], self.a)[1])
+
+    def test_target_settlement_is_exact_turn_and_never_business_success(self):
+        for state, rc, stop, expected in [
+            ('completed', 0, 'end_turn', 'target_completed'),
+            ('waiting_reply', 0, 'end_turn', 'target_completed'),
+            ('unknown', None, None, 'target_unknown'),
+            ('failed', 1, None, 'target_unknown'),
+            ('cancelled', 0, 'cancelled', 'target_cancelled'),
+            ('completed', 1, 'end_turn', 'target_unknown'),
+        ]:
+            with self.subTest(state=state, rc=rc):
+                t = self.store.create(self.a, 'local', 'omp', '/probe', 'old', False)
+                self.store.update(t['id'], state='running')
+                self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+                self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled')
+                self.store.advance_intervention(t['id'], self.a)
+                self.assertFalse(self.store.finish_turn(t['id'], 1, 'completed', 0, 'end_turn'))
+                self.assertEqual(self.store.get(t['id'])['commands']['stable']['status'], 'queued')
+                self.store.update(t['id'], state='running')
+                self.store.event(t['id'], '2:partial', 'answer', 'partial result', turn=2)
+                self.store.finish_turn(t['id'], 2, state, rc, stop)
+                self.assertFalse(self.store.finish_turn(t['id'], 2, 'completed', 0, 'end_turn'))
+                final, launch = self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+                self.assertFalse(launch)
+                self.assertFalse(self.store.advance_intervention(t['id'], self.a)[1])
+                self.assertEqual((final['turn'], final['session']), (2, t['session']))
+                self.assertEqual(final['commands']['stable']['status'], expected)
+                self.assertEqual(final['intervention']['status'], expected)
+                self.assertIn('partial result', [e['text'] for e in self.store.events(t['id'], self.a)])
+
+    def test_replaced_queued_command_is_not_credited_for_another_prompt(self):
+        t = self.store.create(self.a, 'local', 'omp', '/probe', 'old', False)
+        self.store.intervene(t['id'], self.a, 'first', 'one')
+        self.store.intervene(t['id'], self.a, 'second', 'two')
+        replay, launch = self.store.intervene(t['id'], self.a, 'first', 'one')
+        self.assertFalse(launch)
+        self.assertEqual((replay['prompt'], replay['turn']), ('second', 1))
+        self.store.update(t['id'], state='running')
+        self.store.finish_turn(t['id'], 1, 'completed', 0, 'end_turn')
+        self.store.intervene(t['id'], self.a, 'third', 'three')
+        self.assertFalse(self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled'))
+        current = self.store.get(t['id'])
+        self.assertEqual({k: v['status'] for k, v in current['commands'].items()},
+                         {'one': 'superseded', 'two': 'target_completed', 'three': 'queued'})
+        self.store.request_cancel(t['id'], self.a)
+        self.assertEqual(self.store.get(t['id'])['commands']['three']['status'], 'withdrawn')
+
+    def test_missing_launch_receipt_is_unknown_and_never_replayed(self):
+        t = self.store.create(self.a, 'local', 'omp', '/probe', 'old', False)
+        self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+        launched = self.store.claim_launch(t['id'], 1)
+        self.store.finish_launch(t['id'], 1, launched['launch_id'])
+        final, launch = self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+        self.assertFalse(launch)
+        self.assertEqual((final['state'], final['commands']['stable']['status']), ('unknown', 'target_unknown'))
+
+    def test_close_withdraws_unadvanced_intervention_without_replay(self):
+        for state, success in [('cancelled', True), ('completed', True), ('unknown', False)]:
+            with self.subTest(state=state, success=success):
+                t = self.store.create(self.a, 'local', 'omp', '/probe', 'old', False)
+                self.store.update(t['id'], state='running')
+                self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+                self.store.finish_turn(t['id'], 1, state, 0 if state != 'unknown' else None,
+                                       'end_turn' if state == 'completed' else None)
+                self.store.begin_close(t['id'], self.a)
+                self.store.finish_close(t['id'], 1, success)
+                final, launch = self.store.intervene(t['id'], self.a, 'adjust', 'stable')
+                self.assertFalse(launch)
+                self.assertEqual((final['turn'], final['session']), (1, t['session']))
+                self.assertEqual(final['commands']['stable']['status'], 'withdrawn')
+                self.assertEqual(final['intervention']['status'], 'withdrawn')
+                self.assertFalse(self.store.advance_intervention(t['id'], self.a)[1])
 
     def test_unknown_intervention_never_replays_and_cancel_withdraws(self):
         t = self.store.create(self.a, 'local', 'agy', '/probe', 'old', True)

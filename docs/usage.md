@@ -37,6 +37,16 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 
 终态通知携带 `question_ids` 和最近 1000 字公开回答 `answer_tail`；有 pending 介入时附带下一步动作。宿主截尾仍可能丢内容，应补读 events，不用占位回答代替读取。宿主/Telegram 的静默消费与真实路由须独立验收，不能据此关闭 issue #1。
 
+问题协议使用 `CALLCLI_QUESTION Q1 问题正文`（依次 Q2、Q3）：`Q[1-9][0-9]*` 后接一个 ASCII 空格和非空正文。编号是同一 task/turn 内的逻辑问题身份，不是源 messageId，也不用于授权。相同编号与完整正文指纹（SHA-256 与字符长度）相同的复述只登记一次，保留首个 event token 供 reply；不同编号或无编号的同文问题仍各需一答。同编号正文不同保留独立可答 token，并附安全 `question_note`，不打断收流或覆盖正文。身份计算发生在公开文本截到 8000 字符之前；不持久化或通知超长原始正文。旧事件缺少完整身份依据时保守保留，不凭截断前缀合并。下一轮可重新使用 Q1；历史事件不回写，旧任务已登记的重复 token 不自动合并。
+
+编号问题事件公开 `question_label`、`question_sha256`、`question_length`；同编号不同正文另带 `question_note`。指纹覆盖解码后完整问题文本（含编号、UTF-8 编码），长度为字符数，均在 8000 字符公开上限之前计算；因此两条可见截断文本相同的事件仍可能有不同指纹并分别待答。
+
+解码行缓冲最多 64000 字符；超限仅保留公开前缀，附身份不完整的 `question_note`，不生成指纹、不按编号合并，保守逐条待答，后续行继续处理。
+
+`Q1:`、`Q1.`、编号前多余空格或编号后多个空格不属于该身份语法，按无编号问题逐条登记，不进行宽松推断。原失败公开文本以 `Q1 ` 开头，已符合此规则；该形状的回放已通过，但真实任务仍需部署后的父方验收。
+
+编号身份由持久事件保存，重新打开 Store 或同轮重复提交不重新登记已回答的问题；这不提供 runner 崩溃后自动恢复或 exactly-once 投递。普通同 token 重放、旧轮事件拒收及全部独立问题答完才续轮的规则不变。
+
 - `running`：结合真实阶段、工具状态和产物判断进展；静默不等于卡死。
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
 - `completed/cancelled`：对应轮已结算，仍需检查真实结果或残留。
@@ -65,6 +75,23 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 ```
 
 同一次提交的重试复用同一个 command ID。`pending/queued` 仅证明提交，不证明改向生效。实现语义是：请求介入 → 原轮取消 → 确认原轮结算 → 同目标会话续轮 → 读取修订结果。继续短 `wait` 驱动和观察状态转换，不宣称无损热修改。
+
+`commands[command_id].status` 跟踪该命令的精确 `target_turn`，`intervention.status` 同步最近一条命令：
+
+| 状态 | 框架能证明的事实 |
+| --- | --- |
+| `pending` | 修订已保存，等待旧轮确认结算，尚无目标轮 |
+| `queued` | 修订已成为目标轮输入，runner 尚未领取 |
+| `target_started` | runner 已原子领取目标轮；不证明 provider 已接收或模型已理解 |
+| `target_completed` | 目标轮以 exit 0 / `end_turn` 正常结算；包括仍需回答问题的 `waiting_reply` |
+| `target_cancelled` | 目标轮确认取消；不表示修订完成 |
+| `target_unknown` | 目标轮失败、结果不确定或派工回执缺失；不自动重放 |
+| `superseded` | 领取前被同一 queued turn 的另一条修订替换，不归功于后来执行 |
+| `withdrawn` | 待执行介入被显式 cancel 或 close 撤回 |
+
+`target_completed` 不是业务目标达成或调整生效证明；协调者仍需评估回答、问题与产物。问题回复可继续同 session 的后续 turn，但不改变该命令的原 `target_turn`，也不重新提交它。同 task 的相同 command ID / 相同 prompt 在任意轮重试均不重派；同 ID / 不同 prompt 拒绝。旧轮或重复结算不能覆盖后继状态；已关闭历史记录不补写、不重放。这里仍是 cancel+resume，不是 steer，也不新增 queue 模式。
+
+显式 close 会撤回尚无目标轮的 pending 介入；若仍有目标轮的 queued/target_started 记录而任务已允许关闭，则记 target_unknown，不猜测其执行结果。关闭失败也不恢复续派授权。已结算命令保持原状态。
 
 Hermes 原生工具使用 `{"action":"intervene","task_id":"TASK_ID","command_id":"UNIQUE_STABLE_COMMAND_ID","prompt":"修订要求"}`。后续调用 `status` 或 `events` 会在旧轮确认结算后启动同 session 新轮；取消回执本身不会启动新轮，`unknown` 不自动重放。来源仍由当前宿主捕获，不能从其他 session/topic 接管。后台进度回注依赖真实 Hermes terminal/process registry，通用事件可读不代表宿主已消费，更不代表 Telegram 已投递。
 

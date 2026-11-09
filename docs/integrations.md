@@ -84,6 +84,8 @@ hermes plugins doctor call-cli
 
 **Hermes 的 `status` / `events` 不是纯读操作**：它们会推进此前已由 `intervene` 授权、仍为 pending 的介入；旧轮确认结算后，查询可能启动同 session 的下一轮。没有已授权 pending 介入时不会自行派工；`unknown` 保留不确定结果，不自动重试。终端 dispatch 的迟到回执按 turn 与 launch identity 条件写回，不能覆盖新轮的状态或 process ID。
 
+命令生命周期由共享 Store/runner 按精确 target_turn 更新，两个入口直接读取同一记录：runner 领取为 target_started，正常结算为 target_completed，取消／不确定分别为 target_cancelled／target_unknown。它们不是模型理解或业务生效承诺，waiting_reply 也可属于正常结算；参见[完整状态合同](usage.md#执行中主动改向或传达用户要求)。多轮回复仍沿用原 command ID，不因查询、迟到通知或问题续轮重新派工；已有关闭历史不回填。
+
 升级前没有 `needs_session` / `acpx_created` / `session_creation_attempted` 的旧 Hermes 任务，仅凭 `cancelled`、空 process ID 或字段缺失不能推断会话尚未创建。已有 native record ID 则复用；没有 ID 时，只有第一轮取消终态及该轮 runner 持久事件 `Cancelled before provider launch` 同时存在，才允许续轮首次创建。证据不足会在记录介入或取消旧轮之前明确拒绝，提示先核对旧任务再使用新的 `start`，不猜测重建。取消发生在 runner 启动前、没有此事件的旧记录也遵循拒绝策略。
 
 ## 后端扩展接口

@@ -53,6 +53,7 @@ def run_task(db_path, task_id):
         if current['state'] != 'queued' or current['turn'] != turn:
             raise ValueError('Turn already claimed or not queued')
         current.update(state='running',runner_pid=os.getpid())
+        store._target_commands(current, 'target_started')
         store._save(db,current)
     task = store.get(task_id)
     emit('started',task['device']+'/'+task['agent'])

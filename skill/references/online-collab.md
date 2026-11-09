@@ -35,6 +35,8 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 有界等待必须包含 CLI 初始化、数据库连接与锁竞争，不只限制循环内 sleep。遇锁可明确返回 busy；不可读时返回空状态，不伪造 queued。零等待并发调用可能全部 busy，验收应要求随后一次非竞争有界调用可推进且不重复启动，而不是假定每次探针都取得写锁。
 
+问题身份使用 `CALLCLI_QUESTION Q1 正文`：同一 task/turn 的相同编号、完全相同正文只需一答，仍用首个返回 token 回复；独立同文问题分配不同编号。无编号问题逐条登记；跨轮可重用编号。严格语法、冲突结算与恢复边界见[问题协议](../../docs/usage.md#观察提问与回复)；源码候选需独立验收与部署，不能推定安装副本已采用。
+
 ## 4. 明确介入与取消语义
 
 支持热输入时验证真实生效；不支持时明确采用取消旧轮、确认停止、原协作会话续作，不宣传为无损热修改或通用暂停。
@@ -47,7 +49,7 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 ACPX 0.22.0 Shared Runtime 的公开 startTurn 明确拒绝 steer；同版 in-process 的 steer 等待活动轮结束，不改变该轮，不能改用它冒充热修改。AGY 1.5.3 一次 initialize 未宣告 steer，只是所探测协议面的证据，不足以否定所有原生入口。OMP 也按实际使用栈逐层核验，不据品牌豁免。以后上游能力改变时重查，不把版本事实永久化。
 
-当前命令记录的 pending/queued 只证明保存与调度；target_turn 的执行事件才支持已接收，修订相关回答／产物及独立读回才支持已生效。status/events（Hermes）或 wait（通用）会在旧轮结算后推进已授权介入；不能只收到取消回执就停止消费，也不能在 unknown 自动续轮。问题回复与新 turn 完成监控由原协调者继续承接。
+当前命令记录的 pending/queued 只证明保存与排队；target_started 只证明 runner 已领取精确 target_turn，target_completed 只证明该轮 exit 0 / end_turn 正常结算（可仍有问题待答），不证明模型理解或业务生效。target_cancelled / target_unknown 不表示成功，后者不自动重放；superseded / withdrawn 分别表示领取前被替换／主动撤回。修订相关回答／产物及独立读回才支持已生效；完整状态合同见[调用手册](../../docs/usage.md#执行中主动改向或传达用户要求)。status/events（Hermes）或 wait（通用）会在旧轮结算后推进已授权介入；不能只收到取消回执就停止消费。问题回复与新 turn 完成监控由原协调者继续承接，同一 controller command_id 不因问题多轮而重派。
 
 - 将取消受理与执行终止分开判断：prompt 的成功退出、无协议错误及有效 stopReason 才构成该实现的结算证据。SSH EOF、exit255、缺终止协议不能转成 cancelled 后自动启动下一轮，因为远端旧轮可能仍活着。
 - 以事务和 turn/state 条件保护取消、续轮与关闭；只记录取消期间的问题，不让问题提前开放下一轮。旧轮迟到事件不能覆盖新轮。

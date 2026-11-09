@@ -59,6 +59,7 @@ class Collaboration:
                 current = self.store._owned(db, task['id'], Origin(**task['origin']))
                 if current['turn'] == task['turn'] and current['state'] == 'queued':
                     current.update(state='unknown', launch_error=type(exc).__name__)
+                    self.store._target_commands(current, 'target_unknown')
                     self.store._save(db, current)
 
     def connect(self, runtime):

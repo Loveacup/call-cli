@@ -9,12 +9,17 @@ def safe_tool_name(value):
 def safe_tool_id(value):
     return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.:-]{0,159}', value) else ''
 
+class IncompleteQuestion(str):
+    """Bounded public prefix whose full body was not retained."""
+    identity_complete = False
+
 
 class EventDecoder:
     """Only public assistant messages and minimal tool status reach the event log."""
     def __init__(self, shared_request_id=None):
         self.text = ''
         self.pending = ''
+        self.pending_overflow = False
         self.stop_reason = None
         self.failed = False
         self.prompt_id = None
@@ -96,11 +101,15 @@ class EventDecoder:
         content = update.get('content', {})
         chunk = content.get('text','') if isinstance(content,dict) else ''
         self.text = (self.text + chunk)[-64000:]
-        self.pending = (self.pending + chunk)[-64000:]
         out = []
-        while '\n' in self.pending:
-            line, self.pending = self.pending.split('\n',1)
-            out.extend(self.line(line))
+        parts = chunk.split('\n')
+        for index, value in enumerate(parts):
+            ended = index < len(parts)-1
+            remaining = 64000-len(self.pending)
+            self.pending += value[:remaining]
+            self.pending_overflow |= len(value) > remaining
+            if ended:
+                out.extend(self.finish())
         return out
 
     def _legacy_rpc(self, message):
@@ -129,7 +138,11 @@ class EventDecoder:
         line = line.strip()
         for prefix,kind in [('CALLCLI_STAGE ','stage'),('CALLCLI_QUESTION ','question'),('CALLCLI_SKILL ','skill')]:
             if line.startswith(prefix):
-                return [(kind,line[len(prefix):][:8000])]
+                text = line[len(prefix):]
+                # Keep question identity intact until Store hashes it before public truncation.
+                if kind == 'question' and self.pending_overflow:
+                    return [(kind, IncompleteQuestion(text[:8000]))]
+                return [(kind, text if kind == 'question' else text[:8000])]
         if line:
             self.final_answer = (self.final_answer + line + '\n')[-64000:]
             return [('answer',line[:8000])]
@@ -138,4 +151,5 @@ class EventDecoder:
     def finish(self):
         out = self.line(self.pending)
         self.pending = ''
+        self.pending_overflow = False
         return out

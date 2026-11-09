@@ -244,6 +244,23 @@ class CollaborationTests(unittest.TestCase):
         self.assertNotIn('sensitive', json.dumps(result))
         self.assertEqual(result['launch_error'], 'OSError')
 
+    def test_intervention_dispatch_failure_marks_target_unknown_without_retry(self):
+        client = self.c.connect('omp')['client_id']
+        task = self.c.start(client, prompt='initial', cwd='/project')
+        self.c.store.update(task['id'], state='completed')
+        attempts = []
+        def fail(current):
+            attempts.append(current['turn'])
+            raise OSError('synthetic dispatch uncertainty')
+        self.c.launch = fail
+        result = self.c.intervene(client, task['id'], 'adjust', command_id='stable')
+        self.assertEqual((result['state'], result['turn']), ('unknown', 2))
+        self.assertEqual(result['commands']['stable']['status'], 'target_unknown')
+        self.assertEqual(result['intervention']['status'], 'target_unknown')
+        self.c.intervene(client, task['id'], 'adjust', command_id='stable')
+        self.c.wait(client, task['id'], timeout=0)
+        self.assertEqual(attempts, [2])
+
     def test_concurrent_wait_and_duplicate_intervention_launch_only_one_turn(self):
         from concurrent.futures import ThreadPoolExecutor
         client = self.c.connect('omp')['client_id']

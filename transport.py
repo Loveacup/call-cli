@@ -21,7 +21,9 @@ def command(device, shell, argv):
 def protocol_prompt(text):
     return ('You are participating in a new CLI collaboration session. Work only within the stated scope; do not commit, push, deploy, or change unrelated files. '
             'Do not use memory for this operational task. For meaningful stages emit a public line CALLCLI_STAGE followed by a short status. '
-            'If you need an answer, emit CALLCLI_QUESTION followed by the question on a single line and end this turn. '
+            'If you need an answer, emit CALLCLI_QUESTION Q<n> followed by the question on a single line and end this turn. '
+            'Use a distinct positive integer label (Q1, Q2, ...) for each independent question within a turn, even with identical wording. '
+            'Repeating the same label and exact question within that turn restates it, requiring only one reply; never reuse a label for different text. '
             'Do not include private reasoning. End with actual results, verification and remaining issues.\n\n'+text)
 
 

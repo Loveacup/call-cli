@@ -1,9 +1,11 @@
 """Small durable task directory; ACPX and Hermes remain the execution owners."""
 from __future__ import annotations
 import dataclasses
+import hashlib
 import json
 import os
 import posixpath
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -89,6 +91,16 @@ class Store:
                 raise ValueError('Workspace is already owned by task '+other['id'])
 
     @staticmethod
+    def _target_commands(task, status):
+        # JSON reloads separate intervention from commands; update both explicitly.
+        for command_id, entry in task.get('commands', {}).items():
+            if (entry.get('target_turn') == task['turn']
+                    and entry.get('status') in {'queued', 'target_started'}):
+                entry['status'] = status
+                if task.get('intervention', {}).get('command_id') == command_id:
+                    task['intervention']['status'] = status
+
+    @staticmethod
     def _save(db, task):
         db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(task), task['id']))
 
@@ -120,6 +132,7 @@ class Store:
                     task['process_id'] = process_id
                 elif task['state'] in {'queued', 'running', 'cancelling'}:
                     # A missing dispatch receipt is uncertain, never permission to replay.
+                    self._target_commands(task, 'target_unknown')
                     task['state'] = 'unknown'
                 self._save(db, task)
         return task
@@ -131,6 +144,27 @@ class Store:
             task = json.loads(row[0])
             if metadata.get('turn',task['turn']) != task['turn']:
                 return False
+            if db.execute('SELECT 1 FROM events WHERE task=? AND token=?', (task_id, token)).fetchone():
+                return False
+            if kind == 'question':
+                complete = getattr(text, 'identity_complete', True)
+                if not complete:
+                    metadata['question_note'] = 'Question exceeded line buffer; complete identity unavailable; answer each token separately.'
+                label = re.match(r'^(Q[1-9][0-9]*) \S', text) if complete else None
+                if label:
+                    # Logical identity is explicit and turn-scoped, never inferred from wording.
+                    fingerprint = hashlib.sha256(text.encode('utf-8')).hexdigest()
+                    metadata.update(turn=task['turn'], question_label=label[1],
+                                    question_sha256=fingerprint, question_length=len(text))
+                    prior = [json.loads(row[0]) for row in db.execute(
+                        "SELECT data FROM events WHERE task=? AND json_extract(data,'$.turn')=? "
+                        "AND json_extract(data,'$.question_label')=? AND json_extract(data,'$.kind')='question'",
+                        (task_id, task['turn'], label[1]))]
+                    if any(event.get('question_sha256') == fingerprint and
+                           event.get('question_length') == len(text) for event in prior):
+                        return False
+                    if prior:
+                        metadata['question_note'] = 'Question label reused with different or unverified body; answer each token separately.'
             # Dedupe happens before mutating task state.
             event = dict(token=token, kind=kind, text=text[:8000], **metadata)
             inserted = db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?)', (task_id, token, json.dumps(event)))
@@ -225,6 +259,8 @@ class Store:
                 raise ValueError('Task fate is not settled; intervention refused')
             if legacy_hermes:
                 self._prepare_legacy_hermes_session(db, task)
+            if task['state'] == 'queued':
+                self._target_commands(task, 'superseded')
             entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'], status='pending')
             commands[command_id] = entry
             task['intervention'] = entry
@@ -279,6 +315,11 @@ class Store:
             task=self._owned(db,task_id,origin)
             if task['state'] not in {'completed','waiting_reply','cancelled','unknown'}:
                 raise ValueError('Task is not settled for closing')
+            entry = task.get('intervention', {})
+            if entry.get('status') == 'pending':
+                entry['status'] = 'withdrawn'
+                task['commands'][entry['command_id']] = entry
+            self._target_commands(task, 'target_unknown')
             task['state']='closing'
             self._check_writers(db,task)
             self._save(db,task)
@@ -300,6 +341,10 @@ class Store:
             if task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
             if state=='completed' and task['question_id']:state='waiting_reply'
             task.update(state=state,exit_code=rc,stop_reason=stop_reason,runner_pid=0,prompt='')
+            status = ('target_completed' if state in {'completed', 'waiting_reply'}
+                      and rc == 0 and stop_reason == 'end_turn' else
+                      'target_cancelled' if state == 'cancelled' else 'target_unknown')
+            self._target_commands(task, status)
             if task.get('skills'):
                 reports = task.get('skill_reports', {}).get(str(turn), {})
                 task['skill_report_missing'] = [s['id'] for s in task['skills']

@@ -195,7 +195,93 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         final = self.store.get(task['id'])
         self.assertEqual((final['state'], final['turn'], final['session']), ('completed', 2, task['session']))
         self.assertEqual(final['intervention']['target_turn'], 2)
+        self.assertEqual(final['commands']['revision']['status'], 'target_completed')
+        self.assertEqual(final['intervention']['status'], 'target_completed')
         self.assertEqual([e['kind'] for e in self.store.events(task['id'], self.origin)].count('cancelled'), 1)
+
+    def test_command_claim_and_uncertain_target_do_not_replay(self):
+        import contextlib, io
+        from unittest.mock import patch
+        from backends import TurnResult, backend_for
+        from runner import run_task
+        for outcome in ('unknown', 'cancelled', 'exception'):
+            with self.subTest(outcome=outcome):
+                task = self.task('initial')
+                self.store.intervene(task['id'], self.origin, 'adjust', 'stable')
+                def target(store, current, emit):
+                    observed = store.get(task['id'])
+                    self.assertEqual(observed['commands']['stable']['status'], 'target_started')
+                    self.assertEqual(observed['intervention']['status'], 'target_started')
+                    emit('answer', 'preserved partial result')
+                    if outcome == 'exception':
+                        raise RuntimeError('synthetic interruption')
+                    return TurnResult(outcome, 0 if outcome == 'cancelled' else 1,
+                                      'cancelled' if outcome == 'cancelled' else None)
+                with patch.object(backend_for('omp'), 'run', target), contextlib.redirect_stdout(io.StringIO()):
+                    run_task(self.store.path, task['id'])
+                final, launch = self.store.intervene(task['id'], self.origin, 'adjust', 'stable')
+                self.assertFalse(launch)
+                self.assertEqual(final['turn'], 1)
+                self.assertEqual(final['intervention']['status'],
+                                 'target_cancelled' if outcome == 'cancelled' else 'target_unknown')
+                self.assertEqual(final['commands']['stable']['status'], final['intervention']['status'])
+                self.assertEqual([e['text'] for e in self.store.events(task['id'], self.origin) if e['kind']=='answer'],
+                                 ['preserved partial result'])
+
+    def test_new_command_during_target_does_not_steal_previous_settlement(self):
+        import contextlib, io
+        from unittest.mock import patch
+        from backends import TurnResult, backend_for
+        from runner import run_task
+        task = self.task('initial')
+        self.store.intervene(task['id'], self.origin, 'first', 'one')
+        def revise_again(store, current, emit):
+            if current['turn'] == 2:
+                self.assertEqual(current['prompt'], 'second')
+                return TurnResult('completed', 0, 'end_turn')
+            self.store.intervene(task['id'], self.origin, 'second', 'two')
+            self.assertFalse(self.store.intervene(task['id'], self.origin, 'first', 'one')[1])
+            return TurnResult('cancelled', 0, 'cancelled')
+        with patch.object(backend_for('omp'), 'run', revise_again), contextlib.redirect_stdout(io.StringIO()):
+            run_task(self.store.path, task['id'])
+        final = self.store.get(task['id'])
+        self.assertEqual(final['commands']['one']['status'], 'target_cancelled')
+        self.assertEqual(final['commands']['two']['status'], 'pending')
+        resumed, launch = self.store.advance_intervention(task['id'], self.origin)
+        self.assertTrue(launch)
+        self.assertEqual((resumed['turn'], resumed['session']), (2, task['session']))
+        with patch.object(backend_for('omp'), 'run', revise_again), contextlib.redirect_stdout(io.StringIO()):
+            run_task(self.store.path, task['id'])
+        final = self.store.get(task['id'])
+        self.assertEqual(final['commands']['one']['status'], 'target_cancelled')
+        self.assertEqual(final['commands']['two']['status'], 'target_completed')
+        self.assertEqual(final['intervention']['status'], 'target_completed')
+
+    def test_question_reply_turns_never_redispatch_controller_command(self):
+        import contextlib, io
+        from runner import run_task
+        task = self.task('initial')
+        self.store.intervene(task['id'], self.origin, 'ASK', 'stable')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        first = self.store.get(task['id'])
+        self.assertEqual((first['state'], first['commands']['stable']['status']),
+                         ('waiting_reply', 'target_completed'))
+        for answer in ('ASK again', 'final answer'):
+            current = self.store.get(task['id'])
+            resumed = self.store.reply(task['id'], self.origin, current['question_id'], answer)
+            replay, launch = self.store.intervene(task['id'], self.origin, 'ASK', 'stable')
+            self.assertFalse(launch)
+            self.assertEqual((replay['turn'], replay['prompt']), (resumed['turn'], answer))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run_task(self.store.path, task['id']), 0)
+        final = self.store.get(task['id'])
+        self.assertEqual((final['turn'], final['state'], final['session']), (3, 'completed', task['session']))
+        self.assertEqual((final['commands']['stable']['target_turn'], final['intervention']['status']),
+                         (1, 'target_completed'))
+        self.assertEqual([(e['turn'], e['kind']) for e in self.store.events(task['id'], self.origin)
+                          if e['token'].endswith(':settled')],
+                         [(1, 'waiting_reply'), (2, 'waiting_reply'), (3, 'completed')])
 
     def test_rejected_runner_settlement_never_broadcasts_a_terminal_event(self):
         import contextlib, io
@@ -340,6 +426,64 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         calls=[__import__('json').loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
         self.assertEqual(sum('new' in c for c in calls),1)
         self.assertEqual(sum('prompt' in c for c in calls),2)
+
+    def test_conflicting_numbered_questions_preserve_stream_and_continue(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        task = self.task('normal task')
+        chunk = ('EARLY_RESULT\nCALLCLI_QUESTION Q1 Format?\n'
+                 'CALLCLI_QUESTION Q1 Format, JSON or CSV?\nLATE_RESULT\n')
+        with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps([chunk])}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        result = self.store.get(task['id'])
+        events = self.store.events(task['id'], self.origin)
+        self.assertEqual([e['text'] for e in events if e['kind']=='answer'], ['EARLY_RESULT', 'LATE_RESULT'])
+        self.assertEqual(result['state'], 'waiting_reply')
+        questions = [e for e in events if e['kind']=='question']
+        self.assertEqual([e['text'] for e in questions], ['Q1 Format?', 'Q1 Format, JSON or CSV?'])
+        self.assertIn('question_note', questions[1])
+        first = self.store.reply(task['id'], self.origin, questions[0]['token'], 'JSON')
+        self.assertEqual((first['turn'], first['state']), (1, 'waiting_reply'))
+        self.store.reply(task['id'], self.origin, questions[1]['token'], 'CSV')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        final = self.store.get(task['id'])
+        self.assertEqual((final['state'], final['session'], final['acpx_record_id']),
+                         ('completed', task['session'], result['acpx_record_id']))
+
+    def test_long_question_identity_precedes_public_truncation(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        for suffixes, expected in [('AB', 2), ('AA', 1)]:
+            with self.subTest(suffixes=suffixes):
+                task = self.task('normal task')
+                lines = ['CALLCLI_QUESTION Q1 '+'x'*7997+suffix+'\n' for suffix in suffixes]
+                output = io.StringIO()
+                with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps(lines)}), contextlib.redirect_stdout(output):
+                    self.assertEqual(run_task(self.store.path, task['id']), 0)
+                questions = [e for e in self.store.events(task['id'], self.origin) if e['kind']=='question']
+                self.assertEqual(len(questions), expected)
+                self.assertTrue(all(len(e['text']) == 8000 for e in questions))
+                self.assertNotIn('x'*7997+'A', output.getvalue()+json.dumps(questions))
+                for n, question in enumerate(questions):
+                    reply = self.store.reply(task['id'], self.origin, question['token'], 'answer '+str(n))
+                    self.assertEqual(reply['turn'], 2 if n == expected-1 else 1)
+
+    def test_over_limit_question_is_retained_without_claiming_complete_identity(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        task = self.task('normal task')
+        chunks = ['CALLCLI_QUESTION Q1 ', 'x'*40000, 'x'*40000, 'A\n']*2+['LATE_RESULT\n']
+        with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps(chunks)}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run_task(self.store.path, task['id']), 0)
+        events = self.store.events(task['id'], self.origin)
+        questions = [e for e in events if e['kind']=='question']
+        self.assertEqual(len(questions), 2)
+        self.assertTrue(all('question_sha256' not in e and 'question_note' in e for e in questions))
+        self.assertEqual([e['text'] for e in events if e['kind']=='answer'], ['LATE_RESULT'])
 
     # Exact AGY wire chunk observed in real failed turns (prompt result was end_turn).
     AGY_FATAL = '\n\u26a0 Agent execution terminated due to error.\n'

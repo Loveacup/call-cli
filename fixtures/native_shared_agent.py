@@ -13,6 +13,10 @@ def record(direction,message):
         if key in message:out[key]=message[key]
     if 'error'in message:out['error']={'code':message['error'].get('code')}
     if isinstance(message.get('result'),dict)and 'stopReason'in message['result']:out['result']={'stopReason':message['result']['stopReason']}
+    update=message.get('params',{}).get('update',{})
+    if update:
+        out['sessionUpdate']=update.get('sessionUpdate')
+        if 'messageId' in update:out['messageId']=update['messageId']
     with trace.open('a')as f:f.write(json.dumps(out)+'\n')
 
 def send(message):
@@ -20,7 +24,10 @@ def send(message):
     print(json.dumps(message),flush=True)
 
 def answer(i,result):send({'jsonrpc':'2.0','id':i,'result':result})
-def text(value):send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':value}}}})
+def text(value, message_id=None):
+    update={'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':value}}
+    if message_id is not None:update['messageId']=message_id
+    send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':update}})
 
 for line in sys.stdin:
     m=json.loads(line);record('outbound',m);method=m.get('method');i=m.get('id')
@@ -36,6 +43,33 @@ for line in sys.stdin:
                   'data':{'authRequired':True,'private':'PRIVATE_SYNTHETIC_DATA'}}})
         elif mode=='fail':send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'Synthetic main prompt failure'}})
         elif mode=='block':pending=i
+        elif mode=='intervention':
+            prompt='\n'.join(part.get('text','') for part in m['params']['prompt'])
+            if 'INITIAL_BLOCK' in prompt:
+                text('SYNTHETIC_PARTIAL_RESULT\n')
+                pending=i
+            elif prompt.endswith('SYNTHETIC_REVISION'):
+                text('SYNTHETIC_TARGET_RESULT revision received\n')
+                answer(i,{'stopReason':'end_turn'})
+            else:
+                send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'Synthetic revision missing'}})
+        elif mode=='questions':
+            prompt='\n'.join(part.get('text','') for part in m['params']['prompt'])
+            if 'INITIAL_QUESTION' in prompt or 'REASK_QUESTION' in prompt:
+                text('SYNTHETIC_PARTIAL_RESULT\nCALLCLI_QUES', 'message-a')
+                text('TION Q1 Which format?', 'message-a')
+                send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{'sessionUpdate':'tool_call','toolCallId':'question-tool','kind':'other','status':'pending'}}})
+                send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{'sessionUpdate':'tool_call_update','toolCallId':'question-tool','status':'completed'}}})
+                text('CALLCLI_QUESTION Q1 Which format?', 'message-b')
+            elif 'INDEPENDENT_QUESTIONS' in prompt:
+                text('EARLY_RESULT\nCALLCLI_QUESTION Q1 Same?\nCALLCLI_QUESTION Q2 Same?\n'
+                     'CALLCLI_QUESTION Q1 Format, JSON or CSV?\nLATE_RESULT\n', 'message-c')
+                for suffix in 'ABA':
+                    text('CALLCLI_QUESTION Q3 '+'x'*7997, 'message-long')
+                    text(suffix+'\n', 'message-long')
+            else:
+                text('SYNTHETIC_APPLIED '+prompt+'\n', 'message-d')
+            answer(i,{'stopReason':'end_turn'})
         elif mode=='skills':
             prompt='\n'.join(part.get('text','') for part in m['params']['prompt'])
             skill_entries=[json.loads(line) for line in prompt.splitlines() if line.startswith('{"id": "skill-')]
