@@ -1,10 +1,10 @@
 # ACPX 原生操作备忘
 
-先查执行端 `acpx --version` 和对应子命令 `--help`。命令最初在 ACPX 0.19.6 验证；当前各端版本和升级后复验范围统一读 [设备／CLI 表](devices.md)，不固定安装版本。
+先查执行端 `acpx --version` 和对应子命令 `--help`。历史命令／版本只是证据；[设备发现](devices.md)说明当前路由，[维护检查](maintenance.md)统一来源、安装、版本与升级边界，不固定历史版本。
 
 ## 入口与权限
 
-POSIX 用 `command -v acpx omp codex pi`，Windows 用 `Get-Command`。自定义 agent 可能通过配置中的 command/argv 定位；只读取必要字段，不输出认证配置。OMP 常用 `omp acp`。未知 agent 名不代表内置支持。
+POSIX 用 `command -v acpx omp codex pi agy`，Windows 用 `Get-Command`。自定义 agent 可由配置 command/argv 定位；只读必要字段，不输出认证配置。OMP 常用 `omp acp`；AGY 使用原生 `agy acp`。未知 agent 名不代表内置支持；AGY 精确模型／effort 与历史查询见[模型参考](agy-models.md)。
 
 - 无工具问答：`--deny-all --no-fs --no-terminal`。
 - 读文件：`--approve-reads --non-interactive-permissions deny`。
@@ -60,6 +60,8 @@ SSH 在目标设备启动 ACPX；ACPX 本身不是跨机器会话服务。
 5. 产物留在执行端；精确读回或下载后验收。
 
 Windows 用 PowerShell `-NoProfile -EncodedCommand`：脚本以 UTF-16LE 编码再 base64，输出显式 UTF-8。读 JSON 用 `Get-Content -Raw -Encoding UTF8`，解析错误不复述完整配置。先 `Get-Command acpx`，不写死 npm 包内部 cli.js，也不把 POSIX 引号照搬 cmd。
+
+Windows 桌面任务先核调用进程与目标窗口 Session ID：PowerShell 用 [Diagnostics.Process]::GetCurrentProcess().SessionId，并用 query session 读取交互会话。仅在授权内使用当前用户、最低权限的一次性任务测试，结束删除自有任务；SSH Session0、登录桌面与真实 agent 操作分别报告，不使用其他用户令牌，不新增常驻桥。桌面工具存在或独立工具成功不证明经本入口启动的 agent 已能操控桌面。
 
 ## 遇到问题
 

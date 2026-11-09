@@ -1,157 +1,72 @@
 ---
 name: call-cli
-description: "Use when coordinating CLI agents through ACPX."
-version: 1.2.0
+description: "Coordinate cross-CLI and cross-device agent tasks: dispatch, monitor progress, answer questions, revise work and accept results. Use for ongoing collaboration with OMP, Codex, Pi or AGY, not ordinary local commands."
+version: 1.3.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [acpx, orchestration, omp, codex, pi]
+    tags: [acpx, orchestration, omp, codex, pi, agy]
     related_skills: [hermes-agent]
 ---
 
 # Call CLI · 调 CLI
 
-以 OMP、Codex、Pi、AGY 为目标进行跨 CLI／跨设备协作，发起端负责在线协调、向用户汇报和结果验收；Hermes 可以是发起端，但不应成为必经中转。复用 ACPX 会话、现有 SSH 与宿主原生能力；通用协作逻辑与宿主通知适配分开，不另建调度平台、守护进程、审批表或旧式 gate。Hermes 的 `call_cli` 薄插件是已建设的宿主入口，不等于任意 CLI 发起的通用链路已经实现或验收。
+新建跨 CLI／跨设备协作会话，发起端负责在线协调、实质汇报与验收；Hermes 可以参与，但不是必经中转。复用 ACPX、现有 SSH、公共任务桥与宿主原生能力，不另建调度平台或常驻服务。普通本机命令、纯宿主内部子代理及已有平台负责的编排不必走本技能；接管手动会话另需明确范围。
 
-## When to Use
+## 核心方向
 
-用户要求新建跨 CLI 协作会话，或派发、监控、汇报、问答、介入、继续和关闭 OMP／Codex／Pi／AGY 任务时使用；发起方不限于 Hermes。纯 Hermes 内部子代理、已有平台自身的任务管理和普通本机命令不必走这个技能。
+目标是从真实 origin 到执行期进度／问题／失败回原会话，用户及发起 agent 都能动态调整正确任务，核验接收与生效，持续续办直至验收收尾。任意受支持 CLI 均可发起或执行；OMP 同样逐层验证，不预设达标。
 
-## 先确定协作范围，再选择入口
+[当前核心需求](references/core-requirements.md)是唯一维护正本，个人副本仅保留语义镜像。**修改本技能或配套实现前先读；需求变化先更新正本，再同步正文、引用、模板和验收。** 源码支持、安装部署、当前 schema、真实执行和用户收到分别判定，不把目标写成已完成。
 
-1. **区分新会话与接管现有会话**：默认新建独立协作会话，不因某 CLI 已打开就向其注入消息；接管手动打开的会话是另一项明确范围。
-2. **确认真实发起端与返回路径**：先验证发起端如何调用统一入口、接收事件和继续处理，再选目标设备。发起端只声明了 CLI 名或拿到连接句柄，不等于已经证明原生会话身份。Hermes 来源由其宿主上下文捕获；通用逻辑不要强制要求 Hermes 环境变量，也不要用伪造变量冒充宿主来源。
-3. **保留完整在线协作能力**：当前交付包括执行期进度监控与实质汇报、双向问答、发起端依据进展主动协调，以及用户在发起端 CLI 输入新要求后由它介入目标会话。不要把“等待式”实现成阻塞到最终结果才返回。
-4. **让监控可让出控制权**：优先复用流式事件、游标和有界等待，使发起端在目标执行期间仍能接收人工输入。具体方案逐 CLI 验证；消息能显示不代表发起端已消费，更不代表目标要求已生效。
-5. **单列离线异步唤醒**：发起端离开当前协作、处理无关工作或空闲后自动被唤醒，先作为路线图；除非用户明确纳入，不作为本轮前置，也不因此新增常驻机制。不得把执行期进度接收、主动协调和人工介入一并推迟。
-6. **按能力与现态选入口，不按品牌选入口**：先核对所需的 start／wait／reply／intervene／close 动作和真实返回路径，再选已验证入口。Hermes 已加载的 `call_cli` 只用于它实际支持的动作；需要通用在线协作时按[通用入口流程](references/online-collab.md)使用统一 CLI，Hermes 也可作为声明的发起方，但不能据此声称获得原生 chat/topic 绑定或异步回注。非 Hermes 发起必须由其自身消费事件、回答和介入，不得为演示成功偷偷由 Hermes 代办。项目源码、已安装副本和当前会话可见工具分别核验，不把一处修改自动当成全部生效。
+## 启动：先确认来源、能力与范围
 
-## 怎样分工
+1. **一次逻辑启动检查**：[维护源与安装检查](references/maintenance.md)覆盖 call-cli、本轮参与 CLI 的协作 skill；任务所选 skill 另查来源／版本、目标可读性与采用。记录 installed／available／unknown，查询失败不称最新；同任务 status／续轮复用结果，不重复全检。检查不是升级授权。
+2. **在哪里、做什么**：按[设备发现约定](references/devices.md)复用私有清单或本任务现有别名，确定目标绝对 cwd、输入、写入范围、产物和验证。跨设备文件不自动同步；复杂任务用[任务模板](templates/task.md)。
+3. **真实返回路径**：先核验发起宿主如何消费事件、收原会话输入与继续行动，再选执行端。命名 runtime 或 client handle 不是认证来源；保存设备、DB、client/task/session/turn、原生 process 与 cursor，不能猜“最近任务”。
 
-- 简单机械操作由当前发起端直接做；需要独立判断、独立上下文或并行产出时再派工。
-- 这些 CLI 都能规划、实现、审查。按当前模型、工具、设备和任务选择，不把品牌永久绑定角色。只需要一个工作伙伴时，不默认三方会审。
-- 独立任务可以并行；不要让两个人同时改同一批文件。已有平台负责编排的项目，交回现有负责人，不启动竞争调度。
+| 入口 | 来源与回流 | 使用条件 |
+| --- | --- | --- |
+| Hermes `call_cli` | 宿主捕获真实来源；原生 terminal 通知桥 | 只用当前实际加载的 agent／动作；先读[宿主分支](references/hermes-host.md) |
+| 通用 `collab.py`／已安装包装器 | 私有 client handle；发起端自己消费短 wait 并向原会话转述 | 按[在线流程](references/online-collab.md)核对当前 help；不宣称 chat/thread 绑定或自动回注 |
+| 原生 ACPX | 命名会话、流与控制能力依适配器 | [独立短测或诊断](references/native-commands.md)，不绕过已登记任务再执行一遍 |
 
-## 开始前确认三件事
+旧 schema 缺动作时，先核验已有受支持入口及宿主桥；明确通用路径损失和协调者中继责任。需要新工具快照时才考虑宿主支持的重载／新会话，`/new` 不是普遍唯一解，也不会让新来源取得旧任务所有权。某个入口的 runtime 标签不支持某 CLI，只说明该入口缺口，不代表该 CLI 永远不能发起。
 
-1. **在哪里做**：按[设备发现约定](references/devices.md)读取用户已有的本地清单，或发现本任务所需的现有 SSH 别名、cwd 和入口；分发模板不提供真实设备默认值，不抄作者历史路径。
-2. **做成什么**：目标、输入、可改范围、产物和验证方式。小任务一段话即可；复杂任务用 [任务模板](templates/task.md)。
-3. **如何接着看**：保存 `设备 + cwd + agent + session name`；后台运行再记 Hermes 返回的 process ID，不用“最近会话”猜目标。
+## 在线协调：消费、判断、接续
 
-需要把特定方法、引用或脚本交给目标 CLI 时，先按[技能选择与传递](references/skill-passing.md)本地优先选择，内容不足才发现公开候选；相关性优先，核对仓库 star、实质更新、内容和依赖。通过公共 start 的 skills 传递 required/optional/reference，核对目标实际读取回执，续轮保持固定版本。
+- 用数值 `seq` 增量消费公开事件，有界 `wait` 给原宿主输入让出控制权；心跳仅是唤醒，不是完整记录。区分事件产生、持久化、回注、协调者消费与用户实际收到。实质阶段、待决策与失败及时转述，不逐 token 或重复心跳刷屏。
+- 发起 agent 根据偏差／阻塞在授权内主动协调，不只转发用户。问题保留精确 `question_id`，能自行决定就回答并观察续轮；真正需用户决定才回原会话询问。多个待答问题逐条结算，不能提问后失去后续责任。
+- 用户修订按精确 task 与稳定 `command_id` 传递；重复提交沿用同 ID。**steer、queue、cancel+resume 是不同语义**：先查所用栈的真实能力，再明确采用方式。当前 Shared Runtime 拒绝 steer；`intervene` 是取消、结算、同 session 续轮，不是无损热修改。详见[控制语义及生效判据](references/online-collab.md)。
+- 区分命令已保存、待续轮、执行端已接收与结果实际体现；`pending/queued` 不等于生效。绑定目标 turn 的事件、修订相关结果与产物验证，不凭自报或状态名判定有效。旧 runner 完成不等于新轮完成；续轮重新跟踪实际 process/turn。
+- 只汇报有用变化；静默不等于失败，alive 不等于有进展。`unknown`、断线或工具失败先按原句柄对账，不换模型、换通道或新派任务盲目重放。公开 SDK 不可观测的权限决定如实写未知。
 
-沿用用户现有登录和模型。缺依赖／认证时说明具体缺口，不静默切设备、复制凭据或改默认配置；只准备用户当前需要的目标 CLI，不因 ACPX 有其他内置入口就自动安装。
+## 权限与任务材料
 
-## AGY 模型、审批与结果
+授权决定业务范围；工具批准策略不是文件沙箱。`write` 表示编辑授权与资源占用，不把 `write:false` 当访问隔离。AGY 新任务默认 approve-all、可显式 approve-reads；其他 CLI 的默认策略不因此扩大。模型必须按[AGY 模型与审批](references/agy-models.md)发现、显式设置并读回，不能猜后缀或静默换 provider。
 
-按 [AGY 工作流](references/agy-models.md) 在目标设备发现当前 ACP 候选，由发起端 Core CLI 选模型；用户指定优先。新 AGY 必传 `model`，可选 `effort` 须匹配 `thought_level` 元数据；不猜后缀、不切 provider。新任务默认持久化 `agy_approval: approve-all`，显式只读审批选 `approve-reads`；两者都不是文件沙箱，编辑另设 `write: true`。旧任务缺字段维持原权限，OMP/Codex/Pi 默认不变。续轮保留选择；优先原生 read/search，已授权 shell 可用。
+方法材料先本地选择，不足再按相关性、维护来源与实质更新找公开候选；[任务技能传递](references/skill-passing.md)提供 required／optional／reference 快照与逐轮读取／采用核验。暂存、读取、自报采用、独立验收是不同证据；传递 skill 不扩大业务权限，也不默认全局安装。
 
-协议 `end_turn`／exit 0 不等于任务成功：AGY 工具 failed 且无最终回答、也无待答问题，或既有精确 fatal 最终行，记 `unknown` 并附 `settlement_note`，不报完成、不重放；正常提问保留 `waiting_reply` 可回复，fatal 最终行仍覆盖提问。失败后恢复并给有效最终回答可完成。诊断只含安全工具标识／类别／状态；当前 SDK 不公开权限决策，明确报不可观测，不能凭 failed 推断 deny。AGY 工具名也可能被 SDK 丢弃；命令正文 title 不作为安全工具名输出。
+保留单一生命周期 owner 和同写面唯一 writer。复用公共核心、发起端适配、执行端适配及工具链／skill 传递的小接口，仅隔离真实差异。已有平台编排的工作交回其 owner；不建立竞争调度。Git 发布、部署、系统安装、凭据操作、其他 profile、服务重启及删除无关文件都需要针对性授权；普通派工或维护检查不包含这些权限。
 
-## Hermes 宿主入口：call_cli 工具
+## 验收与收尾
 
-`call_cli` 提供 `start / list / status / events / reply / intervene / cancel / close`，是需单独安装并启用的可选 Hermes 模块，不因复制此技能而出现；新工具需要新会话加载，旧会话不要强改工具集。
+发起端读真实回答与产物、检查范围并运行必要验证，再报告整体完成／部署状态。`completed`、exit 0 和执行者自报都不代替验收；协议 unknown 与产物通过分别记录。取消回执不等于停写，确认结算后才续作；未知结果保持资源占用并对账。结束后关闭自有会话，读回当前实现要求的 no-session，清理自有 watcher／临时材料；不能为清理成功改写失败历史。
 
-- `start` 指定 `agent`、`device`、执行端绝对 `cwd`、`prompt`；Windows 设备增加 `remote_shell: "powershell"`。只有已授权写入才设 `write: true`；同步目录或跨设备共享资源用同一 `resource` 标识。
-- 来源 profile/session/platform/chat/topic 由宿主真实上下文捕获，模型不可填写。返回后保留 `task.id` 和原生 process ID；后续动作只用精确 `task_id`。任务表按来源隔离，不用另一 topic 或 `/new` 冒认旧任务。
-- 先用 `events` 查看阶段、回答和问题；`reply` 带原始 `question_id`。多个问题逐条回答，全部记录后才启动续轮。取消必须等状态结算，再考虑续派；`unknown` 保留写目录占用，先查原 ACPX 会话与进程。
-- `intervene` 使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`，重试沿用同一 ID。运行期先取消旧轮，待结算后调用 `status` 或 `events` 驱动同 session 续轮；`pending/cancelling` 不代表生效，`unknown` 不续派。`cancel` 撤回尚未执行的介入。完成后再用同动作续轮只算普通续作，不算运行期介入。
-- 向用户汇报先说整体是否完成、是否已部署，再说当前阻塞和有意义的新证据；区分局部检查与完整交付，在授权范围内持续完成常规返工。
-- 完成／问题通过宿主原生 terminal/process registry 回注；有新增进度时约 60 秒合并一次，不逐 token 唤醒。仅在支持异步回注的长驻宿主会话适用；oneshot 不据此宣称能自动唤醒。真实跨 topic 投递验收状态见 [验证范围](references/verification.md)。
-- 一个任务只启动一次。工具失败时先按 task/process/session 对账，不自动改走原生命令再执行一遍；验收完成后用 `close` 关闭自有 ACPX 会话。
+[验证范围](references/verification.md)区分指导场景、合成协议、真实模型、真实发起端消费及原会话投递；局部成功不外推所有 CLI／设备。把授权内剩余工作持续办完，不把一个切片通过说成整体完成；真正缺授权或入口能力时列精确缺口与候选，不扩大实现。
 
-项目位置从当前安装发现；安装与配置供 AI 执行的手册见项目检出目录的 `docs/configuration.md`，或 [仓库文档](https://github.com/Loveacup/call-cli/blob/main/docs/configuration.md)。源码入口、物理插件副本和当前进程加载状态分别核验。
+阶段复盘优先更新项目已有记录和 issue，先定位、读已有正文并去重；对外写入需授权且脱敏、写后读回，不自动关闭未验收工作。复用既有证据，反例推动具体规则修订或撤回，不不断追加通用禁令。详见[反馈与协作维护](references/coordination.md)。
 
-## 原生命令：诊断与独立短测
+## 按分支读取
 
-以下为 POSIX shell；工具调用之间不要假设变量会保留，重新提供变量或使用保存的精确值。`agent` 可为 `omp`、`codex`、`pi`。
+- [维护源与安装检查](references/maintenance.md)：每次逻辑启动的检查、更新边界与兼容性。
+- [在线流程](references/online-collab.md)：通用命令、问答、介入、跨平台传输与链路验收。
+- [Hermes 宿主](references/hermes-host.md)：真实来源、旧 schema、通知轮身份与原生过程观察。
+- [原生命令](references/native-commands.md)：权限、SSH／编码、watch、取消与故障定位。
+- [AGY 模型与审批](references/agy-models.md)：候选／effort、结果不确定与安全诊断。
+- [协议结算](references/protocol-decoding.md)：Shared Runtime、RPC 反例与权威结果。
+- [Windows Codex SSH](references/windows-codex-ssh.md)：服务／桌面会话、独立入口及受限客户端。
+- [副本与发布](references/deployment.md)：源／个人差异、依赖清单、加载验证及独立部署授权。
 
-```bash
-agent=omp
-work=/absolute/project
-session=feature-parser-unique
-acpx --cwd "$work" --format json "$agent" sessions new --name "$session"
-acpx --cwd "$work" --format json --approve-reads \
-  --non-interactive-permissions deny --timeout 900 \
-  "$agent" -s "$session" prompt --file /absolute/task.md
-```
-
-- 创建成功只表示会话存在；实际文本／工具事件才表明任务开始执行。
-- 只读分析用上面的读权限。**已获授权的本地实现任务**可把 `--approve-reads` 换成 `--approve-all`，省去例行工具批准；任务包明确范围。它不是文件沙箱，也不把改代码扩大为 Git 发布、生产部署或删除无关内容。
-- Hermes 宿主的正常派工使用上面的 `call_cli`，由薄 runner 交给原生 `terminal(background=true, notify=true, heartbeat=60)`。其他发起端使用经验证的通用入口，不继承 Hermes 的通知能力。以下直接命令仅用于明确独立的短测／诊断；不要与已登记任务并行启动同一轮，也不需要额外 PTY。
-- 无后续交流的短任务用 `exec`；需要持续观察和接续则用命名会话。
-- CLI 名不是模型名。需要指定模型时，确认适配器实际提供的 ID 后用 `--model`，不固定历史型号。
-
-## 实时查看与继续交流
-
-```bash
-acpx --cwd "$work" --format json "$agent" status -s "$session"
-acpx --cwd "$work" --format json "$agent" sessions watch --name "$session"
-```
-
-先看 prompt 的流式输出；只有独立观察／重新接入时才开 watch，不默认长期挂两个观察器。
-
-- `alive` 只说明进程／队列 owner 存活。结合最新文本、工具状态、实际产物判断进展；静默不等于卡死，不编百分比。
-- watch 先回放再跟随；回放收到的时间不是事件原始时间。可用 cursor 续读。
-- 能看到回答片段、工具调用与完成、用量和结束结果；具体字段依赖适配器。只汇报有用变化，不输出思维链或整段初始化日志。
-- 首次完成通知到达后验收；迟到或重复通知按精确 task／turn／process 与已保存验收记录对账，不重新派工或重跑已完成工作。已消费且不改变交付结论、实际阻塞或用户所需动作的回执内部处理，不逐条发送“无新增问题”刷屏；旧失败须核对旧任务已收尾、后继成功证据确属同一目标，不能只因通知到达较晚就忽略。
-
-本轮结束后，在同一会话追加具体缺口：
-
-```bash
-acpx --cwd "$work" --format json --approve-reads \
-  --non-interactive-permissions deny --timeout 900 \
-  "$agent" -s "$session" prompt "只补缺少的边界测试，保留已完成内容。"
-```
-
-介入时先读精确任务的最新状态与事件，再发送针对性的修订要求；用户在发起端输入后，由发起端完成传递、核验和反馈，不让用户去目标端搬运消息。区分收到、排队与已生效：运行中第二条 prompt 可能只是排队，不能当成即时纠偏。适配器支持热输入时验证真实生效；不支持时明确采用取消当前轮、确认停止、原协作会话续作的替代，不宣传为无损热干预或通用暂停。保留已有成果；未知执行状态不自动重放。同任务通常复用会话，无关任务或独立审查新建会话。
-
-## 取消、收尾与验收
-
-```bash
-acpx --cwd "$work" --format json "$agent" cancel -s "$session"
-acpx --cwd "$work" --format json "$agent" sessions history --limit 10 "$session"
-acpx --cwd "$work" --format json "$agent" sessions close "$session"
-acpx --cwd "$work" --format json "$agent" status -s "$session"
-```
-
-取消回执不替代停写确认。尤其 SSH 断线或超时后，先查同一会话、进程和产物，不立即重复派工。保留已有成果，只补未完成部分；认证错误不循环重试。遇到未知返回查当前 `--help`，不宽泛杀进程。
-
-用户报告主机卡顿、内存耗尽，或控制命令连续超时时，先暂停新派工与自动重试，保留任务定位和已写产物，再用 `systematic-debugging` 的资源压力分支做轻量只读排查；涉及多台设备就分别取样，不只查当前执行端。按进程身份、创建时间、父子关系和精确任务标记区分本轮任务、其他自动化与普通应用；超时、同名进程或未匹配 cwd 都不足以认定归属或停写。仅按已授权的精确范围停止异常进程，并读回进程消失与资源恢复；缓解卡顿不等于协作任务完成，也不证明底层机制已修复。
-
-**发起端验收：读真实产物、核对改动范围、运行必要验证，再报告结果。** Hermes 承担发起端时也遵循同一要求。正常退出和执行方自报完成不是验收本身。审查报告写清问题、位置和依据即可，不强制 JSON verdict。结束后关闭不再需要的自有会话和 watcher；明确保留作下一轮的会话记录定位信息。
-
-验证通用在线协作时，按真实调用链逐项取证：非 Hermes 发起并跨设备新建会话 → 结束前收到阶段事件并汇报 → 对方提问、发起端按问题编号回答并续轮 → 发起端依据进展主动纠偏 → 执行期间经发起端原生输入路径接收用户修订、介入目标并验证结果 → 原发起端收回结果与关闭会话。人工介入可由测试驱动提供输入，但须标为模拟用户输入，不能冒称用户真实操作；脚本直接替发起 CLI 代答或代发介入不算链路通过。分别报告结构探测、假 worker、真实传输、真实发起端消费与实际改向；不能用注册成功、单次短应答或带模拟来源的 dispatch 替代端到端验收。
-
-## 阶段复盘与 GitHub 反馈
-
-每个有实质交付的项目阶段结束后，都将交付、实际证据、协作问题、原因边界和下阶段改进回写该项目 GitHub issue。已有阶段/问题 issue 时追加去重后的阶段评论；即使没有新缺陷也记录本阶段结果，无匹配入口才新建阶段复盘 issue。不按单次工具调用重复发帖。先从目标项目 cwd 的 Git remote 与 `gh repo view` 核实实际仓库，阅读已有相关 issue 与评论去重。项目问题去该项目实际仓库；Call CLI 自身缺陷才去 `Loveacup/call-cli`，宿主问题标明归属待查并链接上游，不全部堆到工具仓库。
-
-外部写入须有用户授权。已有匹配 issue 时追加实质阶段证据，否则创建阶段复盘或可复现、可验收的脱敏问题 issue；不为同一阶段重复建卡。移除凭据、用户/聊天标识、私有路径和任务正文，只保留必要版本、症状、最小步骤、预期/实际和证据边界。提交后用 `gh issue view`／评论 API 读回精确目标、正文及 URL，再确认反馈成功。未获写入授权时交回草稿和目标，不谎称已发布。
-
-后台空回复先区分模型、宿主通知与平台投递。call-cli #1 仍需真实 Telegram 逐事件复现；合成测试通过或提示词去噪不是 Telegram 已修复，不能据此关闭 issue。
-
-## 设备表维护
-
-[设备发现约定](references/devices.md) 是通用模板，不是维护者的实时设备清单。用户已有私有清单时复用它，只维护相关变化；没有清单就按本任务发现，不自动新建另一套库存或扫描局域网。
-
-每行保留设备、连接方式、CLI／入口、版本、最近检查和真实功能证据。安装可见、命令可启动、模型应答、工具／实时事件分别写清；未测不写成可用。关机／离线只记本次不可达，保留上次成功事实；旧成功与当前故障冲突时，标出当前阻塞，不沿用旧结论派工。不记录密码或 token，不因维护清单自行安装、修复或改配置。已存在项目正本时，核对后改为引用该正本，不另建长期重复表。
-
-## ACPX 更新维护
-
-- 每个逻辑派工检查目标端 installed/latest 一次并持久保存结果；正常派工仅检查，不自动升级。版本兼容按能力核验，不固定历史精确版本。检查和升级分开，详见 [版本与模型约定](references/agy-models.md)。
-- 不从本技能继承维护者的个人升级授权。不要另行扩大到 OMP／Codex／Pi 更新、认证迁移或全局配置重写；活动任务、来源不明或不兼容版本变化都先保留并核对。
-- 续轮在既有共享安装锁内核验当前版本，首轮检查保留为历史；同一任务的 status／events／关闭不另发更新命令。
-- 发生更新后读回实际版本并做必要的真实短测。分别报告已安装与可执行范围；不创建定时扫描、更新器或常驻服务。
-
-## 跨设备与参考
-
-默认本机；任务在另一设备或那里才有合适 CLI 时，通过现有 SSH 使用同一套 ACPX 命令。工作目录和产物属于执行端，本机文件不会自动传过去。先查现有 SSH 别名，不写死 IP 或账号。
-
-- [通用入口流程](references/online-collab.md)：入口选择、在线协调循环、执行期介入、跨平台调用与端到端判定。
-- [原生命令与跨设备用法](references/native-commands.md)：事件结构、Windows 编码、模型、后台观察和故障定位。
-- [验证范围](references/verification.md)：实测与未测能力分开记录。
-- [协议解码与真实结算](references/protocol-decoding.md)：回调错误、双向 RPC 同号、共享运行时权威结果及原生传输反例验证。
-
-这是可移植的协作技能，不是治理平台。复用同一任务库、当前用户的授权和本地现态；不把维护者的设备、路径、历史验收或权限当成你的安装事实。
+项目接口从当前安装与公开 [Loveacup/call-cli 文档](https://github.com/Loveacup/call-cli)核对；这是可移植指导，不携带维护者的设备库存、历史授权或安装认证。

@@ -42,8 +42,6 @@ acpx --cwd "$WORK" --format json --agent 'agy acp' sessions history --limit 10 "
 ```
 
 
-## 版本检查不等于升级
+## 版本与维护
 
-每个逻辑新任务查询 installed/latest 一次，结果持久保存；尚未启动就改为续轮的新任务也必须检查。reply/status/wait/close 不重复 npm 查询。每轮执行持有共享安装锁，并重新读取本地安装身份以保证 CLI 与 SDK 来自同版；这是防竞态核验，不是新一轮 latest 查询或硬编码版本锁。
-
-正常派工只检查，绝不自行 npm install。独立维护只有明确授权、来源已验证且设备无活动任务时才能升级；活动会话、来源不明、主次版本变化需要人工/发起端评估，不为了升级停止别人任务。内部 `ensure_current(..., allow_upgrade=True)` 仅保留受锁和忙碌检测保护的同主次版本 patch 维护路径，不是工具参数，也不是自动授权。升级后读回版本并真实短测；当前版本缺少所需公共 API 时明确阻塞，不改走未知 provider。
+通用版本、来源／安装检查及升级边界统一见[维护检查](maintenance.md)，不因 AGY 特例扩大到其他 CLI。每轮在既有共享安装锁内核对当前 CLI／SDK 身份；首轮 latest 查询是历史，续轮不重新联网或安装。

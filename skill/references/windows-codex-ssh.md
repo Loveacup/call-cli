@@ -17,5 +17,4 @@
 - PC Codex 作为发起端时，可从一开始选已安装 `$HOME\.local\bin\call-cli-native.ps1`，它通过原生 PowerShell/.NET 调用现有 SSH 和同一 collab.py JSON API；普通 Node 客户端保持不变，不宣称其兼容问题已修复。当前原生客户端远端解码用 macOS `/usr/bin/base64 -D`，不外推到 Linux。
 - PowerShell 脚本包装另一 PS1 时，把所有参数和字面量 `'--'` 放入字符串数组再 splat。不要写裸 `-- @args`：PowerShell 可消费终止标记并改变后续数组传递，导致下游缺少协议分隔符。先验证真实已安装包装入口，不只测直接数组调用的叶子。
 - 原生客户端只做 SSH/JSON，不能代答或隐式重放。完整 JSON 可确认本次动作回复；超时、断线、无完整回复或清理不明返回 do_not_replay。结束本地 SSH 不代表取消远端任务；未知业务效果先按精确 task/session 对账。
-- 用 PowerShell ConvertFrom-Json 判断完整回复前先排除纯空白：它可能返回空结果却不抛异常，不能把“没有异常”当作 JSON 确认。回归同时覆盖空白前缀后实际 JSON，以及仅空白直到超时；后者必须 unknown/do_not_replay，且不重发业务。该缺陷已在 Windows 用同一测试哈希真实 RED→六项 GREEN，定点独审 PASS；修复后真实 connect/status 通过，旧版完整模型任务保留为旧版证据。随后 v0.2.2 已部署后的新鲜 PC Codex→MacBook OMP 代码任务也已验收：`e93bc69daa454b8f`，同会话两轮后 closed，父方六项测试及八组 golden cases 通过；证据在 `hermes-call-cli/evidence/real-task-a61ced237d/`。仓库现名 `Loveacup/call-cli`，本地旧目录名不变。
-- 真实 PC Codex→MacBook OMP 代码任务已由父方复跑六项测试、八组 golden cases，并验证同会话问答续轮及 closed。源测试与证据位于 `hermes-call-cli/evidence/real-task-91cc1038c0/`；这是该链路的一次实测，不泛化为 GUI、未登录、所有客户端或自动异步唤醒通过。
+- ConvertFrom-Json 前先排除纯空白：它可能不抛异常却没有结果，不能当 JSON 确认。历史 Windows 合成回归曾观察 RED→六项通过，随后真实 connect/status 与受控模型任务各有独立证据；详见公开 [Windows 验证摘要](https://github.com/Loveacup/call-cli/blob/main/VERIFICATION.md#windows-codex-independent-ssh-entry)。这是对应版本／链路的结果，不保证当前安装、GUI、未登录或异步唤醒。
