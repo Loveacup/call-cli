@@ -58,6 +58,63 @@ function publicEvent(event) {
   }
 }
 
+async function watchedAuth(runtime, handle, requestId) {
+  if (typeof runtime.watchSession !== 'function') return false;
+  const abort = new AbortController();
+  const expired = Symbol('watch deadline');
+  let timer, iterator, pending;
+  const deadline = new Promise(resolve => {
+    timer = setTimeout(() => {resolve(expired); abort.abort();}, 1000);
+  });
+  let active = false, promptId, prompts = 0, responses = 0, ambiguous = false, auth = false, total = 0, matched = 0;
+  try {
+    // Passive public replay only. Never export messages or infer from error text.
+    iterator = runtime.watchSession({handle, signal:abort.signal})[Symbol.asyncIterator]();
+    for (;;) {
+      pending = Promise.resolve(iterator.next());
+      const next = await Promise.race([pending, deadline]);
+      if (next === expired) return false;
+      pending = undefined;
+      if (next.done) return false;
+      const event = next.value;
+      if (abort.signal.aborted || ++total > 10000) return false;
+      if (event.requestId !== requestId) continue;
+      if (++matched > 1000) return false;
+      if (event.type === 'turn_started') {
+        if (active) return false;
+        active = true;
+      } else if (active && event.type === 'turn_result') {
+        return event.result?.status === 'failed' && prompts === 1 && responses === 1 && !ambiguous && auth;
+      } else if (active && event.type === 'message') {
+        const message = event.message;
+        if (message?.method === 'session/prompt') {
+          prompts++;
+          promptId = message.id;
+          if (!(typeof promptId === 'string' || typeof promptId === 'number')) ambiguous = true;
+        } else if (prompts && message?.id === promptId) {
+          // The journal omits direction; a callback ID collision is not proof of a prompt error.
+          if (message.method) ambiguous = true;
+          else if ('error' in message || 'result' in message) {
+            responses++;
+            auth = message.error?.code === -32000 && message.error?.data?.authRequired === true;
+          }
+        }
+      }
+    }
+  } catch {
+    // Missing/expired journals and unsupported watches leave the cause unknown.
+  } finally {
+    clearTimeout(timer);
+    abort.abort();
+    // Async-generator return queues behind next; neither may hold the failure frame.
+    const close = () => {
+      try {Promise.resolve(iterator?.return?.()).catch(() => {});} catch {}
+    };
+    Promise.resolve(pending).then(close, close);
+  }
+  return false;
+}
+
 function sendFrame(frame) {
   return new Promise((resolve, reject) => process.stdout.write(JSON.stringify(frame) + '\n', error => error ? reject(error) : resolve()));
 }
@@ -96,8 +153,15 @@ async function run(options, prompt, deps = {}) {
     const valid = result && !result.error &&
       ((result.status === 'completed' && result.stopReason === 'end_turn') ||
        (result.status === 'cancelled' && result.stopReason === 'cancelled'));
+    let diagnostic = {};
+    if (result?.status === 'failed') {
+      if (result.error?.detailCode === 'AUTH_REQUIRED') diagnostic = {errorCategory:'auth_required'};
+      else if (await watchedAuth(runtime, handle, requestId)) {
+        diagnostic = {errorCategory:'auth_required', errorSource:'session_watch'};
+      }
+    }
     await send({type: 'callcli.shared.result', requestId,
-      status: valid ? result.status : 'failed', stopReason: valid ? result.stopReason : null});
+      status: valid ? result.status : 'failed', stopReason: valid ? result.stopReason : null, ...diagnostic});
     code = valid ? 0 : 1;
   } catch {
     // Never serialize exceptions: they can include private prompts/configuration.

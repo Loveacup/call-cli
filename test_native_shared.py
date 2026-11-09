@@ -62,4 +62,33 @@ class NativeSharedTests(unittest.TestCase):
                     finally:environment.stop()
         print('NATIVE_SHARED_EVIDENCE '+json.dumps(evidence))
 
+    def test_structured_prompt_auth_survives_queue_wrapping_without_replay(self):
+        fixture=pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()/'.hermes/cache/scratch') as tmp:
+            work=pathlib.Path(tmp);home=work/'home';home.mkdir();trace=work/'wire.jsonl'
+            agent=shlex.join([sys.executable,'-B',str(fixture),str(trace),'auth-fail'])
+            def control(task,action,timeout=20):
+                args=['acpx','--agent',agent,'--cwd',task['cwd'],'--format','json']
+                if action=='new':args+=['sessions','new','--name',task['session']]
+                elif action in ('close','show'):args+=['sessions',action,task['session']]
+                else:args+=[action,'-s',task['session']]
+                return subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
+            c=Collaboration(work/'tasks.sqlite3',control=control);client=c.connect('omp')['client_id'];origin=c.origin(client)
+            task=c.store.create(origin,'local','omp',str(work),'SYNTHETIC AUTH DIAGNOSTIC ONLY',False)
+            c.store.update(task['id'],shell='posix',timeout=35)
+            with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}):
+                try:
+                    output=io.StringIO()
+                    with contextlib.redirect_stdout(output):rc=run_task(c.store.path,task['id'])
+                    result=c.store.get(task['id']);events=c.store.events(task['id'],origin)
+                    self.assertEqual((result['state'],rc),('unknown',1))
+                    self.assertIn('watchSession prompt error.code=-32000/data.authRequired=true',result['settlement_note'])
+                    self.assertEqual([e['text'] for e in events if e['kind']=='answer'],['SYNTHETIC_PARTIAL_RESULT'])
+                    self.assertNotIn('PRIVATE_SYNTHETIC',output.getvalue()+json.dumps(result)+json.dumps(events))
+                    wire=[json.loads(line) for line in trace.read_text().splitlines()]
+                    self.assertEqual(sum(x.get('method')=='session/prompt' for x in wire),1)
+                finally:
+                    c.close(client,task['id'])
+                    self.assertEqual(json.loads(control(c.store.get(task['id']),'status').stdout)['status'],'no-session')
+
 if __name__=='__main__':unittest.main()

@@ -30,7 +30,11 @@ for line in sys.stdin:
     elif method in ['session/load','session/resume','authenticate']:answer(i,{})
     elif method=='session/prompt':
         text('CALLCLI_STAGE synthetic protocol fixture started\n')
-        if mode=='fail':send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'Synthetic main prompt failure'}})
+        if mode=='auth-fail':
+            text('SYNTHETIC_PARTIAL_RESULT\n')
+            send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'PRIVATE_SYNTHETIC_ERROR',
+                  'data':{'authRequired':True,'private':'PRIVATE_SYNTHETIC_DATA'}}})
+        elif mode=='fail':send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'Synthetic main prompt failure'}})
         elif mode=='block':pending=i
         elif mode=='skills':
             prompt='\n'.join(part.get('text','') for part in m['params']['prompt'])

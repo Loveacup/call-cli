@@ -181,6 +181,8 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 - **实时 ACP 模型与 effort 发现：** 在执行设备运行 `node models.cjs /absolute/workdir`，通过 ACPX 公共 `inspectAgentModels` 读取当前广告的模型候选。不同执行设备/账号返回的模型候选可能不同，须按该设备本次发现结果从 `availableModelIds` 中选择精确 ID 传入 `--agent agy --model ID`（Hermes：`agent: "agy", model: "ID"`）；可选 `--effort VALUE` 须从 `models.cjs` 返回的 `thought_level.options` 中核验（已在 **AGY 1.5.3 / ACPX 0.22.0** 实测 `gemini-4-argon` / `medium`、`claude-opus-5-5` / `medium` 与 `gemini-3.8-flash` / `low`）。绝不从显示名猜测或剥离后缀。每轮提交 prompt 前由原生 CLI `set` 设置并经 `sessions show` 精确读回核验，失败直接停止，不静默回退模型或切换 provider。
 - **默认 `approve-all` 审批与工作区写占用分离：** 新建 AGY 任务默认持久化 `agy_approval: "approve-all"`（即使 `write` 为 `false`），放行任务授权范围内的 shell 与原生工具，同时提示词优先引导使用原生 read/search 工具。若需严格只读审批，显式传入 `--agy-approval approve-reads`（Hermes：`agy_approval: "approve-reads"`），此时 shell/写请求会被非交互拒绝。**工具审批策略与 `write: false` 都不是操作系统或文件系统沙箱；** 获授权编辑文件仍须另传 `--write` 以声明写权限并占用工作区。`reply`/`intervene` 续轮保留该策略；缺省该字段的旧任务仍按原 `write` 映射，OMP/Codex/Pi 的默认策略（缺省 `approve-reads`，`--write` 选 `approve-all`）保持不变。
 - **如实结算业务结果：** 协议层 `end_turn` / exit `0` 不直接等于业务成功。对 AGY 任务，若任一工具调用状态为 `failed` 且最后一次工具事件后既无最终回答也无待答问题——或公开输出最后一个非空行恰为致命错误标记 `⚠ Agent execution terminated due to error.`——该轮如实结算为 `unknown` 并记录 `settlement_note`（不自动重放）。待答问题仍保留 `waiting_reply` 可正常回复（致命错误最终行优先覆盖）；工具失败后若恢复并输出最终回答则可正常完成。公开事件仅保留安全工具标识符、类别与状态；因当前公共 Shared Runtime 事件不暴露权限决策，`permission_diagnostics.permission_decisions` 统一记为 `unobservable`，不把工具失败臆测为权限拒绝。详见 [AGY 模型与审批工作流（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
+- **安全认证诊断：** 失败轮可识别精确 `error.detailCode: "AUTH_REQUIRED"`，或通过公开 `runtime.watchSession()` 做有界被动回放（1 秒／1000 条当前请求事件／10000 条总事件）。后者要求精确 host request、turn_started、唯一主 prompt RPC／response 及 failed turn_result，且结构字段 `error.code === -32000`、`data.authRequired === true` 同时成立。回调 ID 碰撞、重复、缺 journal 或超时均保持原因未知。只回流固定类别和来源标签；不匹配错误正文、不回流原消息／任意 data／adapter stderr，不扫描 AGY 日志，不改凭据或重放。
+  已在安装的 ACPX 0.22.0 配合隔离合成 ACP 端点实测认证分类、普通错误不分类、正常结果不变、单次 prompt 与 close/no-session。通用 queue detailCode 本身不是认证证据；fatal-only executor HTTP 401 与认证生命周期仍未解决，也不证明 Hermes/Telegram 投递通过。
 
 ### 2. 按任务固定传递技能（`skills.py`、`skill-stage.cjs`）
 
@@ -196,6 +198,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 ### 3. 多 CLI 并行协作、可续读事件与模块化后端
 
 - **多 CLI 并行执行与单写者锁：** 同一设备或跨 SSH 可同时并行运行多个目标 CLI（如 AGY 与 OMP 并发工作），按 origin/client/task/session 严格隔离。`--write` 与可选跨设备 `--resource` 提供单写者目录占用保护；只读任务（包括 `write: false` 下默认 `approve-all` 的 AGY 任务）可与另一任务的合法写者安全并存。
+  仅派工和消费事件的中继须保持 `write:false`，即使在同 cwd 发起内层 writer；只有实际编辑者占写锁。scratch cwd 可选作职责隔离，不是绕过锁的条件；共享任务库与锁语义不变。
 - **持久 `seq` 游标与原子结算（`bridge.py`、`runner.py`、`events.py`）：** runner 输出通知与 `events`/`wait` 共享 SQLite 持久 `rowid`（`seq`）游标。同一工具的重复相同状态自动去重（stdout 普通工具通知每轮最多 12 条，失败状态不受限，全部记录均可经 `events` 查询）。每轮结束时在同一个 SQLite 事务内原子提交任务状态与唯一 `<turn>:settled` 事件（含 `question_ids`、最长 1000 字 `answer_tail` 及待执行介入的 `next_action`），避免 `close` 或 `intervene` 并发竞争丢失结算通知。
 - **模块化后端扩展接口（`backends.py`、`acpx_backend.py`）：** 任务归属、轮次状态机、介入与写锁由 `bridge.py` 和 `runner.py` 统一管理。`backends.py` 注册实现 `prepare_start(model, effort, approval)`、`run(store, task, emit)` 与 `control(task, action, timeout)` 的后端适配器。非 ACP 后端可直接注册在同一表中，无需新增守护进程或独立状态库（已由 `test_backends.py` 中的非 ACP fake 完整生命周期契约验证）。详见[后端扩展接口（`docs/integrations.md#后端扩展接口`）](docs/integrations.md#后端扩展接口)。
 
@@ -236,8 +239,8 @@ Call CLI 严格区分**源码已实现、离线/合成测试已通过、本机�
 
 | 验证层级 | 已核验范围 | 明确边界／未宣称范围 |
 | :-- | :-- | :-- |
-| **源码与离线测试套件** | Python 标准库单元测试（`111` 项：`107` 通过，`4` 项 opt-in 原生/真模测试默认跳过）与 Node 测试套件（`test_skill_stage.cjs`、`test_shared_prompt.cjs`、`test_models.cjs`、`test_codex_ssh.cjs` 共 `46` 项通过）。 | 使用假传输与合成端点；不证明真实模型行为或宿主通知路由。 |
-| **原生 ACPX 传输集成（`RUN_NATIVE_ACPX_TESTS=1`）** | 在真实 **ACPX 0.22.0** queue-owner 上配合合成 ACP 端点通过 `2` 套 opt-in 集成测试（`test_native_skills`、`test_native_shared`）：覆盖回调 ID 冲突恢复、合成认证、主请求报错、取消、3 种技能模式跨 2 轮原生读取及 `no-session` 关闭读回。 | 证明真实 ACPX Shared Runtime 与 queue-owner 协议交互；端点为合成脚本而非真实 LLM 模型。 |
+| **源码与离线测试套件** | deadline 返工后的发布候选：Python `114` 项（`109` 通过、`5` 个 opt-in 跳过），四个 Node 套件共 `51` 项通过，详见 `VERIFICATION.md`。 | 假传输与合成端点不证明真实模型行为或宿主通知路由。 |
+| **原生 ACPX 传输集成（`RUN_NATIVE_ACPX_TESTS=1`）** | deadline 返工后，`test_native_shared` 与 `test_native_skills` 的全部三个 opt-in 方法在安装的 ACPX 0.22.0 上通过。 | 真实 ACPX 传输配合合成端点，不是真实 LLM 模型；默认套件跳过原生/模型探针。 |
 | **本机与跨设备 SSH 真实模型协作** | 已在 macOS（**ACPX 0.22.0**、**AGY 1.5.3** 的 `gemini-4-argon` / `medium`、`claude-opus-5-5` / `medium`、`gemini-3.8-flash` / `low` 及本机 **OMP**）实测：模型/effort 读回、AGY + OMP 并发执行、运行中 `intervene` 取消续轮、本地/公开 PDF 技能传递；跨设备 Windows SSH **OMP**（`ACPX 0.21.1`）与 **Pi**/**Codex** 对应测试场景已验。 | 每次实测仅证明所跑通的具体 CLI、模型、入口与设备组合；不外推所有未测 CLI/设备组合、任意后台子进程强杀或桌面 GUI 自动化。 |
 | **宿主原会话消费与 Telegram 投递** | 可选 Hermes 插件（`__init__.py`）已在源码与单测中实现来源捕获、后台 runner 启动、技能 schema 与 `intervene` 状态推进。 | **未宣称全链已验收：** 加载新工具 schema 需按宿主支持方式刷新工具表或新开 Hermes 会话（原会话快照可能仍旧，不宣称当前对话内已成功重载）；宿主当前会话实时消费、Telegram 空通知问题（**Issue #1**）、上游 AGY 错误输出（**Issue #2**）以及离开协作后的离线自动唤醒仍保持开放或属独立范围。 |
 

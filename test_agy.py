@@ -97,3 +97,21 @@ class AgyTests(unittest.TestCase):
             client = c.connect('codex')['client_id']
             with self.assertRaisesRegex(ValueError, 'model'):
                 c.start(client, agent='agy', cwd=root, prompt='inspect')
+
+    def test_fatal_without_structured_auth_and_late_results_do_not_gain_auth_cause(self):
+        from events import EventDecoder
+        from agy import AGY_FATAL_LINE, outcome_note
+        for category in (None, 'executor_401', 'PRIVATE_CATEGORY'):
+            decoder = EventDecoder(shared_request_id='owned:1')
+            decoder.feed({'type':'callcli.shared.event', 'requestId':'owned:1', 'event':{
+                'type':'text_delta', 'stream':'output', 'tag':'agent_message_chunk', 'text':AGY_FATAL_LINE+'\n'}})
+            decoder.feed({'type':'callcli.shared.result', 'requestId':'owned:1',
+                          'status':'completed', 'stopReason':'end_turn', 'errorCategory':category})
+            decoder.feed({'type':'callcli.shared.result', 'requestId':'owned:1',
+                          'status':'failed', 'stopReason':None, 'errorCategory':'auth_required'})
+            self.assertIsNone(decoder.error_category)
+            note = outcome_note(decoder, 0, 'completed')
+            self.assertIn('outcome unknown', note)
+            self.assertNotIn('authentication', note)
+            self.assertNotIn('401', note)
+            self.assertNotIn('PRIVATE', note)

@@ -50,6 +50,10 @@ def output(message):
     request=payload['options']['requestId']
     if 'error'in message:failed=True;return
     if 'result'in message:
+        if os.environ.get('ACPX_FAKE_RESULT_FRAME'):
+            frame=json.loads(os.environ['ACPX_FAKE_RESULT_FRAME'])
+            frame.setdefault('requestId',request)
+            print(json.dumps(dict(frame,type='callcli.shared.result')),flush=True);return
         stop=message['result']['stopReason']
         print(json.dumps({'type':'callcli.shared.result','requestId':request,'status':'failed'if failed else ('cancelled'if stop=='cancelled'else'completed'),'stopReason':stop}),flush=True);return
     update=message['params']['update']
@@ -112,6 +116,42 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
     def task(self,prompt):
         t=self.store.create(self.origin,'local','omp',str(self.root),prompt,False)
         return self.store.update(t['id'],shell='posix',timeout=30)
+
+    def test_auth_diagnostic_is_task_bound_and_preserves_unknown_results(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        for extra, expected in [
+            ({'errorCategory':'auth_required'}, True),
+            ({'errorCategory':'auth_required', 'errorSource':'session_watch'}, True),
+            ({'errorCategory':'auth_required', 'requestId':'another:1'}, False),
+            ({'errorCategory':'PRIVATE_CATEGORY'}, False),
+            ({}, False),
+            ({'status':'completed', 'stopReason':'end_turn', 'errorCategory':'auth_required'}, False)
+        ]:
+            with self.subTest(extra=extra):
+                task = self.task('normal task')
+                frame = dict(status='failed', stopReason=None, message='PRIVATE_MESSAGE')
+                frame.update(extra)
+                output = io.StringIO()
+                with patch.dict(os.environ, {'ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), contextlib.redirect_stdout(output):
+                    run_task(self.store.path, task['id'])
+                result = self.store.get(task['id'])
+                self.assertEqual(result['state'], 'completed' if frame['status']=='completed' else 'unknown')
+                note = result.get('settlement_note') or ''
+                self.assertEqual('runtime-reported authentication required' in note, expected)
+                if expected:
+                    self.assertIn('watchSession prompt error.code=-32000/data.authRequired=true'
+                                  if extra.get('errorSource') == 'session_watch'
+                                  else 'turn.result.error.detailCode=AUTH_REQUIRED', note)
+                    self.assertIn('authentication origin unknown', note)
+                    self.assertIn('no automatic replay', note)
+                events = self.store.events(task['id'], self.origin)
+                self.assertEqual([e['text'] for e in events if e['kind']=='answer'], ['FAKE_ANSWER'])
+                self.assertNotIn('PRIVATE', output.getvalue()+json.dumps(result)+json.dumps(events))
+                calls = [json.loads(line) for line in (self.root/'calls.jsonl').read_text().splitlines()]
+                self.assertEqual(sum('prompt' in c and task['session'] in c for c in calls), 1)
+
     def test_intervention_advance_keeps_settlement_event_and_cursor(self):
         import contextlib, io, json
         from unittest.mock import patch

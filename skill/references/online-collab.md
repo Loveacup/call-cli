@@ -23,6 +23,8 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 按实际发起端选择 runtime 标签；支持的标签从当前帮助读取。client_id 是私有协作句柄，声明的 runtime 不是认证过的原生 CLI 身份。原生身份验证另从真实运行时取证，不由模型编造 session ID 或 Telegram 来源。目标为 Windows 时设置 powershell；只有已获写入授权才启用 write。保留 client、task、目标 session 与 turn，不用最近会话猜目标。
 
+中继只派工和消费事件时保持 `write:false`，即使内层任务会修改同一 cwd；只有实际编辑者传 `--write`。中继误声明写入会在内层任务创建前正确触发冲突，不是锁泄漏。使用同一个任务库对账，不新增父子交接或绕过锁；另选 scratch cwd 只做职责隔离。
+
 ## 3. 运行在线协调循环
 
 1. 调用 `wait --task TASK_ID --after CURSOR --timeout 5`，接续返回游标。

@@ -189,3 +189,154 @@ test('explicit approval wins over write while legacy mapping stays supported', a
     assert.equal(policy, expected);
   }
 });
+
+test('only a failed turn AUTH_REQUIRED detail yields a safe task-bound diagnostic', async () => {
+  for (const [status, error, expected] of [
+    ['failed', {code:'RUNTIME', detailCode:'AUTH_REQUIRED', message:'PRIVATE_MESSAGE', retryable:true}, 'auth_required'],
+    ['failed', {code:'AUTH_REQUIRED', detailCode:'PRIVATE_DETAIL', message:'PRIVATE_MESSAGE'}, undefined],
+    ['failed', {detailCode:'AUTH_REQUIRED_PRIVATE', message:'PRIVATE_MESSAGE'}, undefined],
+    ['failed', {detailCode:401, message:'UNAUTHENTICATED PRIVATE_MESSAGE'}, undefined],
+    ['failed', undefined, undefined],
+    ['completed', {detailCode:'AUTH_REQUIRED', message:'PRIVATE_MESSAGE'}, undefined]
+  ]) {
+    const frames = [];
+    let starts = 0;
+    const code = await run(options, 'PRIVATE_PROMPT', {
+      loadAuth: async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime: async () => ({createSharedAcpRuntime: () => ({
+        startTurn() {
+          starts++;
+          return {events:(async function* () {})(), result:Promise.resolve({status, error, stopReason:'end_turn'})};
+        },
+        shutdown:async () => {}
+      })}),
+      send:async frame => frames.push(frame)
+    });
+    assert.equal(code, 1);
+    assert.equal(starts, 1);
+    assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
+      status:'failed', stopReason:null, ...(expected ? {errorCategory:expected} : {})}]);
+    assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|UNAUTHENTICATED|retryable/);
+  }
+});
+
+test('failed queued turns recover only unambiguous structured prompt auth from passive watch', async () => {
+  const started = {type:'turn_started', requestId:options.requestId};
+  const message = value => ({type:'message', requestId:options.requestId, message:value});
+  const prompt = message({id:2, method:'session/prompt', params:{prompt:'PRIVATE_PROMPT'}});
+  const auth = message({id:2, error:{code:-32000, message:'PRIVATE_ERROR', data:{authRequired:true, token:'PRIVATE_TOKEN'}}});
+  const end = {type:'turn_result', requestId:options.requestId, result:{status:'failed'}};
+  for (const [events, expected] of [
+    [[started, prompt, auth, end], true],
+    [[started, prompt, message({id:2, error:{code:-32000, message:'authentication required PRIVATE_ERROR'}}), end], false],
+    [[started, prompt, message({id:2, error:{code:-32000, data:{authRequired:'true'}}}), end], false],
+    [[started, prompt, message({id:2, error:{code:401, data:{authRequired:true}}}), end], false],
+    [[started, prompt, {...auth, requestId:'foreign:1'}, end], false],
+    [[started, prompt, message({id:2, method:'fs/read_text_file'}), auth, end], false],
+    [[started, prompt, auth, auth, end], false],
+    [[started, prompt, prompt, auth, end], false],
+    [[started, prompt, auth], false],
+    [[prompt, auth, end], false],
+    [[started, prompt, auth, {...end, result:{status:'completed'}}], false],
+    [[...Array(1500).fill({type:'message', requestId:'foreign:1'}), started, prompt, auth, end], true],
+    [[{type:'turn_started',requestId:'owned:0'}, {...prompt,requestId:'owned:0'},
+      {...auth,requestId:'owned:0'}, {...end,requestId:'owned:0'}, started, prompt,
+      message({id:2,error:{code:-32000,data:{authRequired:false}}}), end], false]
+  ]) {
+    const frames = []; let starts = 0, watchSignal, watchHandle;
+    await run(options, 'PRIVATE_PROMPT', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime: () => ({
+        startTurn() {starts++; return {events:(async function* () {})(), result:Promise.resolve({
+          status:'failed', error:{detailCode:'QUEUE_RUNTIME_PROMPT_FAILED', message:'PRIVATE_ERROR'}})};},
+        async *watchSession({handle, signal}) {watchSignal=signal;watchHandle=handle;yield* events;},
+        shutdown:async () => {}
+      })}), send:async frame => frames.push(frame)
+    });
+    assert.equal(frames.at(-1).errorCategory, expected ? 'auth_required' : undefined);
+    assert.equal(frames.at(-1).errorSource, expected ? 'session_watch' : undefined);
+    assert.equal(starts, 1);
+    assert.equal(watchHandle.acpxRecordId, options.sessionId);
+    assert.equal(watchSignal.aborted, true);
+    assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|authRequired|QUEUE_RUNTIME/);
+  }
+});
+
+test('passive-watch errors and unavailable journals cannot replace the failed result', async () => {
+  for (const watchSession of [undefined, async function* () {throw Error('PRIVATE_WATCH');},
+    async function* ({signal}) {await new Promise(resolve => signal.addEventListener('abort',resolve,{once:true}));}]) {
+    const frames=[];
+    const code=await run(options, 'task', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime: () => ({
+        startTurn:() => ({events:(async function* () {})(),result:Promise.resolve({status:'failed'})}),
+        watchSession, shutdown:async () => {}
+      })}),send:async frame => frames.push(frame)
+    });
+    assert.equal(code,1);
+    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+  }
+});
+
+test('watch deadline publishes failure before noncooperative next settles and cleans late work', async () => {
+  for (const rejectLate of [false, true]) {
+    const frames = [];
+    let release, entered, cleaned = 0, returned = 0, shutdown = false, signal;
+    const pending = new Promise(resolve => {release = resolve;});
+    const started = new Promise(resolve => {entered = resolve;});
+    const runPromise = run(options, 'task', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime: () => ({
+        startTurn:() => ({events:(async function* () {})(), result:Promise.resolve({status:'failed'})}),
+        watchSession(input) {
+          signal = input.signal;
+          const iterator = (async function* () {
+            try {
+              entered();
+              await pending;
+              if (rejectLate) throw Error('PRIVATE_LATE_REJECTION');
+              yield {type:'turn_started',requestId:options.requestId};
+            } finally {cleaned++;}
+          })();
+          const close = iterator.return.bind(iterator);
+          iterator.return = (...args) => {returned++; return close(...args);};
+          return iterator;
+        },
+        shutdown:async () => {shutdown = true;}
+      })}), send:async frame => frames.push(frame)
+    });
+    await started;
+    let early;
+    try {
+      early = await Promise.race([runPromise.then(code => ({code})),
+        new Promise(resolve => setTimeout(() => resolve(null), 1300))]);
+    } finally {release(); await runPromise;}
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(early, {code:1}, 'diagnostic I/O must not delay the original failure');
+    assert.equal(signal.aborted, true);
+    assert.equal(shutdown, true);
+    assert.equal(returned, 1);
+    assert.equal(cleaned, 1);
+    assert.deepEqual(frames, [{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+  }
+});
+
+test('iterator return rejection or pending cleanup cannot delay the failed frame', async () => {
+  for (const close of [() => Promise.reject(Error('PRIVATE_CLOSE')),
+    () => new Promise(() => {}), () => {throw Error('PRIVATE_CLOSE');}]) {
+    const frames = []; let returned = 0;
+    const code = await run(options, 'task', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime: () => ({
+        startTurn:() => ({events:(async function* () {})(),result:Promise.resolve({status:'failed'})}),
+        watchSession:() => ({[Symbol.asyncIterator]() {return this;},
+          next:async () => ({done:true}), return() {returned++;return close();}}),
+        shutdown:async () => {}
+      })}),send:async frame => frames.push(frame)
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(code, 1);
+    assert.equal(returned, 1);
+    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+  }
+});

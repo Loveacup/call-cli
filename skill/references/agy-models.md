@@ -35,6 +35,10 @@ AGY 专属策略在 `agy.py`；任务生命周期、SQLite、runner、Shared Run
 
 公开事件仅保留安全 identifier 形式的工具 title、类别和状态，舍弃 rawInput/rawOutput/content、摘要、路径和思维链。当前 ACPX 0.22 公共 SDK 没有权限决策事件，`permission_diagnostics.permission_decisions` 为 `unobservable`；工具 failed 的原因不能猜成权限拒绝。AGY wire 的 `name` 当前也未进入 SDK 事件，title 可是完整 shell 正文，此时只显示 ID／类别／状态，不伪造名称。若已授权原生诊断，仅提取精确自有记录的安全 name/kind/status 与权限 optionId，不导出完整日志。
 
+失败轮的 `error.detailCode` 精确等于 `AUTH_REQUIRED` 时投影固定 `auth_required`。若 queue 仅返回 `QUEUE_RUNTIME_PROMPT_FAILED` 等无具体类别的失败，可通过现有公开 `runtime.watchSession()` 最多被动回放 1 秒、每请求 1000 事件、总计 10000 事件；精确 host requestId、turn_started、唯一主 prompt RPC ID 和 response、failed turn_result 均成立，且 `error.code === -32000 && data.authRequired === true` 才分类。回调 ID 碰撞、重复、缺记录、接口不支持或超时都保持原因未知；不读错误正文，不回流原消息或任意 data。
+
+安装的 ACPX 0.22.0 与隔离合成端点已验证该公开路径可达，保留部分成果和 unknown、每轮仅一次 prompt、close/no-session；不是实际模型认证故障证明。`settlement_note` 区分 turn.result 与 session_watch 来源，提示保留成果、由操作者检查认证后再明确授权续办。该类别不证明 executor 401，不自动刷新、重登或重放。只有 fatal 文本而无结构化证据仍为原因未知；本轮不采用 AGY 原始日志或进程绑定探针。
+
 AGY 历史查询始终使用精确 cwd 与 raw agent command，不能用内置 `agy` alias：
 
 ```sh

@@ -21,6 +21,8 @@ class EventDecoder:
         self.read_callbacks = set()
         self.shared_request_id = shared_request_id
         self.shared_result_seen = False
+        self.error_category = None
+        self.error_source = None
         self.tool_failed = False
         self.final_answer = ''
         self.tool_details = {}
@@ -38,6 +40,9 @@ class EventDecoder:
                 self.stop_reason = frame['stopReason']
             else:
                 self.failed = True
+                if frame.get('status') == 'failed' and frame.get('errorCategory') == 'auth_required':
+                    self.error_category = 'auth_required'
+                    self.error_source = 'session_watch' if frame.get('errorSource') == 'session_watch' else 'turn_result'
             return None
         if frame.get('type') != 'callcli.shared.event':
             self.failed = True

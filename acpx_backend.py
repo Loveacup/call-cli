@@ -211,6 +211,14 @@ class AcpxBackend:
                 state='unknown'
             if note:
                 state='unknown'
+            if decoder.error_category == 'auth_required':
+                source = ('watchSession prompt error.code=-32000/data.authRequired=true'
+                          if decoder.error_source == 'session_watch' else 'turn.result.error.detailCode=AUTH_REQUIRED')
+                diagnostic = ('ACPX Shared Runtime '+source+': '
+                              'runtime-reported authentication required; authentication origin unknown. '
+                              'Preserve partial results; ask the operator to check authentication before '
+                              'any explicitly authorized continuation; no automatic replay.')
+                note = (note+' ' if note else '')+diagnostic
             return TurnResult(state, rc, decoder.stop_reason, note)
         finally:
             if proc is not None and proc.poll() is None:
