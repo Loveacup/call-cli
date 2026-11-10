@@ -170,11 +170,12 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 | :-- | :-- | :-- |
 | **A POSIX terminal or script** | `python3 collab.py` | Complete generic coordinator CLI (`connect`, `start`, `list`, `status`, `events`, `wait`, `reply`, `intervene`, `cancel`, `close`). `connect --runtime {omp,codex,pi,hermes}` records a caller declaration (`client_id` capability handle), not authenticated native host identity. |
 | **OMP, Codex or Pi** | `skill/` bundle + configured entry | Guides the initiating AI through environment discovery, online coordination and skill passing. Skills do not install dependencies or replace native target CLI logins. |
+| **A new owned OMP RPC host (experimental)** | `omp --mode rpc --no-ui --no-extensions -e /absolute/call-cli/omp-extension.mjs` | Native context supplies identity; managed 1-second `wait` polling queues follow-ups, not stdout push or steer. Session switch/exit stops delivery, not business tasks. Zero-model lifecycle close verified; ordinary TUI, ACP defer, restart recovery and final real-business E2E remain unverified. |
 | **Another machine over SSH** | `remote-client.cjs` | Single-file Node SSH transport forwarding JSON actions to `collab.py` on the POSIX coordinator host. |
 | **Restricted Windows Codex** | `remote-client.ps1` / `codex-ssh.cjs` | `remote-client.ps1` avoids the observed Node `spawn(ssh) EPERM` in the Windows Codex sandbox (verified against a macOS coordinator). `codex-ssh.cjs` runs a fresh desktop-context Codex via a one-shot InteractiveToken task to avoid Session 0 `0xC0000142`. |
 | **Hermes host** | Optional `call_cli` plugin (`__init__.py`, `plugin.yaml`) | Captures native `HERMES_SESSION_*` origin identity, dispatches background runners via the host terminal tool, and advances authorized `intervene` on `status`/`events`. Loading updated tool schemas requires refreshing the tool table via a host-supported method or opening a new Hermes session (an existing session's tool snapshot may remain stale); live current-chat consumption and Telegram delivery (Issue #1) require separate host verification. |
 
-**Terminal installation and in-CLI skill/plugin loading are two steps of one setup path.** See the [integration guide (`docs/integrations.md`, 简体中文)](docs/integrations.md) for the exact 14-file runtime deployment list and in-CLI loading commands.
+**Terminal installation and in-CLI skill/plugin loading are two steps of one setup path.** See the [integration guide (`docs/integrations.md`, 简体中文)](docs/integrations.md) for entry-specific dependency closures and loading commands. The experimental OMP adapter is opt-in for a new owned RPC instance only; it does not globally enable an extension or reload an existing host.
 
 <a id="capabilities"></a>
 ## Core capabilities
@@ -273,7 +274,7 @@ RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_sh
 | Guide | What it covers | Language |
 | :-- | :-- | :-- |
 | [Installation & configuration (`docs/configuration.md`)](docs/configuration.md) | Environment discovery, SSH aliases, ACPX agent config, auth, permissions, version checks and acceptance steps. | 简体中文 |
-| [CLI & module integration (`docs/integrations.md`)](docs/integrations.md) | OMP/Codex/Pi skill installation, in-CLI loading, optional Hermes plugin, 14-file runtime list and backend seam (`backends.py`). | 简体中文 |
+| [CLI & module integration (`docs/integrations.md`)](docs/integrations.md) | OMP/Codex/Pi skill installation, experimental OMP RPC adapter, optional Hermes plugin, entry-specific dependency closures and backend seam (`backends.py`). | 简体中文 |
 | [Online collaboration (`docs/usage.md`)](docs/usage.md) | `seq` cursor polling, multi-question `reply`, `intervene` cancel+resume, cancellation, verification and `close`. | 简体中文 |
 | [Core requirements (`skill/references/core-requirements.md`)](skill/references/core-requirements.md) | Canonical maintenance requirements for continuous bidirectional collaboration and layered evidence accounting. | 简体中文 |
 | [Task skill passing (`skill/references/skill-passing.md`)](skill/references/skill-passing.md) | Local-first selection, public repo signals, `required`/`optional`/`reference` modes, staging limits and `CALLCLI_SKILL` receipts. | 简体中文 |

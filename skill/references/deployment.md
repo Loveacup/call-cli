@@ -12,3 +12,11 @@
 ## 最小 skill-only 同步候选
 
 不更换运行时：在获准的独立技能位置准备完整 root/references/templates，合并所需个人适配并保留私有设备库存；核链接、文件清单和语义，然后只切消费者的 skill 绑定并用其原生加载器读回。若现有 skill 与 runtime 共用 release/current，优先提出解耦该绑定的精确候选，不默许移动运行时 current。新目标、绑定或登记变更仍属独立安装／暴露授权；本文件只给方案，不执行部署。
+
+## OMP 实验性宿主适配
+
+只在获准的新建自有 RPC 实例单次加载：`omp --mode rpc --no-ui --no-extensions -e /absolute/call-cli/omp-extension.mjs`。使用完整的固定 commit 目录；`omp-extension.mjs` 相邻必须有 `omp_bridge.py`，以及[集成手册依赖闭包](https://github.com/Loveacup/call-cli/blob/main/docs/integrations.md#运行时依赖闭包)的同版文件。公共 skill 的 root/references/templates 独立打包，个人库存和 Hermes 专属说明按各安装原文合并，不能从公开模板覆盖。
+
+实测 API 为 OMP 18.18.1。原生 ctx 生成 session/agent 身份；每个 binding 的受管 1 秒 timer 对活跃 task 做 one-shot Python wait0，批次后再计时，通过 followUp 入队，不是 stdout 推送或 steer。首次并发 bind 共用一次请求，各 task 跟踪和错误隔离；业务状态、续轮及 writer 互斥复用 core。退出／切 session 只停止投递，不取消任务；普通 TUI、ACP defer、重启恢复及真实最终业务 E2E 均未验。加载后先验证工具注册和不调用模型的 list，真实业务与原会话投递另验；RPC prompt ACK 不是 extension close 完成，须等待 handler 回执及原生 no-session。
+
+候选 manifest 逐文件记录 commit、SHA-256、相邻资源和 skill 链接校验；以实际 import／文件读取依赖生成，不能从旧文件数量加减。发布准备不切 current、物理插件或个人 skill 绑定；父方核验本 worker 已结算关闭及其他相关活动任务后，再按备份、精确文件清单、原子切换和哈希读回步骤接管。旧 release 与失败证据保留，磁盘切换不等于当前宿主已加载，不为刷新而 restart/reload。

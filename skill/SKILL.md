@@ -29,10 +29,13 @@ metadata:
 | 入口 | 来源与回流 | 使用条件 |
 | --- | --- | --- |
 | Hermes `call_cli` | 宿主捕获真实来源；原生 terminal 通知桥 | 只用当前实际加载的 agent／动作；先读[宿主分支](references/hermes-host.md) |
+| OMP `call_cli_omp`（实验性） | 原生 ctx 注入身份；受管 1 秒 wait0 轮询后 followUp，不是推送或 steer | 仅在新建自有 RPC 实例以 `omp --mode rpc --no-ui --no-extensions -e /absolute/call-cli/omp-extension.mjs` 单次加载；先读[依赖与加载边界](references/deployment.md#omp-实验性宿主适配) |
 | 通用 `collab.py`／已安装包装器 | 私有 client handle；发起端自己消费短 wait 并向原会话转述 | 按[在线流程](references/online-collab.md)核对当前 help；不宣称 chat/thread 绑定或自动回注 |
 | 原生 ACPX | 命名会话、流与控制能力依适配器 | [独立短测或诊断](references/native-commands.md)，不绕过已登记任务再执行一遍 |
 
 旧 schema 缺动作时，先核验已有受支持入口及宿主桥；明确通用路径损失和协调者中继责任。需要新工具快照时才考虑宿主支持的重载／新会话，`/new` 不是普遍唯一解，也不会让新来源取得旧任务所有权。某个入口的 runtime 标签不支持某 CLI，只说明该入口缺口，不代表该 CLI 永远不能发起。
+
+OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请求共用 bind、各 task 独立跟踪；身份不由模型填写。退出或切 session 只停宿主投递，不取消业务。已验零模型 RPC close，不代表普通 TUI、ACP defer、恢复或真实最终业务 E2E 通过；维护检查仍覆盖 call-cli 与本轮实际参与 CLI 的协作 skill，不因新增入口改变检查目标。
 
 ## 在线协调：消费、判断、接续
 

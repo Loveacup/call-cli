@@ -166,11 +166,12 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 | :-- | :-- | :-- |
 | **POSIX 终端或脚本** | `python3 collab.py` | 完整通用协调 CLI（`connect`、`start`、`list`、`status`、`events`、`wait`、`reply`、`intervene`、`cancel`、`close`）。`connect --runtime {omp,codex,pi,hermes}` 仅记录调用方自报声明（返回本地 `client_id` 句柄），不是已认证的原生宿主身份。 |
 | **OMP、Codex 或 Pi** | `skill/` 技能包 + 已配置的协调入口 | 指导发起端 AI 完成环境发现、在线协调与技能传递；技能本身不安装系统依赖，也不代替目标 CLI 原生登录。 |
+| **新建自有 OMP RPC 宿主（实验性）** | `omp --mode rpc --no-ui --no-extensions -e /absolute/call-cli/omp-extension.mjs` | 原生 ctx 生成身份；受管 1 秒 wait 轮询后 followUp，不是 stdout 推送或 steer。退出／切 session 只停投递，不取消业务。仅验零模型 close；普通 TUI、ACP defer、重启恢复和真实最终业务 E2E 未验。 |
 | **其他机器（跨 SSH）** | `remote-client.cjs` | 单文件 Node SSH 客户端，将 JSON 命令转发至 POSIX 协调主机的 `collab.py`。 |
 | **Windows 受限 Codex 环境** | `remote-client.ps1` / `codex-ssh.cjs` | `remote-client.ps1` 规避已观察到的 Windows Codex 沙箱内 Node `spawn(ssh) EPERM`（当前仅核验 macOS 协调端）；`codex-ssh.cjs` 通过一次性 InteractiveToken 任务在已登录桌面上下文启动新 Codex，规避 Session 0 `0xC0000142`。 |
 | **Hermes 宿主** | 可选 `call_cli` 插件（`__init__.py`、`plugin.yaml`） | 捕获原生 `HERMES_SESSION_*` 来源身份，经宿主 terminal 工具后台运行 runner，并在调用 `status`/`events` 时推进已授权的 `intervene`。加载更新后的工具 schema 需按宿主支持方式刷新工具表或新开 Hermes 会话（原会话工具快照可能仍为旧版）；宿主当前会话实时消费与 Telegram 投递（Issue #1）仍需单独宿主验收。 |
 
-**终端安装与 CLI 内加载属于同一条配置路径的先后步骤。** 必须一起部署的 14 个运行时文件清单与各 CLI 内加载验证方式详见[集成手册（`docs/integrations.md`，简体中文）](docs/integrations.md)。
+**终端安装与 CLI 内加载属于同一条配置路径的先后步骤。** 各入口依赖闭包与加载方式详见[集成手册（`docs/integrations.md`，简体中文）](docs/integrations.md)。实验性 OMP 入口仅在新建自有 RPC 实例单次加载，不全局启用或 reload 现有宿主。
 
 <a id="核心能力"></a>
 <a id="capabilities"></a>
@@ -273,7 +274,7 @@ RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_sh
 | 手册 | 内容概要 | 语言 |
 | :-- | :-- | :-- |
 | [安装与配置（`docs/configuration.md`）](docs/configuration.md) | 环境发现、SSH 别名、ACPX agent 配置、认证、权限、版本检查与交付验收。 | 简体中文 |
-| [CLI／模块接入（`docs/integrations.md`）](docs/integrations.md) | OMP/Codex/Pi 技能安装、CLI 内加载、可选 Hermes 插件、14 文件运行时清单与后端扩展接口（`backends.py`）。 | 简体中文 |
+| [CLI／模块接入（`docs/integrations.md`）](docs/integrations.md) | OMP/Codex/Pi 技能安装、实验性 OMP RPC 适配、可选 Hermes 插件、各入口依赖闭包与后端扩展接口（`backends.py`）。 | 简体中文 |
 | [在线协作（`docs/usage.md`）](docs/usage.md) | `seq` 游标续读、多问题 `reply`、`intervene` 取消续轮、取消、验收与 `close`。 | 简体中文 |
 | [当前核心需求（`skill/references/core-requirements.md`）](skill/references/core-requirements.md) | 持续双向协作与分层证据核验的唯一维护正本。 | 简体中文 |
 | [任务技能传递（`skill/references/skill-passing.md`）](skill/references/skill-passing.md) | 本地优先选择、公开仓库线索、`required`/`optional`/`reference` 模式、暂存限制与 `CALLCLI_SKILL` 回执。 | 简体中文 |
