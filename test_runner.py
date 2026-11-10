@@ -78,8 +78,19 @@ if 'cancel' in args:
     raise SystemExit(0)
 text=payload['prompt'] if shared else sys.stdin.read()
 session=args[args.index('-s')+1]
+if shared and not os.environ.get('ACPX_FAKE_NO_START'):
+    print(json.dumps({'type':'callcli.shared.event','requestId':payload['options']['requestId'],'event':{'type':'prompt_started'}}),flush=True)
 if 'BLOCK' in text:
-    while not (root/('cancel-'+session)).exists():time.sleep(.03)
+    while not (root/('cancel-'+session)).exists():
+        activity=root/('activity-'+session)
+        if activity.exists():
+            value=activity.read_text();activity.unlink()
+            output({'params':{'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':value}}}})
+        tool=root/('tool-'+session)
+        if tool.exists():
+            tool.unlink()
+            output({'params':{'update':{'sessionUpdate':'tool_call_update','toolCallId':'read1','title':'read_file','kind':'read','status':'in_progress'}}})
+        time.sleep(.03)
     mode=os.environ.get('ACPX_CANCEL_MODE','cancelled')
     if mode == 'failed':output({'error':{'code':-1,'message':'failed'}})
     if mode not in {'eof','exit255'}:
@@ -151,6 +162,474 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 self.assertNotIn('PRIVATE', output.getvalue()+json.dumps(result)+json.dumps(events))
                 calls = [json.loads(line) for line in (self.root/'calls.jsonl').read_text().splitlines()]
                 self.assertEqual(sum('prompt' in c and task['session'] in c for c in calls), 1)
+
+    def test_runtime_diagnostics_require_exact_category_source_and_keep_unknown(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from runner import run_task
+        for category, source, expected in [
+            ('timeout', 'turn_result_code', 'runtime-reported prompt deadline'),
+            ('connection_lost', 'turn_result_detail', 'runtime-reported agent connection loss'),
+            ('timeout', 'turn_result_detail', None),
+            ('connection_lost', 'turn_result_code', None),
+            ('timeout', None, None),
+            ('auth_required', 'PRIVATE_SOURCE', None),
+            ('PRIVATE_CATEGORY', 'turn_result_code', None)
+        ]:
+            with self.subTest(category=category, source=source):
+                task = self.task('normal task')
+                frame = dict(status='failed', stopReason=None, errorCategory=category, errorSource=source, message='PRIVATE_MESSAGE')
+                output = io.StringIO()
+                with patch.dict(os.environ, {'ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), contextlib.redirect_stdout(output):
+                    run_task(self.store.path, task['id'])
+                result = self.store.get(task['id'])
+                self.assertEqual(result['state'], 'unknown')
+                note = result.get('settlement_note') or ''
+                if expected:
+                    self.assertIn(expected, note)
+                    self.assertIn('reconcile', note)
+                    self.assertIn('no automatic replay', note)
+                    if category == 'timeout':
+                        self.assertIn('configured timeout 30s', note)
+                    else:
+                        self.assertIn('cause unknown', note)
+                else:
+                    self.assertNotIn('runtime-reported', note)
+                events = self.store.events(task['id'], self.origin)
+                self.assertNotIn('PRIVATE', output.getvalue()+json.dumps(result)+json.dumps(events))
+                calls = [json.loads(line) for line in (self.root/'calls.jsonl').read_text().splitlines()]
+                self.assertEqual(sum('prompt' in c and task['session'] in c for c in calls), 1)
+
+    def test_runtime_diagnostics_ignore_foreign_and_success_frames(self):
+        from events import EventDecoder
+        for category, source in [('timeout','turn_result_code'), ('connection_lost','turn_result_detail')]:
+            for status, request_id in [('failed','foreign:1'), ('completed','owned:1'), ('cancelled','owned:1')]:
+                with self.subTest(category=category, status=status, request_id=request_id):
+                    decoder = EventDecoder(shared_request_id='owned:1')
+                    decoder.feed(dict(type='callcli.shared.result', requestId=request_id, status=status,
+                                      stopReason={'completed':'end_turn','cancelled':'cancelled'}.get(status),
+                                      errorCategory=category, errorSource=source))
+                    self.assertIsNone(decoder.error_category)
+                    self.assertIsNone(decoder.error_source)
+
+    def test_quiet_unbudgeted_turn_notifies_once_per_episode_and_never_cancels(self):
+        self._timed_turn_scenario('quiet')
+
+    def test_unbudgeted_startup_is_bounded_without_claiming_runtime_timeout(self):
+        self._timed_turn_scenario('startup')
+
+    def test_explicit_outer_deadline_keeps_existing_cancellation(self):
+        self._timed_turn_scenario('explicit')
+
+    def test_duplicate_tool_updates_do_not_postpone_quiet_reminder(self):
+        self._timed_turn_scenario('duplicate_tool')
+
+    def test_large_payload_cancel_is_supervised_before_stdin_finishes(self):
+        self._blocked_payload_scenario(False)
+
+    def test_large_payload_startup_deadline_is_supervised_before_stdin_finishes(self):
+        self._blocked_payload_scenario(True)
+
+    def test_blocked_payload_cancel_failure_converges_transport(self):
+        self._blocked_payload_scenario(False, True)
+
+    def _blocked_payload_scenario(self, startup, cancel_failure=False):
+        import contextlib, io, json, subprocess, sys, threading, time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from runner import run_task
+        task=self.task('x'*2000000)
+        self.store.update(task['id'],timeout=None)
+        marker=self.root/'pipe-child-started'
+        (self.root/'node').write_text('#!'+sys.executable+'\nimport pathlib,time\npathlib.Path('+repr(str(marker))+').touch()\ntime.sleep(10)\n')
+        children=[];popen=subprocess.Popen
+        def launch(*args,**kwargs):
+            child=popen(*args,**kwargs)
+            if args[0][0]=='node':children.append(child)
+            return child
+        before=set(threading.enumerate())
+        from backends import backend_for
+        backend=backend_for('omp');control=backend.control
+        def cancel_control(current,action,timeout=20):
+            result=control(current,action,timeout)
+            if action=='cancel' and cancel_failure:result.returncode=1
+            return result
+        now=[0.0]
+        with patch('acpx_backend.subprocess.Popen',side_effect=launch), \
+                patch('acpx_backend.time',SimpleNamespace(monotonic=lambda:now[0])), \
+                patch.object(backend,'control',side_effect=cancel_control), \
+                contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as pool:
+            future=pool.submit(run_task,self.store.path,task['id'])
+            try:
+                until=time.monotonic()+3
+                while not marker.exists() and time.monotonic()<until:time.sleep(.01)
+                self.assertTrue(marker.exists())
+                if startup:now[0]=121
+                else:self.store.request_cancel(task['id'],self.origin)
+                until=time.monotonic()+2
+                cancel=self.root/('cancel-'+task['session'])
+                while not cancel.exists() and not future.done() and time.monotonic()<until:time.sleep(.01)
+                self.assertTrue(cancel.exists(),'backpressure prevented cancel control')
+                future.result(timeout=2)
+                result=self.store.get(task['id'])
+                self.assertEqual(result['state'],'unknown')
+                if startup:self.assertIn('prompt acceptance not observed',result['settlement_note'])
+                self.assertTrue(children and all(child.poll() is not None for child in children))
+            finally:
+                for child in children:
+                    if child.poll() is None:child.terminate()
+                future.result(timeout=5)
+        self.assertFalse([t for t in threading.enumerate() if t not in before and t.name.startswith('callcli-transport-')])
+
+    def test_received_acceptance_prevents_delayed_startup_cancellation(self):
+        self._received_frame_scenario(None)
+
+    def test_received_terminal_preserves_failure_diagnostics_at_startup_deadline(self):
+        for category,source in [('timeout','turn_result_code'),('connection_lost','turn_result_detail')]:
+            with self.subTest(category=category):self._received_frame_scenario((category,source))
+
+    def _received_frame_scenario(self, diagnostic):
+        import contextlib, io, json, os, queue, threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=None)
+        received=threading.Event();base=queue.Queue
+        class ObservedQueue(base):
+            def put(self,item,*args,**kwargs):
+                result=super().put(item,*args,**kwargs)
+                if isinstance(item,bytes) and (b'callcli.shared.result' if diagnostic else b'prompt_started') in item:received.set()
+                return result
+        ticks=[0]
+        def clock():
+            ticks[0]+=1
+            if ticks[0]==1:return 0
+            self.assertTrue(received.wait(3),'reader must receive the request fact before deadline decision')
+            return 121
+        env={'ACPX_FAKE_NO_START':'1' if diagnostic else ''}
+        if diagnostic:env['ACPX_FAKE_RESULT_FRAME']=json.dumps(dict(status='failed',stopReason=None,errorCategory=diagnostic[0],errorSource=diagnostic[1]))
+        with patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), patch('acpx_backend.queue.Queue',ObservedQueue), \
+                patch.dict(os.environ,env),contextlib.redirect_stdout(io.StringIO()):
+            rc=run_task(self.store.path,task['id'])
+        self.assertFalse((self.root/('cancel-'+task['session'])).exists(),'received fact lost to deadline decision')
+        result=self.store.get(task['id']);note=result.get('settlement_note') or ''
+        self.assertEqual((result['state'],rc),('unknown',1) if diagnostic else ('completed',0))
+        self.assertNotIn('startup cancellation',note)
+        if diagnostic:self.assertIn('runtime-reported',note)
+
+    def test_terminal_after_startup_cancel_preserves_runtime_diagnostic(self):
+        import contextlib, io, json, os, time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from backends import backend_for
+        from runner import run_task
+        task=self.task('BLOCK');self.store.update(task['id'],timeout=None)
+        backend=backend_for('omp');control=backend.control
+        def cancel(current,action,timeout=20):
+            if action=='cancel':
+                until=time.monotonic()+3
+                while not (self.root/'shared-options.jsonl').exists() and time.monotonic()<until:time.sleep(.01)
+                time.sleep(.1)
+            return control(current,action,timeout)
+        ticks=[0]
+        def clock():
+            ticks[0]+=1
+            return 0 if ticks[0]==1 else 121
+        frame=dict(status='failed',stopReason=None,errorCategory='connection_lost',errorSource='turn_result_detail')
+        with patch('acpx_backend.time',SimpleNamespace(monotonic=clock)),patch.object(backend,'control',side_effect=cancel), \
+                patch.dict(os.environ,{'ACPX_FAKE_NO_START':'1','ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), \
+                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+        result=self.store.get(task['id'])
+        self.assertEqual((result['state'],rc),('unknown',1))
+        self.assertIn('runtime-reported agent connection loss',result['settlement_note'])
+        self.assertNotIn('startup cancellation',result['settlement_note'])
+
+    def test_output_backlog_cannot_starve_cancel_supervision(self):
+        import contextlib, io, queue
+        from unittest.mock import patch
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=None)
+        base=queue.Queue;store=self.store;origin=self.origin;drains=[0]
+        class BackloggedQueue(base):
+            def get_nowait(self):
+                drains[0]+=1
+                if drains[0]==1:store.request_cancel(task['id'],origin)
+                if drains[0]<10000:
+                    return b'{}\n'
+                return super().get_nowait()
+        with patch('acpx_backend.queue.Queue',BackloggedQueue),contextlib.redirect_stdout(io.StringIO()):
+            run_task(self.store.path,task['id'])
+        self.assertTrue((self.root/('cancel-'+task['session'])).exists())
+        self.assertLess(drains[0],10000,'unbounded output drain postponed supervision until producer stopped')
+
+    def test_reader_frame_parse_and_startup_decision_are_serialized(self):
+        import contextlib, io, json, threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=None)
+        parsing=threading.Event();release=threading.Event();loads=json.loads;ticks=[0]
+        def parse(value,*args,**kwargs):
+            if threading.current_thread().name=='callcli-transport-reader' and 'prompt_started' in value:
+                parsing.set();self.assertTrue(release.wait(3))
+            return loads(value,*args,**kwargs)
+        def clock():
+            ticks[0]+=1
+            if ticks[0]==1:return 0
+            if ticks[0]==2:
+                self.assertTrue(parsing.wait(3))
+                threading.Timer(.1,release.set).start()
+            return 121
+        with patch('acpx_backend.json.loads',side_effect=parse),patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
+                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+        self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
+        self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+
+    def test_terminal_is_drained_when_writer_completion_signal_is_delayed(self):
+        import contextlib, io, json, os, threading, time
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from backends import backend_for
+        from runner import run_task
+        task=self.task('BLOCK');self.store.update(task['id'],timeout=None)
+        completion=threading.Event();terminal=threading.Event();created=[0];ticks=[0]
+        class DelayedCompletion:
+            def __init__(self):self.event=threading.Event()
+            def set(self):completion.wait(3);self.event.set()
+            def is_set(self):return self.event.is_set()
+        def event():
+            created[0]+=1
+            return DelayedCompletion() if created[0]==1 else threading.Event()
+        def clock():
+            ticks[0]+=1
+            return 0 if ticks[0]==1 else 121
+        backend=backend_for('omp');control=backend.control
+        def cancel(current,action,timeout=20):
+            if action!='cancel':return control(current,action,timeout)
+            until=time.monotonic()+3
+            while not (self.root/'shared-options.jsonl').exists() and time.monotonic()<until:time.sleep(.01)
+            result=control(current,action,timeout)
+            self.assertTrue(terminal.wait(3))
+            threading.Timer(.2,completion.set).start()
+            return result
+        import queue
+        base=queue.Queue
+        class ObservedQueue(base):
+            def put(self,item,*args,**kwargs):
+                result=super().put(item,*args,**kwargs)
+                if isinstance(item,bytes) and b'callcli.shared.result' in item:terminal.set()
+                return result
+        frame=dict(status='failed',stopReason=None,errorCategory='connection_lost',errorSource='turn_result_detail')
+        transport_threads=SimpleNamespace(Event=event,Lock=threading.Lock,Thread=threading.Thread)
+        with patch('acpx_backend.threading',transport_threads),patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
+                patch('acpx_backend.queue.Queue',ObservedQueue),patch.object(backend,'control',side_effect=cancel), \
+                patch.dict(os.environ,{'ACPX_FAKE_NO_START':'1','ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), \
+                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+        result=self.store.get(task['id'])
+        self.assertEqual((result['state'],rc),('unknown',1))
+        self.assertIn('runtime-reported agent connection loss',result['settlement_note'])
+        self.assertNotIn('startup cancellation',result['settlement_note'])
+
+    def test_transport_reads_success_with_high_numbered_stdout_pipe(self):
+        import contextlib, fcntl, io, os, subprocess
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=1000)
+        popen=subprocess.Popen;ticks=[0]
+        def launch(*args,**kwargs):
+            child=popen(*args,**kwargs)
+            if args[0][0]=='node':
+                high=fcntl.fcntl(child.stdout.fileno(),fcntl.F_DUPFD,1100)
+                child.stdout.close();child.stdout=os.fdopen(high,'rb')
+            return child
+        def clock():
+            ticks[0]+=1
+            return 0 if ticks[0]==1 else 121
+        with patch('acpx_backend.subprocess.Popen',side_effect=launch), \
+                patch('acpx_backend.time',SimpleNamespace(monotonic=clock)),contextlib.redirect_stdout(io.StringIO()):
+            rc=run_task(self.store.path,task['id'])
+        self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
+
+    def test_descendant_held_pipes_do_not_block_cancel_failure_cleanup(self):
+        self._held_transport_scenario('descendant')
+
+    def test_terminal_without_transport_exit_has_bounded_cleanup(self):
+        self._held_transport_scenario('completed')
+
+    def test_failed_terminal_without_exit_keeps_runtime_diagnostic(self):
+        self._held_transport_scenario('connection_lost')
+
+    def _held_transport_scenario(self, mode):
+        import contextlib, io, json, os, signal, subprocess, sys, threading, time
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        from runner import run_task
+        from backends import backend_for
+        task=self.task('x'*2000000 if mode=='descendant' else 'normal task')
+        self.store.update(task['id'],timeout=None,write=True)
+        marker=self.root/'held-transport.json'
+        source='import os,sys,json,pathlib,time\n'
+        if mode=='descendant':
+            source+='child=os.fork()\nif child==0:\n time.sleep(12);os._exit(0)\n'
+            source+='pathlib.Path('+repr(str(marker))+').write_text(json.dumps([os.getpid(),child]))\ntime.sleep(12)\n'
+        else:
+            frame=dict(type='callcli.shared.result',status='completed',stopReason='end_turn')
+            if mode!='completed':frame.update(status='failed',stopReason=None,errorCategory='connection_lost',errorSource='turn_result_detail')
+            source+='p=json.loads(sys.stdin.read());r=p["options"]["requestId"]\n'
+            source+='print(json.dumps(dict(type="callcli.shared.event",requestId=r,event=dict(type="text_delta",stream="output",tag="agent_message_chunk",text="SYNTHETIC_RESULT\\n"))),flush=True)\n'
+            source+='f='+repr(frame)+';f["requestId"]=r;print(json.dumps(f),flush=True)\n'
+            source+='pathlib.Path('+repr(str(marker))+').write_text(json.dumps([os.getpid()]))\ntime.sleep(12)\n'
+        (self.root/'node').write_text('#!'+sys.executable+'\n'+source)
+        backend=backend_for('omp');control=backend.control
+        def cancel(current,action,timeout=20):
+            result=control(current,action,timeout)
+            if action=='cancel' and mode=='descendant':result.returncode=1
+            return result
+        before=set(threading.enumerate());pids=[];start=time.monotonic()
+        with patch.object(backend,'control',side_effect=cancel), \
+                patch('acpx_backend.TRANSPORT_CLEANUP_TIMEOUT',.3,create=True), \
+                contextlib.redirect_stdout(io.StringIO()),ThreadPoolExecutor(max_workers=1) as pool:
+            future=pool.submit(run_task,self.store.path,task['id'])
+            try:
+                until=time.monotonic()+3
+                while not marker.exists() and time.monotonic()<until:time.sleep(.01)
+                self.assertTrue(marker.exists());pids=json.loads(marker.read_text())
+                if mode=='descendant':self.store.request_cancel(task['id'],self.origin)
+                until=time.monotonic()+3
+                while not future.done() and time.monotonic()<until:time.sleep(.01)
+                self.assertTrue(future.done(),'transport cleanup waited for inherited pipes or EOF')
+                self.assertEqual(future.result(),1)
+                result=self.store.get(task['id']);self.assertEqual(result['state'],'unknown')
+                if mode!='descendant':
+                    self.assertIn('transport cleanup',result['settlement_note'])
+                    self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+                if mode=='connection_lost':self.assertIn('runtime-reported agent connection loss',result['settlement_note'])
+                with self.assertRaises(ValueError):self.store.create(self.origin,'local','omp',str(self.root),'conflicting writer',True)
+                self.assertFalse([t for t in threading.enumerate() if t not in before and t.name.startswith('callcli-transport-')])
+                if mode=='descendant':os.kill(pids[1],0)  # IO shutdown must not kill the pipe holder.
+            finally:
+                for pid in pids:
+                    try:os.kill(pid,signal.SIGKILL)
+                    except ProcessLookupError:pass
+                future.result(timeout=6)
+
+    def test_terminal_diagnostic_survives_slow_public_event_backlog(self):
+        import contextlib, io, json, os, threading, time
+        from unittest.mock import patch
+        from bridge import Store
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=None)
+        event=Store.event
+        def slow(store,task_id,token,kind,text='',**metadata):
+            if kind=='stage':time.sleep(.01)
+            return event(store,task_id,token,kind,text,**metadata)
+        frame=dict(status='failed',stopReason=None,errorCategory='connection_lost',errorSource='turn_result_detail')
+        with patch.object(Store,'event',slow),patch('acpx_backend.TRANSPORT_CLEANUP_TIMEOUT',.02), \
+                patch.dict(os.environ,{'ACPX_FAKE_RESULT_FRAME':json.dumps(frame),
+                                     'ACPX_FAKE_CHUNKS':json.dumps(['CALLCLI_STAGE row'+str(n)+'\n' for n in range(400)])}), \
+                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+        result=self.store.get(task['id'])
+        self.assertEqual((result['state'],rc),('unknown',1))
+        self.assertIn('runtime-reported agent connection loss',result.get('settlement_note') or '')
+
+    def test_successful_transport_preserves_slow_answer_tail_in_order(self):
+        self._ordered_tail_scenario(False)
+
+    def test_successful_transport_preserves_question_handles_after_backlog(self):
+        self._ordered_tail_scenario(True)
+
+    def _ordered_tail_scenario(self, questions):
+        import contextlib, io, json, os, time
+        from unittest.mock import patch
+        from bridge import Store
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=None)
+        event=Store.event
+        def slow(store,task_id,token,kind,text='',**metadata):
+            if kind=='stage':time.sleep(.02)
+            return event(store,task_id,token,kind,text,**metadata)
+        tail=['FINAL_TAIL_MUST_SURVIVE\n']
+        if questions:tail+=['CALLCLI_QUESTION Q1 First choice?\n','CALLCLI_QUESTION Q2 Second choice?\n']
+        chunks=['CALLCLI_STAGE row'+str(n)+'\n' for n in range(400)]+tail
+        with patch.object(Store,'event',slow),patch.dict(os.environ,{'ACPX_FAKE_CHUNKS':json.dumps(chunks)}), \
+                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+        result=self.store.get(task['id']);events=self.store.events(task['id'],self.origin)
+        self.assertEqual((result['state'],rc),('waiting_reply',0) if questions else ('completed',0))
+        self.assertFalse(result.get('settlement_note'))
+        self.assertEqual([e['text'] for e in events if e['kind']=='stage'],['row'+str(n) for n in range(400)])
+        self.assertEqual([e['text'] for e in events if e['kind']=='answer'],['FINAL_TAIL_MUST_SURVIVE'])
+        if questions:
+            pending=[e for e in events if e['kind']=='question']
+            self.assertEqual([e['text'] for e in pending],['Q1 First choice?','Q2 Second choice?'])
+            self.assertEqual(result['questions'],[e['token'] for e in pending])
+            self.assertLess(next(e['seq'] for e in events if e['kind']=='answer'),pending[0]['seq'])
+            self.assertLess(pending[0]['seq'],pending[1]['seq'])
+
+    def _timed_turn_scenario(self, mode):
+        import contextlib, io, json, os, time
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from runner import run_task
+        task = self.task('BLOCK')
+        self.store.update(task['id'], timeout=30 if mode=='explicit' else None)
+        now = [0.0]
+        output = io.StringIO()
+        def wait_for(predicate):
+            until = time.monotonic()+5
+            while time.monotonic()<until:
+                if predicate():return
+                time.sleep(.02)
+            self.fail('timed turn did not reach expected public state')
+        def events():return self.store.events(task['id'], self.origin)
+        def reminders():return [e for e in events() if e['kind']=='stage' and 'No visible public events' in e['text']]
+        with patch('acpx_backend.time', SimpleNamespace(monotonic=lambda:now[0])), \
+                patch.dict(os.environ, {'ACPX_FAKE_NO_START':'1' if mode=='startup' else ''}), \
+                contextlib.redirect_stdout(output), ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_task, self.store.path, task['id'])
+            try:
+                wait_for(lambda:(self.root/'shared-options.jsonl').exists())
+                time.sleep(.35)
+                if mode=='quiet':
+                    now[0]=601
+                    wait_for(lambda:len(reminders())==1)
+                    now[0]=1202;time.sleep(.35)
+                    self.assertEqual(len(reminders()),1)
+                    self.assertEqual(self.store.get(task['id'])['state'],'running')
+                    self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+                    (self.root/('activity-'+task['session'])).write_text('CALLCLI_STAGE resumed\n')
+                    wait_for(lambda:any(e['text']=='resumed' for e in events()))
+                    now[0]=1803
+                    wait_for(lambda:len(reminders())==2)
+                    self.store.request_cancel(task['id'],self.origin)
+                elif mode=='duplicate_tool':
+                    trigger=self.root/('tool-'+task['session'])
+                    trigger.touch()
+                    wait_for(lambda:any(e['kind']=='tool' for e in events()))
+                    now[0]=599;trigger.touch()
+                    wait_for(lambda:not trigger.exists());time.sleep(.1)
+                    now[0]=601
+                    wait_for(lambda:len(reminders())==1)
+                    self.assertEqual(sum(e['kind']=='tool' for e in events()),1)
+                    self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+                    self.store.request_cancel(task['id'],self.origin)
+                else:now[0]=121
+                rc=future.result(timeout=5)
+                result=self.store.get(task['id'])
+                if mode=='startup':
+                    self.assertEqual((result['state'],rc),('unknown',1))
+                    self.assertIn('prompt acceptance not observed within 120s',result['settlement_note'])
+                    self.assertNotIn('TIMEOUT',result['settlement_note'])
+                else:self.assertEqual((result['state'],rc),('cancelled',0))
+                options=json.loads((self.root/'shared-options.jsonl').read_text().splitlines()[0])
+                if mode=='explicit':self.assertEqual(options['timeoutMs'],30000)
+                else:self.assertNotIn('timeoutMs',options)
+            finally:
+                if not future.done():
+                    self.store.request_cancel(task['id'],self.origin)
+                    future.result(timeout=5)
 
     def test_intervention_advance_keeps_settlement_event_and_cursor(self):
         import contextlib, io, json

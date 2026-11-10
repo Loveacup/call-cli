@@ -36,6 +36,20 @@ test('stage and question wake correct session once and never expose capability',
   assert.equal(f.calls.at(-1).args.after,7);
 });
 
+test('quiet reminders survive stage coalescing and identical later episodes', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
+  for (const seq of [1,3]) {
+    f.setPacket({task:{id:'task-a',state:'running'},events:[
+      {seq,kind:'stage',text:'No visible public events',quiet_notice:true},
+      {seq:seq+1,kind:'stage',text:'same status'}],after:seq+1});
+    await f.timers.shift()();
+  }
+  const events=f.sent.flatMap(item=>JSON.parse(item.message.content).events);
+  assert.equal(events.filter(event=>event.quiet_notice).length,2);
+  assert.ok(!f.calls.some(call=>call.args?.action==='cancel'));
+});
+
 test('session switch discards in-flight notification without canceling business',async()=>{
   const f=fixture();
   await f.adapter.execute({action:'start',agent:'agy',cwd:'/work',prompt:'inspect'},f.ctx);

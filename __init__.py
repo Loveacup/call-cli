@@ -31,7 +31,7 @@ SCHEMA={
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
         'after':{'type':'integer','default':0},
-        'timeout':{'type':'integer','minimum':30,'maximum':7200,'default':900}
+        'timeout':{'type':'integer','minimum':30,'maximum':7200,'description':'Optional execution limit in seconds; omitted means no execution deadline; control/startup remain bounded'}
     },'required':['action'],'additionalProperties':False}
 }
 
@@ -61,8 +61,9 @@ class Coordinator:
             from .transport import command
             fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
-            timeout=args.get('timeout',900)
-            if not isinstance(timeout,int) or not 30<=timeout<=7200:raise ValueError('timeout must be 30..7200')
+            timeout=args.get('timeout')
+            if timeout is not None and (type(timeout) is not int or not 30<=timeout<=7200):
+                raise ValueError('timeout must be omitted or 30..7200')
             task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'))
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout,
                               needs_session=True,acpx_created=False,session_creation_attempted=False,**fields)
@@ -126,7 +127,9 @@ class Coordinator:
         args={'command':shlex.join([sys.executable,str(Path(__file__).with_name('runner.py')),
                                   '--db',str(store.path),'--task',task['id']]),
               'workdir':str(Path(__file__).parent),'background':True,'notify':True,
-              'heartbeat':60,'timeout':task['timeout']+180}
+              'heartbeat':60}
+        if task.get('timeout') is not None:
+            args['timeout']=task['timeout']+180
         task=store.claim_launch(task['id'],task['turn'])
         turn,launch_id=task['turn'],task['launch_id']
         try:

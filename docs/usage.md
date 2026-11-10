@@ -12,7 +12,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
   --client CLIENT_ID start --device worker-laptop --agent omp \
-  --cwd /absolute/target/workspace --timeout 900 \
+  --cwd /absolute/target/workspace \
   --prompt '目标、只读或可写范围、产物和验收方法'
 ```
 
@@ -22,6 +22,8 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - `--agent` 取 `omp/codex/pi/agy`：是真正的执行目标；AGY 另传当前发现的 `--model`。
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
+- 新任务省略 `--timeout`（或传 `none`）默认不设执行总截止；需要限时才显式传秒数，旧任务的已存 timeout 不变。显式值仍用于 ACPX 每步／prompt 截止和 runner 的 T+90 取消保护，不是精确总墙钟或费用上限。连接与控制限时保留；无预算轮等待 prompt 接受最多 120s，超出请求取消并记 unknown、保留占用。正常运行期间每段连续 600s 没有可见公开事件只发一条 stage 提醒，有公开活动后重新计时；提醒不取消，也不证明无进展或挂死。随时可显式 cancel。
+- 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
 
 ## 观察、提问与回复

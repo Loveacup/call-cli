@@ -43,6 +43,7 @@ for line in sys.stdin:
                   'data':{'authRequired':True,'private':'PRIVATE_SYNTHETIC_DATA'}}})
         elif mode=='fail':send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'Synthetic main prompt failure'}})
         elif mode=='block':pending=i
+        elif mode=='drop':sys.exit(0)
         elif mode=='intervention':
             prompt='\n'.join(part.get('text','') for part in m['params']['prompt'])
             if 'INITIAL_BLOCK' in prompt:

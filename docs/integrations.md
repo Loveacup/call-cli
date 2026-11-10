@@ -100,6 +100,8 @@ hermes plugins doctor call-cli
 
 每个短批次把 stage 合并为最新一条，连续相同 stage 文本不再唤醒；有变化的阶段仍可主动唤醒纠偏。问题、失败、完成在下一次成功读取时及时以官方 `sendMessage` follow-up 投递，工具状态等无业务变化不唤醒；不是 steer。回答片段合并到结算通知，游标依据实际读到并获宿主队列接纳的批次推进，不依据 stdout 尾号；队列接纳不等于模型已经理解或用户已经看到。同 session 的首次并发 start 共用一次 bind，不串行所有任务；reply/intervene 等重新激活跟踪后，旧读取结果按请求 revision 丢弃并由新读取补齐，不得覆盖新轮状态。intervene 仍是 core 的 cancel+resume，不是 OMP steer。
 
+静默提醒沿用 stage 事件并带固定 `quiet_notice: true`；这类事件不参与普通 stage 合并或同文去重，避免后来阶段把提醒吞掉。runner 每段连续静默只产出一条，公开活动后可开启下一段，不增加轮询器或取消行为。新任务省略 timeout 默认不设执行总截止，显式旧值继续透传；同一公共 runner 的启动／控制边界适用于所有现有执行 CLI。
+
 session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递，不自动取消、关闭或改写业务状态。runner 复用现有 detached/DEVNULL 启动，one-shot bridge stdout 断开不影响 runner 输出或 Store 持久化。退出后任务可能自行完成，也可能保留 pending/unknown；不承诺离线回注、自动续轮或恢复，操作者需按精确任务对账。主动 cancel 是另一个明确动作，不能用宿主断连代替取消结算。
 
 本轮仅实跑 owned RPC 实例；补充的零模型生命周期检查由真实 extension 调用 close，等待 handler 完成回执并读回原生 status_snapshot/no-session，不把 prompt ACK 当关闭完成。自有合成会话未提交任何业务 prompt，不能替代真实模型执行、原会话消费或完整联合验收；旧两次 AGY 运行由外部 bridge 收尾的事实不变。普通 TUI 未验，ACP client 可 defer agent-initiated turns，不能将 RPC 成功外推为 ACP idle 唤醒或 Telegram 投递。源码使用需在获准的新宿主实例验证，不热附着现有用户会话，不切个人安装。

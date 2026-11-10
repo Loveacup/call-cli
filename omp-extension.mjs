@@ -51,9 +51,9 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
             if (binding.tasks.get(taskId) !== track || track.revision !== revision) continue;
             const events = packet.events.filter(event => event.seq > track.cursor);
             const answers = [...track.answers, ...events.filter(event => event.kind === 'answer')];
-            const stage = events.findLast(event => event.kind === 'stage');
+            const stage = events.findLast(event => event.kind === 'stage' && !event.quiet_notice);
             const meaningful = events.filter(event => visible.has(event.kind) && event.kind !== 'answer'
-              && (event.kind !== 'stage' || (event === stage && event.text !== track.lastStage)));
+              && (event.kind !== 'stage' || event.quiet_notice === true || (event === stage && event.text !== track.lastStage)));
             if (events.some(event => terminal.has(event.kind) || event.kind === 'waiting_reply')) {
               meaningful.push(...answers);
               meaningful.sort((a, b) => a.seq - b.seq);

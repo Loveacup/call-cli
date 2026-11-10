@@ -3,6 +3,68 @@ const assert = require('node:assert/strict');
 const { run } = require('./shared-prompt.cjs');
 const options = {cwd: '/test/work', sessionId: '11111111-1111-4111-8111-111111111111', sessionName: 'call-owned', requestId: 'owned:1', write: false, timeoutMs: 12000};
 
+test('omitted deadline allows a turn to remain active until explicit cancellation', async () => {
+  const input = {...options}; delete input.timeoutMs;
+  const frames = []; let resolveResult, started, cancel;
+  const accepted = new Promise(resolve => {started = resolve;});
+  const running = run(input, 'task', {
+    loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+    loadRuntime:async () => ({createSharedAcpRuntime: config => {
+      assert.equal(Object.hasOwn(config, 'timeoutMs'), false);
+      return {
+        startTurn(turnInput) {
+          assert.equal(Object.hasOwn(turnInput, 'timeoutMs'), false);
+          const result = new Promise(resolve => {resolveResult = resolve;});
+          cancel = () => resolveResult({status:'cancelled', stopReason:'cancelled'});
+          started();
+          return {events:(async function* () {await result;})(), result};
+        }, shutdown:async () => {}
+      };
+    }}), send:async frame => frames.push(frame)
+  });
+  const admitted = await Promise.race([accepted.then(() => true), running.then(() => false)]);
+  assert.equal(admitted, true);
+  cancel();
+  assert.equal(await running, 0);
+  assert.equal(frames.at(-1).status, 'cancelled');
+});
+
+test('prompt acceptance is published once only after the public signal resolves', async () => {
+  let accept, finish;
+  const frames = [];
+  const promptStarted = new Promise(resolve => {accept = resolve;});
+  const result = new Promise(resolve => {finish = resolve;});
+  const running = run(options, 'task', {
+    loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+    loadRuntime:async () => ({createSharedAcpRuntime:() => ({
+      startTurn:() => ({promptStarted, events:(async function* () {await result;})(), result}),
+      shutdown:async () => {}
+    })}), send:async frame => frames.push(frame)
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(frames, []);
+  accept();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(frames, [{type:'callcli.shared.event', requestId:options.requestId, event:{type:'prompt_started'}}]);
+  finish({status:'cancelled', stopReason:'cancelled'});
+  assert.equal(await running, 0);
+  assert.equal(frames.filter(frame => frame.event?.type === 'prompt_started').length, 1);
+});
+
+test('invalid explicit deadlines are refused before submitting any prompt', async () => {
+  for (const timeoutMs of [0, -1, NaN, Infinity, null, '1200']) {
+    let starts = 0;
+    const frames = [];
+    assert.equal(await run({...options, timeoutMs}, 'task', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime:() => {starts++; throw Error('unexpected');}}),
+      send:async frame => frames.push(frame)
+    }), 1);
+    assert.equal(starts, 0);
+    assert.equal(frames.at(-1).status, 'failed');
+  }
+});
+
 test('shared owner result, not colliding callback error, settles the request', async () => {
   const frames = [], calls = [];
   const runtime = {
@@ -217,6 +279,38 @@ test('only a failed turn AUTH_REQUIRED detail yields a safe task-bound diagnosti
     assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
       status:'failed', stopReason:null, ...(expected ? {errorCategory:expected} : {})}]);
     assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|UNAUTHENTICATED|retryable/);
+  }
+});
+
+test('only fixed failed-turn codes project deadline and disconnect diagnostics without replay', async () => {
+  for (const [result, diagnostic] of [
+    [{status:'failed', error:{code:'TIMEOUT', detailCode:'QUEUE_RUNTIME_PROMPT_FAILED'}}, {errorCategory:'timeout', errorSource:'turn_result_code'}],
+    [{status:'failed', error:{code:'RUNTIME', detailCode:'AGENT_DISCONNECTED'}}, {errorCategory:'connection_lost', errorSource:'turn_result_detail'}],
+    [{status:'failed', error:{code:'TIMEOUT', detailCode:'AUTH_REQUIRED'}}, {errorCategory:'auth_required'}],
+    [{status:'failed', error:{code:'RUNTIME', detailCode:'QUEUE_RUNTIME_PROMPT_FAILED'}}, {}],
+    [{status:'failed', error:{code:'NO_SESSION', detailCode:'TIMEOUT'}}, {}],
+    [{status:'failed', error:{code:'AGENT_DISCONNECTED', detailCode:'PRIVATE_DETAIL'}}, {}],
+    [{status:'failed', error:{code:'TIMEOUT_PRIVATE', detailCode:'AGENT_DISCONNECTED_PRIVATE'}}, {}],
+    [{status:'completed', stopReason:'end_turn'}, {}],
+    [{status:'cancelled', stopReason:'cancelled'}, {}],
+    [{status:'completed', stopReason:'end_turn', error:{code:'TIMEOUT'}}, {}],
+    [{status:'cancelled', stopReason:'cancelled', error:{detailCode:'AGENT_DISCONNECTED'}}, {}]
+  ]) {
+    const frames = []; let starts = 0;
+    if (result.error) Object.assign(result.error, {message:'PRIVATE_MESSAGE', retryable:true, acp:{secret:'PRIVATE_ACP'}});
+    const code = await run(options, 'PRIVATE_PROMPT', {
+      loadAuth:async () => ({authCredentials:{}, authPolicy:'skip'}),
+      loadRuntime:async () => ({createSharedAcpRuntime:() => ({
+        startTurn() {starts++; return {events:(async function* () {})(), result:Promise.resolve(result)};},
+        shutdown:async () => {}
+      })}), send:async frame => frames.push(frame)
+    });
+    const valid = !result.error && ['completed','cancelled'].includes(result.status);
+    assert.equal(code, valid ? 0 : 1);
+    assert.equal(starts, 1);
+    assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
+      status:valid ? result.status : 'failed', stopReason:valid ? result.stopReason : null, ...diagnostic}]);
+    assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|retryable|QUEUE_RUNTIME|AGENT_DISCONNECTED|TIMEOUT/);
   }
 });
 

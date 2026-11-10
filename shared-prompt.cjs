@@ -128,14 +128,15 @@ async function run(options, prompt, deps = {}) {
         || typeof options.write !== 'boolean' || !path.isAbsolute(options.cwd)
         || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(options.sessionId)
         || typeof options.sessionName !== 'string' || !options.sessionName
-        || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) throw Error('INVALID_INPUT');
+        || (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))) throw Error('INVALID_INPUT');
     const permissionMode = options.permissionMode ?? (options.write ? 'approve-all' : 'approve-reads');
     if (!['approve-all', 'approve-reads'].includes(permissionMode)) throw Error('INVALID_PERMISSION_MODE');
+    const timeout = options.timeoutMs === undefined ? {} : {timeoutMs:options.timeoutMs};
     const sdk = await (deps.loadRuntime ?? loadRuntime)(options.expectedVersion);
     const auth = await (deps.loadAuth ?? loadAuth)(options.cwd);
     runtime = sdk.createSharedAcpRuntime({cwd: options.cwd,
       permissionMode,
-      nonInteractivePermissions: 'deny', timeoutMs: options.timeoutMs,
+      nonInteractivePermissions: 'deny', ...timeout,
       authCredentials: auth.authCredentials, authPolicy: auth.authPolicy});
     // This serializable public handle is restored from the coordinator's native
     // session-created record, not from a model-supplied provider session ID.
@@ -144,12 +145,20 @@ async function run(options, prompt, deps = {}) {
     // Selection is applied and read back by the runner before this transport.
     // Shared control methods require an already running owner and cannot bootstrap it.
     const turn = runtime.startTurn({handle, text: prompt, mode: 'prompt', requestId,
-      timeoutMs: options.timeoutMs});
+      ...timeout});
+    let promptNotice, noticeFailed = false;
+    if (turn.promptStarted) {
+      promptNotice = turn.promptStarted.then(() =>
+        send({type:'callcli.shared.event', requestId, event:{type:'prompt_started'}}), () => {});
+      promptNotice.catch(() => {noticeFailed = true;});
+    }
     for await (const event of turn.events) {
       const projected = publicEvent(event);
       if (projected) await send({type: 'callcli.shared.event', requestId, event: projected});
     }
     const result = await turn.result;
+    await promptNotice;
+    if (noticeFailed) throw Error('OUTPUT_FAILED');
     const valid = result && !result.error &&
       ((result.status === 'completed' && result.stopReason === 'end_turn') ||
        (result.status === 'cancelled' && result.stopReason === 'cancelled'));
@@ -158,6 +167,11 @@ async function run(options, prompt, deps = {}) {
       if (result.error?.detailCode === 'AUTH_REQUIRED') diagnostic = {errorCategory:'auth_required'};
       else if (await watchedAuth(runtime, handle, requestId)) {
         diagnostic = {errorCategory:'auth_required', errorSource:'session_watch'};
+      }
+      else if (result.error?.code === 'TIMEOUT') {
+        diagnostic = {errorCategory:'timeout', errorSource:'turn_result_code'};
+      } else if (result.error?.detailCode === 'AGENT_DISCONNECTED') {
+        diagnostic = {errorCategory:'connection_lost', errorSource:'turn_result_detail'};
       }
     }
     await send({type: 'callcli.shared.result', requestId,

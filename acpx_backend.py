@@ -1,8 +1,10 @@
 """ACPX execution adapter shared by OMP, Codex, Pi and AGY."""
 import json
+import os
 from pathlib import Path
 import queue
 import re
+import selectors
 import subprocess
 import threading
 import time
@@ -16,6 +18,10 @@ try:
     from .skills import stage, guidance
 except ImportError:
     from skills import stage, guidance
+
+STARTUP_TIMEOUT = 120
+QUIET_NOTICE_SECONDS = 600
+TRANSPORT_CLEANUP_TIMEOUT = 2
 
 
 class AcpxBackend:
@@ -90,8 +96,9 @@ class AcpxBackend:
         request_id = task['id'] + ':' + str(task['turn'])
         options = dict(cwd=task['cwd'], sessionId=task['acpx_record_id'],
                        sessionName=task['session'], requestId=request_id, write=task['write'],
-                       timeoutMs=task.get('timeout', 900) * 1000,
                        expectedVersion=task['execution_version'])
+        if task.get('timeout') is not None:
+            options['timeoutMs'] = task['timeout'] * 1000
         options['permissionMode'] = self.permission_mode(task)
         for key in ('model', 'effort'):
             if task.get(key) is not None:
@@ -114,6 +121,15 @@ class AcpxBackend:
         task_id, turn = task["id"], task["turn"]
         proc = None
         execution_lock = None
+        threads = []
+        io_stop = threading.Event()
+        def stop_transport():
+            # This Popen child only: never a process group or the shared queue owner.
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:proc.wait(timeout=TRANSPORT_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill();proc.wait(timeout=TRANSPORT_CLEANUP_TIMEOUT)
         try:
             try:
                 from .updates import ensure_current, device_lock
@@ -166,44 +182,189 @@ class AcpxBackend:
             self.pre_prompt(store, task, emit)
             task = stage(store, task, emit)
             argv, payload, request_id = self.transport(task)
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc.stdin.write(payload);proc.stdin.close()
+            started_at = time.monotonic()
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             output = queue.Queue()
+            received_lock = threading.Lock()
+            received_acceptance = received_terminal = reader_ended = False
+            write_done = threading.Event()
+            write_failed = threading.Event()
+            reader_failed = threading.Event()
+            cleanup_expired = False
+            os.set_blocking(proc.stdout.fileno(), False)
+            os.set_blocking(proc.stdin.fileno(), False)
+            os.set_blocking(proc.stderr.fileno(), False)
+            pending_output = bytearray()
+            def receive():
+                nonlocal received_acceptance, received_terminal, reader_ended
+                # Called under received_lock, including the final pre-deadline check.
+                if reader_ended or received_terminal:return
+                for _ in range(16):
+                    try:chunk = os.read(proc.stdout.fileno(), 65536)
+                    except BlockingIOError:return
+                    if not chunk:
+                        reader_ended = True
+                    pending_output.extend(chunk)
+                    while True:
+                        end = pending_output.find(b'\n')
+                        if end < 0:
+                            if not reader_ended or not pending_output:break
+                            end = len(pending_output)-1
+                        line = bytes(pending_output[:end+1])
+                        del pending_output[:end+1]
+                        try:frame = json.loads(line.decode('utf-8','replace'))
+                        except (json.JSONDecodeError,UnicodeError):frame = None
+                        if isinstance(frame, dict) and frame.get('requestId') == request_id:
+                            received_acceptance |= (frame.get('type') == 'callcli.shared.event'
+                                                    and frame.get('event', {}).get('type') == 'prompt_started')
+                            received_terminal |= frame.get('type') == 'callcli.shared.result'
+                        output.put(line)
+                        if received_terminal:return
+                    if reader_ended:
+                        output.put(None)
+                        return
             def reader():
-                for line in proc.stdout:
-                    output.put(line)
-                output.put(None)
+                try:
+                    with selectors.DefaultSelector() as poller:
+                        poller.register(proc.stdout, selectors.EVENT_READ)
+                        while not io_stop.is_set():
+                            if not poller.select(.25):continue
+                            with received_lock:
+                                if reader_ended:return
+                                receive()
+                                if reader_ended or received_terminal:return
+                except (OSError, ValueError):
+                    reader_failed.set()
             def drain_errors():
-                # Do not persist arbitrary adapter stderr, which may include configuration or plugin data.
-                for _ in proc.stderr:
-                    pass
-            threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=drain_errors,daemon=True)]
+                # Discard private stderr without ever waiting for inherited pipe EOF.
+                with selectors.DefaultSelector() as poller:
+                    poller.register(proc.stderr, selectors.EVENT_READ)
+                    while not io_stop.is_set():
+                        if not poller.select(.1):continue
+                        try:chunk = os.read(proc.stderr.fileno(), 65536)
+                        except BlockingIOError:continue
+                        if not chunk:return
+            def write_payload():
+                try:
+                    with selectors.DefaultSelector() as poller:
+                        poller.register(proc.stdin, selectors.EVENT_WRITE)
+                        remaining = memoryview(payload)
+                        while remaining and not io_stop.is_set():
+                            if not poller.select(.1):continue
+                            try:sent = os.write(proc.stdin.fileno(), remaining[:65536])
+                            except BlockingIOError:continue
+                            remaining = remaining[sent:]
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    write_failed.set()
+                finally:
+                    write_done.set()
+            threads=[threading.Thread(target=reader,daemon=True,name='callcli-transport-reader'),
+                     threading.Thread(target=drain_errors,daemon=True,name='callcli-transport-stderr'),
+                     threading.Thread(target=write_payload,daemon=True,name='callcli-transport-stdin')]
             for t in threads:t.start()
             decoder = EventDecoder(shared_request_id=request_id)
             ended = False
             cancelling = False
             stop_started = 0.0
-            deadline = time.monotonic()+task.get('timeout',900)+90
+            deadline = started_at+task['timeout']+90 if task.get('timeout') is not None else None
+            startup_deadline = started_at+STARTUP_TIMEOUT if deadline is None else None
+            startup_expired = False
+            last_visible = started_at
+            quiet_notified = False
+            last_summary = 'No stage or tool status observed.'
+            def consume(line):
+                nonlocal ended, last_visible, quiet_notified, last_summary
+                if line is None:
+                    ended = True
+                    return
+                try:event=json.loads(line.decode('utf-8','replace'))
+                except (json.JSONDecodeError,UnicodeError):return
+                decoded = decoder.feed(event)
+                if decoder.shared_result_seen:ended = True
+                public = event.get('event', {})
+                activity = (event.get('type') == 'callcli.shared.event' and event.get('requestId') == request_id
+                            and not decoder.shared_result_seen and
+                            (public.get('type') == 'prompt_started' or
+                             (public.get('type') == 'text_delta' and public.get('stream') == 'output'
+                              and public.get('tag') == 'agent_message_chunk' and bool(public.get('text')))
+                             or (public.get('type') == 'tool_call' and bool(decoded))))
+                if activity:
+                    last_visible = time.monotonic()
+                    quiet_notified = False
+                for kind,text in decoded:
+                    if kind in {'stage', 'tool'}:last_summary = text[:500]
+                    emit(kind,text)
             while not ended:
+                # Process already delivered frames before considering a deadline.
+                for _ in range(64):
+                    try:consume(output.get_nowait())
+                    except queue.Empty:break
+                    if ended:break
+                if ended:break
                 current=store.get(task_id)
-                if (current['state']=='cancelling' or time.monotonic()>deadline) and not cancelling:
+                now = time.monotonic()
+                if not cancelling and startup_deadline is not None and now > startup_deadline:
+                    with received_lock:
+                        receive()
+                        startup_expired = (not received_acceptance and not received_terminal and not reader_ended
+                                           and current['state'] != 'cancelling')
+                if not received_terminal and (current['state']=='cancelling' or startup_expired or (deadline is not None and now>deadline)) and not cancelling:
                     cancelling=True;stop_started=time.monotonic()
                     result=self.control(task,'cancel',timeout=20)
                     if result.returncode:
                         raise RuntimeError('Cancel was not accepted; remote fate unknown')
+                    if not write_done.is_set():
+                        # Stop the local pipe reader before joining a blocked buffered writer.
+                        stop_transport()
+                        io_stop.set()
+                        with received_lock:
+                            if not reader_ended:receive()
+                        for _ in range(64):
+                            try:consume(output.get_nowait())
+                            except queue.Empty:break
+                        break
+                if write_failed.is_set():
+                    raise RuntimeError('Transport payload delivery failed; remote fate unknown')
+                if reader_failed.is_set():
+                    raise RuntimeError('Transport output observation failed; remote fate unknown')
                 if cancelling and time.monotonic()-stop_started>25:
                     raise RuntimeError('Cancel accepted but prompt has not settled')
-                try:line=output.get(timeout=.25)
+                if not cancelling and not quiet_notified and now-last_visible >= QUIET_NOTICE_SECONDS:
+                    emit('stage', 'No visible public events for '+str(QUIET_NOTICE_SECONDS)+'s; '
+                         'silence does not establish lack of progress or a hang. No cancellation requested. '
+                         'Last visible status: '+last_summary, quiet_notice=True)
+                    quiet_notified = True
+                try:consume(output.get(timeout=.25))
                 except queue.Empty:continue
-                if line is None:ended=True;continue
-                try:event=json.loads(line.decode('utf-8','replace'))
-                except (json.JSONDecodeError,UnicodeError):continue
-                for kind,text in decoder.feed(event):emit(kind,text)
+            if received_terminal and not decoder.shared_result_seen:
+                # Receipt is a finite input boundary; preserve every prior frame in order.
+                while not decoder.shared_result_seen:
+                    try:consume(output.get_nowait())
+                    except queue.Empty:break
             for kind,text in decoder.finish():emit(kind,text)
-            rc=proc.wait(timeout=10)
-            for t in threads:t.join(timeout=2)
+            if not cleanup_expired:
+                try:rc=proc.wait(timeout=TRANSPORT_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired:cleanup_expired = True
+            if cleanup_expired:
+                io_stop.set()
+                stop_transport()
+                rc = proc.returncode
             state='cancelled' if cancelling else ('waiting_reply' if store.get(task_id)['question_id'] else 'completed')
             note = self.outcome_note(decoder, rc, state) if not cancelling else None
+            if startup_expired and decoder.shared_result_seen and decoder.stop_reason != 'cancelled':
+                cancelling = False
+                state = 'waiting_reply' if store.get(task_id)['question_id'] else 'completed'
+                note = self.outcome_note(decoder, rc, state)
+            if startup_expired and not decoder.prompt_started and (not decoder.shared_result_seen or decoder.stop_reason == 'cancelled'):
+                state = 'unknown'
+                note = ('ACPX prompt acceptance not observed within '+str(STARTUP_TIMEOUT)+'s; '
+                        'startup cancellation requested, execution outcome unknown. Reconcile the exact '
+                        'session and artifacts before any authorized continuation; no automatic replay.')
+            if cleanup_expired:
+                state = 'unknown'
+                note = ((note+' ') if note else '')+('Local transport cleanup did not settle after the authoritative result; '
+                        'remote outcome must be reconciled; no automatic replay.')
             settled = rc == 0 and not decoder.failed and decoder.stop_reason in {'cancelled', 'end_turn'}
             if ((cancelling and not settled) or
                     (not cancelling and (not settled or decoder.stop_reason!='end_turn' or not decoder.text.strip()))):
@@ -219,15 +380,25 @@ class AcpxBackend:
                               'Preserve partial results; ask the operator to check authentication before '
                               'any explicitly authorized continuation; no automatic replay.')
                 note = (note+' ' if note else '')+diagnostic
+            elif decoder.error_category == 'timeout':
+                diagnostic = ('ACPX Shared Runtime turn.result.error.code=TIMEOUT: '
+                              'runtime-reported prompt deadline'+(' (configured timeout '+str(task['timeout'])+'s)' if task.get('timeout') is not None else '')+'. '
+                              'Work may be partially applied; reconcile artifacts and external writes before '
+                              'any authorized continuation; no automatic replay.')
+                note = (note+' ' if note else '')+diagnostic
+            elif decoder.error_category == 'connection_lost':
+                diagnostic = ('ACPX Shared Runtime turn.result.error.detailCode=AGENT_DISCONNECTED: '
+                              'runtime-reported agent connection loss; cause unknown. '
+                              'Work may be partially applied; reconcile before any authorized continuation; '
+                              'no automatic replay.')
+                note = (note+' ' if note else '')+diagnostic
             return TurnResult(state, rc, decoder.stop_reason, note)
         finally:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                try:proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill();proc.wait()
+            io_stop.set()
+            stop_transport()
+            for t in threads:t.join(timeout=TRANSPORT_CLEANUP_TIMEOUT)
             if proc is not None:
-                for stream in [proc.stdout,proc.stderr]:
+                for stream in [proc.stdin,proc.stdout,proc.stderr]:
                     if stream:stream.close()
             if execution_lock is not None:
                 execution_lock.__exit__(None,None,None)

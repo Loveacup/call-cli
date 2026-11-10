@@ -26,6 +26,7 @@ class EventDecoder:
         self.read_callbacks = set()
         self.shared_request_id = shared_request_id
         self.shared_result_seen = False
+        self.prompt_started = False
         self.error_category = None
         self.error_source = None
         self.tool_failed = False
@@ -45,14 +46,23 @@ class EventDecoder:
                 self.stop_reason = frame['stopReason']
             else:
                 self.failed = True
-                if frame.get('status') == 'failed' and frame.get('errorCategory') == 'auth_required':
-                    self.error_category = 'auth_required'
-                    self.error_source = 'session_watch' if frame.get('errorSource') == 'session_watch' else 'turn_result'
+                if frame.get('status') == 'failed':
+                    category = frame.get('errorCategory')
+                    source = frame.get('errorSource', 'turn_result' if category == 'auth_required' else None)
+                    allowed = {'auth_required': {'turn_result', 'session_watch'},
+                               'timeout': {'turn_result_code'},
+                               'connection_lost': {'turn_result_detail'}}
+                    if isinstance(category, str) and isinstance(source, str) and source in allowed.get(category, ()):
+                        self.error_category = category
+                        self.error_source = source
             return None
         if frame.get('type') != 'callcli.shared.event':
             self.failed = True
             return None
         event = frame.get('event', {})
+        if event.get('type') == 'prompt_started':
+            self.prompt_started = True
+            return None
         if (event.get('type') == 'text_delta' and event.get('stream') == 'output'
                 and event.get('tag') == 'agent_message_chunk' and isinstance(event.get('text'), str)):
             update = {'sessionUpdate': 'agent_message_chunk',

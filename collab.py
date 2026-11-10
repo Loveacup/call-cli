@@ -71,14 +71,15 @@ class Collaboration:
         return client
 
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
-              remote_shell='posix', write=False, resource='', timeout=900, model=None, effort=None,
+              remote_shell='posix', write=False, resource='', timeout=None, model=None, effort=None,
               agy_approval=None, skills=None):
         from transport import device_identity
         origin = self.origin(client)
         if remote_shell not in {'posix', 'powershell'}:
             raise ValueError('Invalid agent or remote shell')
-        if not prompt.strip() or not cwd or not 0 < timeout <= 86400:
-            raise ValueError('Nonempty prompt/cwd and timeout in (0,86400] required')
+        if (not prompt.strip() or not cwd or (timeout is not None and
+                (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400))):
+            raise ValueError('Nonempty prompt/cwd and optional timeout in (0,86400] required')
         fields = prepare_start(agent, model, effort, agy_approval)
         from pathlib import PurePosixPath, PureWindowsPath
         path_type=Path if device=='local' else (PureWindowsPath if remote_shell=='powershell' else PurePosixPath)
@@ -234,7 +235,8 @@ def main(argv=None):
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
     start.add_argument('--write', action='store_true')
     start.add_argument('--resource', default='')
-    start.add_argument('--timeout', type=float, default=900)
+    start.add_argument('--timeout', type=lambda value: None if value == 'none' else float(value),
+                       help='Optional execution limit in seconds; omitted or none means no execution deadline')
     start.add_argument('--prompt', required=True)
     start.add_argument('--skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot a coordinator-side skill directory')
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')

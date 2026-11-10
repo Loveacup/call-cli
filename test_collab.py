@@ -19,6 +19,21 @@ class CollaborationTests(unittest.TestCase):
                 returncode=0, stdout=b'{"action":"status_snapshot","status":"no-session","summary":"no active session"}'),
             lock=lambda task, **kw: nullcontext(True))
 
+    def test_new_tasks_without_budget_remain_cancellable_and_legacy_budgets_survive(self):
+        client = self.c.connect('omp')['client_id']
+        unbounded = self.c.start(client, prompt='inspect', cwd='/project')
+        self.assertIsNone(unbounded.get('timeout'))
+        self.c.store.update(unbounded['id'], state='running')
+        self.assertEqual(self.c.cancel(client, unbounded['id'])['state'], 'cancelling')
+        bounded = self.c.start(client, prompt='inspect', cwd='/project', timeout=30)
+        self.c.store.event(bounded['id'], 'q', 'question', 'Continue?')
+        self.c.store.update(bounded['id'], state='completed')
+        resumed = self.c.reply(client, bounded['id'], 'q', 'continue')
+        self.assertEqual(resumed['timeout'], 30)
+        for invalid in (0, -1, float('nan'), float('inf'), True, 'none'):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.c.start(client, prompt='inspect', cwd='/project', timeout=invalid)
+
     def test_start_status_events_and_owner_isolation(self):
         a = self.c.connect('omp')['client_id']
         b = self.c.connect('pi')['client_id']

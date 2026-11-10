@@ -26,6 +26,22 @@ class Ctx:
         return json.dumps({'session_id':f'proc-owned-{len(self.calls)}','pid':123,'notify_on_complete':True})
 
 
+
+class HostTimeoutTests(unittest.TestCase):
+    def test_optional_deadline_preserves_cancellation_and_explicit_launch_bound(self):
+        mod = load_plugin()
+        with tempfile.TemporaryDirectory() as d:
+            env = {'HERMES_SESSION_ID':'s1', 'HERMES_SESSION_KEY':'key'}
+            ctx = Ctx(); c = mod.Coordinator(ctx, Path(d), lambda k,x='':env.get(k,x))
+            task = c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect'})['task']
+            self.assertIsNone(task.get('timeout'))
+            self.assertNotIn('timeout', ctx.called[1])
+            self.assertEqual(c.handle({'action':'cancel','task_id':task['id']})['task']['state'], 'cancelled')
+            bounded = c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect','timeout':30})['task']
+            self.assertEqual(bounded['timeout'], 30)
+            self.assertEqual(ctx.called[1]['timeout'], 210)
+            self.assertNotIn('default', mod.SCHEMA['parameters']['properties']['timeout'])
+
 class PluginTests(unittest.TestCase):
     def test_launch_reuses_native_notification_route_without_model_supplied_origin(self):
         mod=load_plugin()
