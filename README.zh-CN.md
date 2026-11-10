@@ -240,7 +240,7 @@ Call CLI 严格区分**源码已实现、离线/合成测试已通过、本机�
 
 | 验证层级 | 已核验范围 | 明确边界／未宣称范围 |
 | :-- | :-- | :-- |
-| **源码与离线测试套件** | deadline 返工后的发布候选：Python `114` 项（`109` 通过、`5` 个 opt-in 跳过），四个 Node 套件共 `51` 项通过，详见 `VERIFICATION.md`。 | 假传输与合成端点不证明真实模型行为或宿主通知路由。 |
+| **源码与离线测试套件** | 实验性 OMP 适配发布验证：Python `136` 项（`129` 通过、`7` 个 opt-in 跳过），五个 Node 测试文件共 `61` 项通过，详见 `VERIFICATION.md`。 | 假传输与合成端点不证明真实模型行为或宿主通知路由。 |
 | **原生 ACPX 传输集成（`RUN_NATIVE_ACPX_TESTS=1`）** | deadline 返工后，`test_native_shared` 与 `test_native_skills` 的全部三个 opt-in 方法在安装的 ACPX 0.22.0 上通过。 | 真实 ACPX 传输配合合成端点，不是真实 LLM 模型；默认套件跳过原生/模型探针。 |
 | **本机与跨设备 SSH 真实模型协作** | 已在 macOS（**ACPX 0.22.0**、**AGY 1.5.3** 的 `gemini-4-argon` / `medium`、`claude-opus-5-5` / `medium`、`gemini-3.8-flash` / `low` 及本机 **OMP**）实测：模型/effort 读回、AGY + OMP 并发执行、运行中 `intervene` 取消续轮、本地/公开 PDF 技能传递；跨设备 Windows SSH **OMP**（`ACPX 0.21.1`）与 **Pi**/**Codex** 对应测试场景已验。 | 每次实测仅证明所跑通的具体 CLI、模型、入口与设备组合；不外推所有未测 CLI/设备组合、任意后台子进程强杀或桌面 GUI 自动化。 |
 | **宿主原会话消费与 Telegram 投递** | 可选 Hermes 插件（`__init__.py`）已在源码与单测中实现来源捕获、后台 runner 启动、技能 schema 与 `intervene` 状态推进。 | **未宣称全链已验收：** 加载新工具 schema 需按宿主支持方式刷新工具表或新开 Hermes 会话（原会话快照可能仍旧，不宣称当前对话内已成功重载）；宿主当前会话实时消费、Telegram 空通知问题（**Issue #1**）、上游 AGY 错误输出（**Issue #2**）以及离开协作后的离线自动唤醒仍保持开放或属独立范围。 |
@@ -248,7 +248,7 @@ Call CLI 严格区分**源码已实现、离线/合成测试已通过、本机�
 ```sh
 # 运行标准离线验证套件（无需模型凭据或联网）
 python3 -B -m unittest discover -v
-node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs
+node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs test_omp_extension.mjs
 
 # 可选：真实本机 ACPX queue-owner + 合成 ACP 端点集成测试（无真实大模型调用）
 RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_shared -v

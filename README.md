@@ -241,7 +241,7 @@ Call CLI separates **source implementation, offline/synthetic tests, locally ins
 
 | Layer | Verified scope | Explicit boundary / not claimed |
 | :-- | :-- | :-- |
-| **Source & offline test suites** | Release candidate after the deadline repair: Python `114` cases (`109` passed, `5` opt-in skipped), Node `51` passed across all four suites; see `VERIFICATION.md`. | Fake transports and synthetic endpoints do not prove live model behavior or host notification routing. |
+| **Source & offline test suites** | Experimental OMP adapter release verification: Python `136` cases (`129` passed, `7` opt-in skipped), Node `61` passed across five test files; see `VERIFICATION.md`. | Fake transports and synthetic endpoints do not prove live model behavior or host notification routing. |
 | **Native ACPX transport (`RUN_NATIVE_ACPX_TESTS=1`)** | All three opt-in methods in `test_native_shared` and `test_native_skills` passed on installed ACPX 0.22.0 after the deadline repair. | Real ACPX transport with synthetic endpoints, not live LLM providers; the default suite skips native/model probes. |
 | **Live local & SSH collaborations** | Exercised on macOS with **ACPX 0.22.0** and **AGY 1.5.3** (`gemini-4-argon` / `medium`, `claude-opus-5-5` / `medium`, `gemini-3.8-flash` / `low`) plus local **OMP**: model/effort readback, concurrent AGY + OMP execution, mid-turn `intervene` cancel+resume, and `origin`/public PDF skill passing. Cross-device Windows SSH **OMP** (`ACPX 0.21.1`) and **Pi**/**Codex** paths verified for their tested scenarios. | Each probe certifies only the exact CLI, model, entry point and device exercised—not every untested CLI/device permutation, arbitrary child-process kill, or GUI automation. |
 | **Host session & Telegram delivery** | Optional Hermes plugin (`__init__.py`) implements origin capture, background runner launch, skill schema and `intervene` state transitions in source and unit tests. | **Not claimed as end-to-end verified:** loading updated tool schemas requires a host-supported tool-table refresh or a new Hermes session (an existing session snapshot may remain stale, and in-session reload is not claimed verified here); live in-chat notification consumption, Telegram empty-notification delivery (**Issue #1**), upstream AGY error reporting (**Issue #2**), and idle wakeup after leaving a collaboration remain open / separate scope. |
@@ -249,7 +249,7 @@ Call CLI separates **source implementation, offline/synthetic tests, locally ins
 ```sh
 # Run the standard offline verification suites (no model credentials or network required)
 python3 -B -m unittest discover -v
-node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs
+node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs test_omp_extension.mjs
 
 # Optional: real local ACPX queue-owner + synthetic ACP endpoint (no live LLM calls)
 RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_shared -v
