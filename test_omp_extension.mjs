@@ -171,3 +171,55 @@ test('stage bursts coalesce while repeated stage text stays quiet',async()=>{
   await f.timers.shift()();
   assert.match(f.sent.at(-1).message.content,/Q1 proceed/);
 });
+
+test('pending intervention polls past cancelled source into target completion without status',async()=>{
+  const packets=[
+    {task:{id:'task-a',state:'cancelled',intervention:{status:'pending'}},events:[{seq:1,kind:'cancelled',text:'source cancelled'}]},
+    {task:{id:'task-a',state:'queued',intervention:{status:'target_started'}},events:[]},
+    {task:{id:'task-a',state:'completed',intervention:{status:'target_completed'}},events:[{seq:2,kind:'answer',text:'REVISED RESULT'},{seq:3,kind:'completed',text:'target done'}]},
+  ];
+  const f=fixture(async r=>{
+    if(r.action==='bind')return {capability:'private'};
+    if(r.args.action==='start')return {task:{id:'task-a',state:'running'}};
+    if(r.args.action==='intervene')return {task:{id:'task-a',state:'cancelling',intervention:{status:'pending'}}};
+    assert.equal(r.args.action,'wait','continuation must not rely on driver status');
+    assert.ok(packets.length,'no wait after completion');
+    return packets.shift();
+  });
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
+  const accepted=await f.adapter.execute({action:'intervene',task_id:'task-a',command_id:'narrow-1',prompt:'README only'},f.ctx);
+  assert.equal(accepted.task.state,'cancelling');
+  await f.timers.shift()();
+  assert.equal(f.timers.length,1,'pending intervention must keep polling after source cancellation');
+  await f.timers.shift()();
+  assert.equal(f.timers.length,1,'queued target must remain tracked');
+  await f.timers.shift()();
+  assert.equal(f.timers.length,0,'completed target must stop polling');
+  assert.deepEqual(f.calls.filter(c=>c.args).map(c=>c.args.action),['start','intervene','wait','wait','wait']);
+  assert.deepEqual(f.calls.filter(c=>c.args?.action==='wait').map(c=>c.args.after),[0,1,1]);
+  assert.deepEqual(f.sent.map(s=>JSON.parse(s.message.content).events.map(e=>e.kind)),[['cancelled'],['answer','completed']]);
+  assert.match(f.sent.at(-1).message.content,/REVISED RESULT/);
+});
+
+for(const state of ['completed','cancelled','closed','unknown'])test(`${state} without an authorized continuation stops polling`,async()=>{
+  const f=fixture();
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
+  f.setPacket({task:{id:'task-a',state,...(state==='unknown'?{intervention:{status:'pending'}}:{})},events:[{seq:1,kind:state,text:state}]});
+  await f.timers.shift()();
+  assert.equal(f.timers.length,0,'terminal state must not automatically retry');
+  assert.equal(f.calls.filter(c=>c.args?.action==='wait').length,1);
+});
+
+for(const stop of ['close','detach'])test(`${stop} clears a pending intervention timer`,async()=>{
+  const f=fixture();
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
+  f.setPacket({task:{id:'task-a',state:'cancelled',intervention:{status:'pending'}},events:[{seq:1,kind:'cancelled',text:'source cancelled'}]});
+  await f.timers.shift()();
+  assert.equal(f.timers.length,1,'authorized continuation must be scheduled before stopping');
+  if(stop==='close'){
+    f.setPacket({task:{id:'task-a',state:'closed'},events:[]});
+    await f.adapter.execute({action:'close',task_id:'task-a'},f.ctx);
+  }else f.adapter.detach();
+  assert.equal(f.timers.length,0,'stop must leave no timer');
+  assert.equal(f.calls.filter(c=>c.args?.action==='wait').length,1,'stop must not advance the target');
+});

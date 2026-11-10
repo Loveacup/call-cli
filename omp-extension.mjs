@@ -67,7 +67,9 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
             track.answers = events.some(event => terminal.has(event.kind) || event.kind === 'waiting_reply') ? [] : answers;
             // Advance only the batch admitted by this live host, never a stdout tail.
             if (events.length) track.cursor = events.at(-1).seq;
-            if (packet.task && (terminal.has(packet.task.state) || packet.task.state === 'waiting_reply')) track.active = false;
+            // Source cancellation can settle after advance; the next wait starts the authorized target.
+            if (packet.task && (terminal.has(packet.task.state) || packet.task.state === 'waiting_reply')
+              && !(packet.task.state === 'cancelled' && packet.task.intervention?.status === 'pending')) track.active = false;
           } catch (error) {
             if (!live(binding, ctx)) return;
             if (binding.tasks.get(taskId) !== track || track.revision !== revision) continue;
@@ -111,7 +113,13 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       if (!live(binding, ctx)) throw new Error('Host session changed; action outcome must be reconciled, not replayed');
       if (result.task) {
         const id = result.task.id;
-        if (args.action === 'close') binding.tasks.delete(id);
+        if (args.action === 'close') {
+          binding.tasks.delete(id);
+          if (binding.timer && ![...binding.tasks.values()].some(track => track.active)) {
+            binding.ctx.clearTimer(binding.timer);
+            binding.timer = undefined;
+          }
+        }
         else if (['start', 'reply', 'intervene', 'cancel', 'status'].includes(args.action)) {
           const track = binding.tasks.get(id) || {cursor: 0, active: false, answers: [], revision: 0};
           track.revision++;
