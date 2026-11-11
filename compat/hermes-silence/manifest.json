@@ -1,0 +1,56 @@
+{
+  "files": {
+    "gateway/platforms/event.py": {
+      "after": "0e5e7d8bb71b9d6481a7b9394192cc3447753a34b1c7546eb52479262caa7d7f",
+      "before": "3030bcc12551de4fa1ac1a8ebb5e82426556a8ea2171341e29cab51305cf24c4"
+    },
+    "gateway/response_filters.py": {
+      "after": "4f107911f014916614245c619896a3c9a937011a6edfb56db0ee5f23a1ca14a1",
+      "before": "9175b0d688617862d3b628fe74d47f6a0bfaf80800e6639bad2735bdc45edf90"
+    },
+    "gateway/run_busy.py": {
+      "after": "82092bb87f14dfe78aa14417789c2172edb9416a55e3266b325533ea873ac626",
+      "before": "becd774be4e06133ef773a32cd60f5503db05cd7259b69002427d5c781f6d709"
+    },
+    "gateway/run_config_loaders.py": {
+      "after": "cb98f7d11442a376068869a2a149cef9f67e4e85ddd4ba776d9d75b4861c16c4",
+      "before": "0339d56b6565ab0faa61b26e150145f02cf6dc006d9f9505f52e63598f90a58c"
+    },
+    "gateway/run_turn.py": {
+      "after": "3964019452652cdda2ca7f9d65c794f17c0b182654d8e6c3d2491edda0e07321",
+      "before": "851dea07d3177ca1a274a5b94e6d490a3b22aee46f5fb57d27fb8a363a03879a"
+    },
+    "gateway/run_turn_persistence.py": {
+      "after": "2ad9400407fba52c2b792c8a65056f353c9994bfc6923ef6dbf4d847959bd41e",
+      "before": "93500872620e0dbc3eeed5f58206907cf689c7bf5315c940e3c2b120f828d6b6"
+    },
+    "gateway/run_turn_runner.py": {
+      "after": "6211201d655c02fb4d44915d6cfbbce4de47be565ae2de06d06e18462dd0f229",
+      "before": "c20474c99ae171882f5524646b60cf5d877e596b6f753051134ce1b8840edbb6"
+    },
+    "gateway/stream_consumer.py": {
+      "after": "dae0d11016ecf1a0aa74a0f49ab23a44899031f232bd02238607f32c3e72b01b",
+      "before": "06cbf630b755a1e136bcf5bc599506a4e33c677d994e8799fca94e79e5d143f4"
+    },
+    "gateway/turn_context.py": {
+      "after": "b49ec0b6d2eab5e201e893cddea79d330e273324d95f5110fea025fb4d3ed2ff",
+      "before": "aa7aa6c1dbb23b1c5eb49adcb6d9efd7bc6de1bf05a9ee78bdde8d16c3ebb60d"
+    },
+    "gateway/warning_notifications.py": {
+      "after": "dbe85eff8926ef50d010b25c85eb697724b2da2bba83032f82fe960ef5912b87",
+      "before": "8e835a2f316c85be623aca2b2b80ca1b2255ded9017869b3e259723275e1ee2c"
+    },
+    "tests/gateway/test_mixed_turn_silence.py": {
+      "after": "9e1d1a81b26aac4ad7737a7027850c00a7448e9dfc850a5983e6d7ec4741d0ab",
+      "before": null
+    },
+    "tests/gateway/test_stream_consumer.py": {
+      "after": "1a841280a59a765987c564559013c01d0685bb53d436f9501700ddb8a783e68a",
+      "before": "c2ebe5343e2ebbf83836e92d81461af433729834e6fdc8c4dcada0b1e0c3b66d"
+    }
+  },
+  "head": "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
+  "patch": "hermes-2bd378ed-silence.patch",
+  "patch_sha256": "b2d7b8a20da92d840ab7dd70de48e235417521ea4890e8737a7befb1c7840746",
+  "upstream": "https://github.com/NousResearch/hermes-agent"
+}

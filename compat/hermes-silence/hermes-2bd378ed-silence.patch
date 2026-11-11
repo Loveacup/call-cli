@@ -1,0 +1,485 @@
+--- a/gateway/platforms/event.py
++++ b/gateway/platforms/event.py
+@@ -146,6 +146,8 @@
+     _admitted_before_drain: bool = field(default=False, init=False, repr=False, compare=False)
+     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
+     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
++    # Successful busy folds may add a human obligation to a machinery/bot opener.
++    _human_reply_expected: bool = field(default=False, init=False, repr=False, compare=False)
+ 
+     def absorb_reply_expected(self, other: "MessageEvent") -> None:
+         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+--- a/gateway/response_filters.py
++++ b/gateway/response_filters.py
+@@ -178,6 +178,8 @@
+     by the gateway poller, never inferred from inbound text), but it deliberately stays
+     non-internal so authorization and the emergency stop still apply to it.
+     """
++    if getattr(event, "_human_reply_expected", False):
++        return None
+     from gateway.session_display import admission_display
+     if kind := admission_display(event).get("kind"):
+         # A canonical admission committed hidden (Desktop widget intent): never a user bubble.
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -812,8 +812,21 @@
+             return None
+         if turn.event is not None and turn.event is not event:
+             turn.event.absorb_reply_expected(event)
++            from gateway.response_filters import display_kind_for_event, is_machinery_display_kind
++            human_reply = (event.reply_expected is not False and not getattr(event.source, "is_bot", False)
++                           and not is_machinery_display_kind(display_kind_for_event(event)))
++            if human_reply:
++                if turn.ctx is None or not getattr(turn.ctx, "_interrupt_depth", 0):
++                    turn.event._human_reply_expected = True
++                    turn.event.reply_expected = True
++                running_agent._silence_marker_needs_reply = True
+             if turn.ctx is not None:
+-                turn.ctx.reply_expected = turn.event.reply_expected
++                if turn.ctx.reply_expected is not True and event.reply_expected is not False:
++                    turn.ctx.reply_expected = event.reply_expected
++                if human_reply:
++                    turn.ctx.human_reply_expected = True
++                    turn.ctx.reply_expected = True
++                    turn.ctx.mute_notification_reply = False
+         return turn
+ 
+     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
+--- a/gateway/run_config_loaders.py
++++ b/gateway/run_config_loaders.py
+@@ -111,6 +111,8 @@
+     def _silence_allowed_for_source(self, source, display_kind, reply_expected, agent_result) -> bool:
+         """Evaluate existing exemptions before consulting the optional room permission."""
+         from gateway.response_filters import silence_allowed
++        if agent_result.get("_human_reply_expected"):
++            display_kind, reply_expected = None, True
+         return silence_allowed(display_kind, reply_expected) or silence_allowed(
+             display_kind, reply_expected, allow_silence=self._room_allow_silence(source),
+             agent_result=agent_result)
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -273,6 +273,10 @@
+             # message's id or it collides with an earlier turn's row carrying the same text. Reply
+             # routing is untouched: the anchor still comes from this event.
+             if isinstance(agent_result, dict):
++                if "queued_terminal_inbound_id" not in agent_result and event._human_reply_expected:
++                    agent_result["_human_reply_expected"] = True
++                if "queued_terminal_inbound_id" in agent_result:
++                    event._human_reply_expected = bool(agent_result.get("_human_reply_expected"))
+                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
+                 if _terminal_inbound:
+                     event.ledger_message_id = str(_terminal_inbound)
+@@ -1613,6 +1617,8 @@
+                 logger.debug("Stream consumer wait before queued message failed: %s", e)
+         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
+         _delivery_result = response if isinstance(response, dict) else (result or {})
++        if getattr(turn_ctx, "human_reply_expected", False):
++            _delivery_result = {**_delivery_result, "_human_reply_expected": True}
+         first_response = _delivery_result.get("final_response", "")
+         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
+             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
+@@ -2217,10 +2223,14 @@
+             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+             if isinstance(response, dict):
+                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
++                response["_human_reply_expected"] = getattr(turn_ctx, "human_reply_expected", False)
+             self._run_agent_evict_on_fallback(turn_ctx)
+ 
+             # Interrupted OR queued message (/queue)?
+             result = turn_ctx.result_holder[0]
++            if isinstance(result, dict):
++                result["_human_reply_expected"] = getattr(turn_ctx, "human_reply_expected", False)
++                result["_notification_reply_muted"] = turn_ctx.mute_notification_reply
+             adapter = self._delivery_adapter_for(source)
+             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
+             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+--- a/gateway/run_turn_persistence.py
++++ b/gateway/run_turn_persistence.py
+@@ -75,6 +75,8 @@
+         from gateway.response_filters import is_intentional_silence_response, silence_allowed
+         kind = agent_result.get("queued_terminal_display_kind", display_kind)
+         expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
++        if agent_result.get("_human_reply_expected"):
++            kind, expected = None, True
+         if (not silent or not session_key or silence_allowed(kind, expected)
+                 or not is_intentional_silence_response(agent_result.get("final_response"))):
+             return
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -321,6 +321,14 @@
+ 
+         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+             if not ctx._run_still_current():
++                return
++            from gateway.response_filters import is_intentional_silence_response
++            # A completed control marker is not commentary; final shaping still enforces replies.
++            if is_intentional_silence_response(text):
++                if stts is not None:
++                    stts.on_delta(None)
++                if already_streamed and stream_consumer is not None:
++                    stream_consumer.on_segment_break()
+                 return
+             unseen = False
+             if local_viewer_route and not already_streamed and str(text or "").strip():
+@@ -1028,8 +1036,8 @@
+                 from gateway.response_filters import silence_allowed
+                 # Where a bare marker would become the "needed a reply" warning, the agent ends a
+                 # marker that follows a written reply on that reply, before transform/persistence.
+-                agent._silence_marker_needs_reply = not silence_allowed(
+-                    ctx.persist_user_display_kind, ctx.reply_expected)
++                agent._silence_marker_needs_reply = (getattr(ctx, "human_reply_expected", False)
++                    or not silence_allowed(ctx.persist_user_display_kind, ctx.reply_expected))
+                 try:
+                     result = agent.run_conversation(api_message, **kwargs)
+                 finally:
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -411,7 +411,7 @@
+ 
+     def on_commentary(self, text: str) -> None:
+         """Queue a completed interim assistant commentary message."""
+-        if text:
++        if text and not _is_intentional_silence_response(text):
+             self._queue.put((_COMMENTARY, text))
+ 
+     def flush_pending_sync(self, timeout: float = 5.0) -> bool:
+@@ -571,6 +571,14 @@
+                     continue
+                 if tick.got_reopen_seed:
+                     await self._eager_reopen_seed()
++                    continue
++
++                if tick.got_segment_break and _is_intentional_silence_response(
++                    self._clean_for_display(self._accumulated)
++                ):
++                    # The completed item was a control marker, not the next item's prefix.
++                    self._accumulated = self._stream_ledger = ""
++                    self._signal_flush(tick.flush_event)
+                     continue
+ 
+                 if tick.got_done:
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -66,6 +66,7 @@
+     # "internal_notification" for async-delegation/background notifications (#82888).
+     persist_user_display_kind: Optional[str] = None
+     persist_user_display_metadata: Optional[dict] = None
++    human_reply_expected: bool = False  # a human steer/redirect joined this running turn
+     user_config: Any = None
+     mute_notification_reply: bool = False
+     voice_turn: bool = False  # a voice-note turn: runs on auxiliary.voice_chat
+--- a/gateway/warning_notifications.py
++++ b/gateway/warning_notifications.py
+@@ -55,6 +55,8 @@
+ 
+ def diagnostic_wake_muted(event, user_config=None) -> bool:
+     """Only trusted diagnostic-only wakes can mute a turn, never human content."""
++    if getattr(event, "_human_reply_expected", False):
++        return False
+     snapshot = getattr(event, "_notification_reply_muted", None)
+     if isinstance(snapshot, bool):
+         return snapshot
+--- /dev/null
++++ b/tests/gateway/test_mixed_turn_silence.py
+@@ -0,0 +1,270 @@
++"""A successful busy steer must not hide a human request behind a machine opener."""
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++import gateway.run as gateway_run
++from agent.prompt_builder import steer_user_row
++from gateway.config import GatewayConfig, Platform
++from gateway.platforms.event import MessageEvent
++from gateway.response_filters import display_kind_for_event
++from gateway.run_turn import _unexpected_silence_reply
++from gateway.session import SessionSource
++
++
++class _Agent:
++    def __init__(self):
++        self.steers = []
++
++    def steer(self, text):
++        self.steers.append(text)
++        return True
++
++    def get_activity_summary(self):
++        return {}
++
++
++@pytest.fixture
++def running_turn(monkeypatch, tmp_path):
++    monkeypatch.setattr(gateway_run, '_load_gateway_config', lambda: {})
++    monkeypatch.setattr(gateway_run, '_hermes_home', tmp_path)
++    monkeypatch.setattr(gateway_run.GatewayRunner, '_init_session_store',
++                        lambda self: setattr(self, 'session_store', MagicMock()))
++    runner = gateway_run.GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    runner._room_allow_silence = lambda source: False
++    runner._is_user_authorized_for_source = lambda source: True
++    runner._admit_bot_message_for_source = lambda source: True
++    runner._admit_bot_chain = lambda event: True
++    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
++    runner._busy_skill_turn = AsyncMock(return_value=(False, None))
++    runner._agent_has_active_subagents = lambda agent: False
++    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
++    runner._send_busy_ack_reply = AsyncMock()
++    runner._busy_steer_ack_enabled = lambda *args: False
++    runner._pending_event_audio_paths = lambda event: []
++    runner._record_room_silence_decision = AsyncMock()
++    runner._effective_busy_input_mode = lambda source: 'steer'
++    runner._effective_busy_text_mode = lambda source: 'interrupt'
++    adapter = SimpleNamespace(_pending_messages={}, _active_sessions={})
++    runner._delivery_adapter_for = lambda source: adapter
++    runner._intake_adapter_for = lambda source: None
++    source = SessionSource(platform=Platform.TELEGRAM, chat_id='synthetic-room',
++                           chat_type='group', user_id='synthetic-human')
++    agent = _Agent()
++    turn = runner._session_state('synthetic-session').turn
++    turn.agent = agent
++    turn.event = MessageEvent(text='Background notice', source=source, internal=True,
++                              reply_expected=False, message_id='machine')
++    turn.ctx = SimpleNamespace(source=source, session_key='synthetic-session', run_generation=1,
++                               persist_user_display_kind=display_kind_for_event(turn.event),
++                               reply_expected=False, stream_consumer_holder=[None],
++                               mute_notification_reply=False, _status_thread_metadata=None,
++                               event_message_id='machine', inbound_message_id='machine')
++    return runner, source, agent, turn
++
++
++async def _shape(runner, source, event, result):
++    response, silent, _ = await runner._hmwa_shape_agent_response(
++        result, source, [], SimpleNamespace(session_id='synthetic'), None, None, 1,
++        'synthetic', 'telegram', 0, persist_user_display_kind=display_kind_for_event(event),
++        reply_expected=event.reply_expected)
++    return '' if silent else response
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('expected', [True, None], ids=['addressed', 'unknown'])
++@pytest.mark.parametrize('muted', [False, True], ids=['normal', 'muted-diagnostic'])
++async def test_human_oob_in_machine_turn_gets_visible_warning(running_turn, expected, muted):
++    runner, source, agent, turn = running_turn
++    turn.ctx.mute_notification_reply = muted
++    turn.event._notification_reply_muted = muted
++    turn.event.metadata['notification_category'] = 'diagnostic' if muted else 'result'
++    human = MessageEvent(text='Please answer this request', source=source,
++                         reply_expected=expected, message_id='human')
++    assert await asyncio.wait_for(runner._handle_active_session_busy_message(human, 'synthetic-session'), 10)
++    row = steer_user_row(agent.steers[0])
++    assert row['role'] == 'user' and 'OUT-OF-BAND USER MESSAGE' in row['content']
++    result = {'final_response': '[SILENT]', 'failed': False, 'messages': []}
++    assert await _shape(runner, source, turn.event, result) == _unexpected_silence_reply()
++    runner._deliver_queued_first_response = AsyncMock(return_value=True)
++    await runner._run_agent_deliver_first_response(turn.ctx, None, result, result, None)
++    assert runner._deliver_queued_first_response.await_args.args[0] == _unexpected_silence_reply()
++    from gateway.warning_notifications import diagnostic_wake_muted
++    assert not diagnostic_wake_muted(turn.event)
++
++
++@pytest.mark.asyncio
++async def test_normal_answer_after_human_steer_is_delivered(running_turn):
++    runner, source, agent, turn = running_turn
++    human = MessageEvent(text='Please answer', source=source, reply_expected=True)
++    await runner._handle_active_session_busy_message(human, 'synthetic-session')
++    assert await _shape(runner, source, turn.event,
++                        {'final_response': 'Here is the answer.', 'messages': []}) == 'Here is the answer.'
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('kind', ['machine', 'unaddressed', 'bot'])
++async def test_followups_without_human_reply_obligation_keep_silence(running_turn, kind):
++    runner, source, agent, turn = running_turn
++    source.is_bot = kind == 'bot'
++    incoming = MessageEvent(text='Synthetic follow-up', source=source, internal=kind == 'machine',
++                            reply_expected=False if kind == 'unaddressed' else True)
++    await runner._handle_active_session_busy_message(incoming, 'synthetic-session')
++    assert await _shape(runner, source, turn.event,
++                        {'final_response': '[SILENT]', 'messages': []}) == ''
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('changes,silent', [({}, True), ({'partial': True}, False),
++                                         ({'interrupted': True}, False), ({'completed': False}, False),
++                                         ({'error': 'synthetic'}, False), ({'failed': True}, False)])
++async def test_room_opt_in_for_mixed_turn_is_healthy_only(running_turn, changes, silent):
++    runner, source, agent, turn = running_turn
++    runner._room_allow_silence = lambda source: True
++    await runner._handle_active_session_busy_message(
++        MessageEvent(text='Please answer', source=source, reply_expected=True), 'synthetic-session')
++    result = {'final_response': '[SILENT]', 'messages': [], **changes}
++    response = await _shape(runner, source, turn.event, result)
++    if silent:
++        assert response == ''
++    elif changes.get('failed'):
++        assert response
++    else:
++        assert response == _unexpected_silence_reply()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('bot_opener', [False, True], ids=['machine-opener', 'bot-opener'])
++async def test_outer_turn_honours_human_fold_without_retyping_opener(monkeypatch, tmp_path, bot_opener):
++    from tests.gateway.test_gateway_silence_tokens import _runner, _event, _source
++
++    runner = _runner(monkeypatch, tmp_path)
++    source = _source()
++    source.is_bot = bot_opener
++    event = _event(internal=not bot_opener, reply_expected=False)
++    event.source = source
++    runner._room_allow_silence = lambda source: False
++    key = 'mixed-outer'
++
++    async def run(**kwargs):
++        turn = runner._session_state(key).turn
++        turn.agent = agent = _Agent()
++        turn.event = event
++        turn.ctx = SimpleNamespace(reply_expected=False)
++        human = MessageEvent(text='Please answer me', source=_source(), reply_expected=True)
++        runner._fold_into_running_turn(agent, key, human)
++        return {'final_response': '[SILENT]', 'messages': [], 'failed': False}
++
++    runner._run_agent = run
++    response = await runner._handle_message_with_agent(event, source, key, 1)
++    assert response == _unexpected_silence_reply()
++    rows = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
++    user = next(row for row in rows if row.get('role') == 'user')
++    assert user.get('display_kind') == ('internal_notification' if not bot_opener else None)
++
++
++@pytest.mark.asyncio
++async def test_later_machine_or_bot_fold_does_not_erase_human_obligation(running_turn):
++    runner, source, agent, turn = running_turn
++    runner._fold_into_running_turn(agent, 'synthetic-session',
++                                  MessageEvent(text='Please answer', source=source, reply_expected=True))
++    for internal, expected in [(True, True), (False, False)]:
++        runner._fold_into_running_turn(agent, 'synthetic-session',
++            MessageEvent(text='Unrelated', source=source, internal=internal, reply_expected=expected))
++    assert await _shape(runner, source, turn.event,
++                        {'final_response': '[SILENT]', 'messages': []}) == _unexpected_silence_reply()
++
++
++@pytest.mark.asyncio
++async def test_unsuccessful_steer_keeps_machine_silence(running_turn):
++    runner, source, agent, turn = running_turn
++    agent.steer = lambda text: False
++    await runner._handle_active_session_busy_message(
++        MessageEvent(text='Queued, not consumed', source=source, reply_expected=True), 'synthetic-session')
++    assert await _shape(runner, source, turn.event,
++                        {'final_response': '[SILENT]', 'messages': []}) == ''
++
++
++@pytest.mark.asyncio
++async def test_queued_machine_context_does_not_inherit_previous_human_fold(running_turn):
++    runner, source, agent, turn = running_turn
++    runner._fold_into_running_turn(agent, 'synthetic-session',
++        MessageEvent(text='First turn human', source=source, reply_expected=True))
++    turn.ctx = SimpleNamespace(_interrupt_depth=1, reply_expected=False,
++                               human_reply_expected=False, mute_notification_reply=False,
++                               persist_user_display_kind='internal_notification', source=source,
++                               session_key='synthetic-session', run_generation=1,
++                               stream_consumer_holder=[None], _status_thread_metadata=None,
++                               event_message_id='queued-machine', inbound_message_id='queued-machine')
++    runner._fold_into_running_turn(agent, 'synthetic-session',
++        MessageEvent(text='Not addressed', source=source, reply_expected=False))
++    runner._deliver_queued_first_response = AsyncMock(return_value=True)
++    result = {'final_response': '[SILENT]', 'messages': []}
++    await runner._run_agent_deliver_first_response(turn.ctx, None, result, result, None)
++    runner._deliver_queued_first_response.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_queued_machine_context_human_fold_gets_warning(running_turn):
++    runner, source, agent, turn = running_turn
++    turn.ctx._interrupt_depth = 1
++    runner._fold_into_running_turn(agent, 'synthetic-session',
++        MessageEvent(text='Queued turn human', source=source, reply_expected=True))
++    runner._deliver_queued_first_response = AsyncMock(return_value=True)
++    result = {'final_response': '[SILENT]', 'messages': []}
++    await runner._run_agent_deliver_first_response(turn.ctx, None, result, result, None)
++    assert runner._deliver_queued_first_response.await_args.args[0] == _unexpected_silence_reply()
++
++
++@pytest.mark.asyncio
++async def test_real_worker_depth_cap_preserves_human_obligation(monkeypatch, tmp_path):
++    from tests.gateway import test_silence_after_reply_line as wiring
++
++    captured = {}
++    make_runner = wiring._make_runner
++
++    def build(adapter):
++        runner = make_runner(adapter)
++        runner._MAX_INTERRUPT_DEPTH = 0
++        runner._requeue_at_depth_cap = MagicMock()
++        captured['runner'] = runner
++        run = runner._run_agent
++
++        async def record(**kwargs):
++            result = await run(**kwargs)
++            captured['result'] = result
++            return result
++
++        runner._run_agent = record
++        return runner
++
++    def conversation(agent, message, **kwargs):
++        runner = captured['runner']
++        key = 'agent:main:telegram:dm:dm-1'
++        turn = runner._session_state(key).turn
++        import time
++        deadline = time.monotonic() + 2
++        while turn.agent is not agent and time.monotonic() < deadline:
++            time.sleep(0.01)
++        assert turn.agent is agent and turn.ctx is not None
++        turn.event = MessageEvent(text='Machine opener', source=wiring._source(), internal=True)
++        runner._fold_into_running_turn(agent, key,
++            MessageEvent(text='Human request', source=wiring._source(), reply_expected=True))
++        wiring._ACTIVE_ADAPTER['adapter']._pending_messages[key] = MessageEvent(
++            text='Wait behind this turn', source=wiring._source(), reply_expected=True)
++        return {'final_response': '[SILENT]', 'messages': [], 'api_calls': 1}
++
++    monkeypatch.setattr(wiring, '_make_runner', build)
++    monkeypatch.setattr(wiring.RecordingAgent, 'run_conversation', conversation)
++    await wiring._run(monkeypatch, tmp_path, reply_expected=False,
++                      persist_user_display_kind='internal_notification')
++    result = captured['result']
++    runner = captured['runner']
++    runner._room_allow_silence = lambda source: False
++    response, silent, _ = await runner._hmwa_shape_agent_response(
++        result, wiring._source(), [], SimpleNamespace(session_id='synthetic'), None, None, 1,
++        'synthetic', 'telegram', 0, persist_user_display_kind='internal_notification', reply_expected=False)
++    assert not silent and response == _unexpected_silence_reply()
++    runner._requeue_at_depth_cap.assert_called_once()
+--- a/tests/gateway/test_stream_consumer.py
++++ b/tests/gateway/test_stream_consumer.py
+@@ -883,6 +883,28 @@
+         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+         assert consumer.final_response_sent is True
+ 
++    @pytest.mark.asyncio
++    @pytest.mark.parametrize("marker", ["[SILENT]", "NO_REPLY"])
++    @pytest.mark.parametrize("streamed", [False, True], ids=["commentary", "streamed-item"])
++    async def test_silent_commentary_does_not_escape_before_a_visible_answer(self, marker, streamed):
++        from tests.gateway.test_telegram_send_reconnect_wait import _make_adapter, _connected_bot
++
++        adapter = _make_adapter()
++        adapter._bot = _connected_bot()
++        adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=42))
++        consumer = GatewayStreamConsumer(adapter, "123", StreamConsumerConfig(cursor=""))
++        if streamed:
++            consumer.on_delta(marker)
++            consumer.on_segment_break()
++        else:
++            consumer.on_commentary(marker)
++        consumer.on_delta("The requested result.")
++        consumer.finish()
++        await consumer.run()
++
++        assert [call.kwargs["text"] for call in adapter._bot.send_message.await_args_list] == [
++            "The requested result\\."]
++
+ 
+ class TestCancelledConsumerSetsFlags:
+     """Cancellation must set final_response_sent when already_sent is True.

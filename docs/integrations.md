@@ -47,6 +47,8 @@ Windows 使用 PowerShell 的 `Test-Path`、`New-Item`、`Copy-Item` 完成相�
 
 只有用户需要 Hermes 宿主来源绑定与原生后台通知时才做此分支。普通跨 CLI 协作不需要它；它也不能代替其他 CLI 消费事件。
 
+Hermes 宿主静默兼容问题另有[独立可选源码补丁](../compat/hermes-silence/README.md)，只支持文档指定的精确公开 commit；不属于插件或 Call CLI 核心，不会自动应用、修改配置或重启服务。先核对整文件版本与验证边界，版本不匹配即停止。
+
 ### 终端方法
 
 先检查当前 profile、已有插件和当前版本帮助。下面是已核对的原生命令形式；不要在另一个 profile 上代替用户安装：
