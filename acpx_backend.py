@@ -366,8 +366,13 @@ class AcpxBackend:
                 note = ((note+' ') if note else '')+('Local transport cleanup did not settle after the authoritative result; '
                         'remote outcome must be reconciled; no automatic replay.')
             settled = rc == 0 and not decoder.failed and decoder.stop_reason in {'cancelled', 'end_turn'}
+            if settled and not cancelling and decoder.stop_reason == 'end_turn' and state == 'completed' and not decoder.final_answer.strip() and not note:
+                note = ('Protocol ended with no final answer (or none after the last tool event); '
+                        'stage, skill reports and tool status are not completion evidence. '
+                        'Outcome unknown; reconcile the exact session and artifacts; no automatic replay.')
             if ((cancelling and not settled) or
-                    (not cancelling and (not settled or decoder.stop_reason!='end_turn' or not decoder.text.strip()))):
+                    (not cancelling and (not settled or decoder.stop_reason!='end_turn' or
+                                         (state != 'waiting_reply' and not decoder.final_answer.strip())))):
                 # Failure can be an uncertain effect; retain the workspace reservation.
                 state='unknown'
             if note:

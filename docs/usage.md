@@ -39,6 +39,8 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 
 终态通知携带 `question_ids` 和最近 1000 字公开回答 `answer_tail`；有 pending 介入时附带下一步动作。宿主截尾仍可能丢内容，应补读 events，不用占位回答代替读取。宿主/Telegram 的静默消费与真实路由须独立验收，不能据此关闭 issue #1。
 
+`unknown` 轮的 `answer_tail` 与累计 `answer` 可能仍含工具前文字，仅用于历史／部分结果对账，不是完成证据；须先按终态判断，再验收具体成果。迟到的重复工具更新即使不再产生工具通知，也会重置最终回答窗口；其后没有新回答或待答问题时会保守结算为 `unknown`，不能用旧 `answer_tail` 覆盖该结算。
+
 问题协议使用 `CALLCLI_QUESTION Q1 问题正文`（依次 Q2、Q3）：`Q[1-9][0-9]*` 后接一个 ASCII 空格和非空正文。编号是同一 task/turn 内的逻辑问题身份，不是源 messageId，也不用于授权。相同编号与完整正文指纹（SHA-256 与字符长度）相同的复述只登记一次，保留首个 event token 供 reply；不同编号或无编号的同文问题仍各需一答。同编号正文不同保留独立可答 token，并附安全 `question_note`，不打断收流或覆盖正文。身份计算发生在公开文本截到 8000 字符之前；不持久化或通知超长原始正文。旧事件缺少完整身份依据时保守保留，不凭截断前缀合并。下一轮可重新使用 Q1；历史事件不回写，旧任务已登记的重复 token 不自动合并。
 
 编号问题事件公开 `question_label`、`question_sha256`、`question_length`；同编号不同正文另带 `question_note`。指纹覆盖解码后完整问题文本（含编号、UTF-8 编码），长度为字符数，均在 8000 字符公开上限之前计算；因此两条可见截断文本相同的事件仍可能有不同指纹并分别待答。
@@ -53,6 +55,7 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
 - `completed/cancelled`：对应轮已结算，仍需检查真实结果或残留。
 - `unknown`：保留任务与资源定位，先对账原会话和进程；不要重放。
+- 四个执行 CLI（OMP/Codex/Pi/AGY）共用完成证据边界：正常 exit 0 与本轮有效 `end_turn` 之外，还须有最后一次工具事件后的非空回答，或保留待答问题为 `waiting_reply`。仅 stage、skill 回执、空输出或工具状态为 `unknown`，写占用不释放、不自动重放；工具之后才出现的回答仍可正常完成。按显式 `CALLCLI_STAGE` / `CALLCLI_SKILL` / `CALLCLI_QUESTION` 分类，不用自然语言关键词判断。普通助手文字仍按回答处理，不证明业务验收；当前投影不传结构化工具正文，协议也没有已定义的无文字业务成功契约，不能把工具 `completed` 当最终成果。取消与协议失败继续走原结算边界。
 - AGY 一轮公开输出的最后一个非空行若恰为 `⚠ Agent execution terminated due to error.`，即使协议返回 `end_turn` / exit 0，也记为 `unknown`，并在 `settlement_note` 与最终事件中写明“AGY 报告致命执行错误、未完成、结果不明、不自动重放”。该判定只拒绝完成，不代表已知根因；引用、前后缀或其后仍有内容的同类文字按普通内容处理。
 - AGY 工具 failed 且最后一个工具事件后无最终回答、也无待答问题时，仅在传输 exit 0、未失败且 end_turn 的情况下，记 `unknown` 并附 `settlement_note`；stage 不算回答。传输失败保留直接的退出说明，不改称工具失败或权限拒绝。正常提问保留 `waiting_reply`，可用准确 question ID 回复；既有 fatal 最终行仍覆盖提问。工具失败后恢复并给出最终回答可 `completed`。协议结束、工具失败和业务结果分别核对。
 - `busy: true, task: null`：数据库锁竞争，没有可信状态；保留游标，稍后再看。

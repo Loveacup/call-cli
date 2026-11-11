@@ -201,6 +201,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 - **多 CLI 并行执行与单写者锁：** 同一设备或跨 SSH 可同时并行运行多个目标 CLI（如 AGY 与 OMP 并发工作），按 origin/client/task/session 严格隔离。`--write` 与可选跨设备 `--resource` 提供单写者目录占用保护；只读任务（包括 `write: false` 下默认 `approve-all` 的 AGY 任务）可与另一任务的合法写者安全并存。
   仅派工和消费事件的中继须保持 `write:false`，即使在同 cwd 发起内层 writer；只有实际编辑者占写锁。scratch cwd 可选作职责隔离，不是绕过锁的条件；共享任务库与锁语义不变。
 - **持久 `seq` 游标与原子结算（`bridge.py`、`runner.py`、`events.py`）：** runner 输出通知与 `events`/`wait` 共享 SQLite 持久 `rowid`（`seq`）游标。同一工具的重复相同状态自动去重（stdout 普通工具通知每轮最多 12 条，失败状态不受限，全部记录均可经 `events` 查询）。每轮结束时在同一个 SQLite 事务内原子提交任务状态与唯一 `<turn>:settled` 事件（含 `question_ids`、最长 1000 字 `answer_tail` 及待执行介入的 `next_action`），避免 `close` 或 `intervene` 并发竞争丢失结算通知。
+- **进度不等于完成：** 四个 ACPX 执行目标（OMP、Codex、Pi、AGY）共同要求 exit 0、有效且属于本轮的 `end_turn`，以及最后一次工具事件后的非空解码回答；有待答问题则为 `waiting_reply`。只有 `CALLCLI_STAGE`、`CALLCLI_SKILL`、空输出或工具状态时记 `unknown`，保留写占用且不自动重放。分类依据显式协议标记，不猜自然语言关键词；未标记助手文本仍按回答处理，不代表业务成果已独立验收。当前 facade 有意不传结构化工具正文，ACPX 0.22.0 的 turn result 也没有允许无文字完成的业务输出契约。AGY 的 fatal/错误诊断及显式取消保留原有优先级。
 - **模块化后端扩展接口（`backends.py`、`acpx_backend.py`）：** 任务归属、轮次状态机、介入与写锁由 `bridge.py` 和 `runner.py` 统一管理。`backends.py` 注册实现 `prepare_start(model, effort, approval)`、`run(store, task, emit)` 与 `control(task, action, timeout)` 的后端适配器。非 ACP 后端可直接注册在同一表中，无需新增守护进程或独立状态库（已由 `test_backends.py` 中的非 ACP fake 完整生命周期契约验证）。详见[后端扩展接口（`docs/integrations.md#后端扩展接口`）](docs/integrations.md#后端扩展接口)。
 
 <a id="工作原理"></a>

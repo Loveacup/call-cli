@@ -884,6 +884,80 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             self.assertEqual(run_task(self.store.path, t['id']), 0)
             self.assertEqual(check.call_count, 1)
 
+    def test_stage_only_turn_is_unknown_for_every_supported_cli(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from backends import BACKENDS
+        from runner import run_task
+        for agent in BACKENDS:
+            with self.subTest(agent=agent):
+                task = self.task('synthetic stage only')
+                self.store.update(task['id'], agent=agent, write=True)
+                with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps([
+                        'CALLCLI_STA', 'GE checking version and protocol support'])}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_task(self.store.path, task['id'])
+                result = self.store.get(task['id'], self.origin)
+                events = self.store.events(task['id'], self.origin)
+                self.assertEqual((result['state'], rc, result['exit_code'], result['stop_reason']),
+                                 ('unknown', 1, 0, 'end_turn'))
+                self.assertEqual([e['text'] for e in events if e['kind']=='stage'],
+                                 ['checking version and protocol support'])
+                self.assertEqual(events[-1]['kind'], 'unknown')
+                self.assertEqual(events[-1]['answer_tail'], '')
+                self.assertIn('no final answer', result['settlement_note'])
+                with self.assertRaises(ValueError):
+                    self.store.create(self.origin, 'local', agent, str(self.root), 'conflict', True)
+                before = (self.root/'calls.jsonl').read_text()
+                with self.assertRaises(ValueError):
+                    run_task(self.store.path, task['id'])
+                self.assertEqual((self.root/'calls.jsonl').read_text(), before)
+                # Release only this synthetic reservation before the next case.
+                self.store.update(task['id'], write=False)
+
+    def test_public_output_and_protocol_outcomes_remain_distinct_across_clis(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        from backends import BACKENDS
+        from runner import run_task
+        tool = {'toolCallId':'read1', 'kind':'read', 'status':'completed'}
+        cases = [
+            ('answer', ['CALLCLI_STAGE checking\n', 'Result: 42'], {}, 'completed', 0),
+            ('literal progress prose', ['Checking version and protocol support'], {}, 'completed', 0),
+            ('skill only', ['CALLCLI_SKILL skill-1 adopted read resources\n'], {}, 'unknown', 1),
+            ('empty', [], {}, 'unknown', 1),
+            ('tool only', [], {'ACPX_FAKE_TOOLS':json.dumps([tool])}, 'unknown', 1),
+            ('partial before tool', ['Partial result\n'], {'ACPX_FAKE_TRAILING_TOOLS':json.dumps([tool])}, 'unknown', 1),
+            ('late duplicate tool', ['Partial result\n'], {'ACPX_FAKE_TOOLS':json.dumps([tool]),
+                 'ACPX_FAKE_TRAILING_TOOLS':json.dumps([tool])}, 'unknown', 1),
+            ('structured answer with receipts', ['0\nfalse\n[]\n{"ok":true}\nCALLCLI_SKILL skill-1 adopted used\nCALLCLI_STAGE verified\n'],
+                 {'ACPX_FAKE_TOOLS':json.dumps([tool])}, 'completed', 0),
+            ('tool then answer', ['Final result: 42'], {'ACPX_FAKE_TOOLS':json.dumps([tool])}, 'completed', 0),
+            ('tool then question', ['CALLCLI_QUESTION Q1 Which file?'], {'ACPX_FAKE_TOOLS':json.dumps([tool])}, 'waiting_reply', 0),
+            ('failure after answer', ['Partial result\n'], {'ACPX_FAKE_RESULT_FAILED':'1'}, 'unknown', 1),
+            ('nonzero after answer', ['Partial result\n'], {'ACPX_FAKE_EXIT':'1'}, 'unknown', 1),
+        ]
+        for agent in BACKENDS:
+            for name, chunks, extra, expected, code in cases:
+                with self.subTest(agent=agent, case=name):
+                    task = self.task('synthetic output classification')
+                    self.store.update(task['id'], agent=agent)
+                    with patch.dict(os.environ, dict(extra, ACPX_FAKE_CHUNKS=json.dumps(chunks))), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        rc = run_task(self.store.path, task['id'])
+                    result = self.store.get(task['id'], self.origin)
+                    self.assertEqual((result['state'], rc), (expected, code))
+                    events = self.store.events(task['id'], self.origin)
+                    self.assertEqual(events[-1]['kind'], expected)
+                    if name in {'partial before tool', 'late duplicate tool'}:
+                        self.assertEqual(events[-1]['answer_tail'], 'Partial result\n')
+                    if name == 'late duplicate tool':
+                        self.assertEqual([e['text'] for e in events if e['kind']=='tool'], ['read1 read completed'])
+                    if expected == 'waiting_reply':
+                        self.assertEqual(result['question_id'], [e['token'] for e in events if e['kind']=='question'][0])
+                    if name in {'failure after answer', 'nonzero after answer'}:
+                        self.assertNotIn('no final answer', result.get('settlement_note', ''))
+
     def test_real_runner_rejects_empty_exit_zero_and_does_not_replay(self):
         from runner import run_task
         t=self.task('EMPTY')

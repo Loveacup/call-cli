@@ -7,6 +7,53 @@ from runner import run_task
 
 @unittest.skipUnless(os.environ.get('RUN_NATIVE_ACPX_TESTS')=='1','opt-in real ACPX queue-owner integration; no model')
 class NativeSharedTests(unittest.TestCase):
+    def test_stage_tool_question_and_answer_settle_across_all_cli_adapters(self):
+        from backends import BACKENDS
+        fixture = pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'
+        evidence = []
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.home()/'.hermes/cache/scratch') as tmp:
+            root = pathlib.Path(tmp)
+            for cli in BACKENDS:
+                for mode, expected in [('stage-only','unknown'), ('tool-only','unknown'),
+                                       ('question-only','waiting_reply'), ('final-answer','completed')]:
+                    with self.subTest(cli=cli, mode=mode):
+                        work = root/(cli+'-'+mode);work.mkdir()
+                        home = work/'home';home.mkdir();trace = work/'wire-shapes.jsonl'
+                        agent = shlex.join([sys.executable,'-B',str(fixture),str(trace),mode])
+                        def control(task, action, timeout=20):
+                            args = ['acpx','--agent',agent,'--cwd',task['cwd'],'--format','json']
+                            if action == 'new':args += ['sessions','new','--name',task['session']]
+                            elif action in ('close','show'):args += ['sessions',action,task['session']]
+                            else:args += [action,'-s',task['session']]
+                            return subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
+                        c = Collaboration(work/'tasks.sqlite3',control=control)
+                        client = c.connect('omp')['client_id'];origin = c.origin(client)
+                        task = c.store.create(origin,'local',cli,str(work),'SYNTHETIC OUTPUT CONTRACT ONLY',True)
+                        c.store.update(task['id'],shell='posix',timeout=35)
+                        with patch.dict(os.environ,{'HOME':str(home)}), \
+                                patch('acpx_backend.AcpxBackend.control',side_effect=control), \
+                                patch('updates.ensure_current',return_value={'decision':'existing-runtime'}):
+                            try:
+                                with contextlib.redirect_stdout(io.StringIO()):rc = run_task(c.store.path,task['id'])
+                                result = c.store.get(task['id'],origin)
+                                events = c.events(client,task['id'])
+                                self.assertEqual((result['state'],rc,result['exit_code'],result['stop_reason']),
+                                                 (expected,1 if expected=='unknown' else 0,0,'end_turn'))
+                                self.assertEqual(events[-1]['kind'],expected)
+                                self.assertEqual([e['text'] for e in events if e['kind']=='answer'],
+                                                 ['SYNTHETIC_FINAL_RESULT 42'] if mode=='final-answer' else [])
+                                if expected == 'unknown':
+                                    with self.assertRaises(ValueError):
+                                        c.store.create(origin,'local',cli,str(work),'conflicting writer',True)
+                                self.assertNotIn('PRIVATE_TOOL_RESULT',json.dumps(events))
+                                wire = [json.loads(line) for line in trace.read_text().splitlines()]
+                                self.assertEqual(sum(e.get('method')=='session/prompt' for e in wire),1)
+                                evidence.append(dict(cli=cli,mode=mode,state=result['state'],runner_exit=rc,prompts=1))
+                            finally:
+                                c.close(client,task['id'])
+                                self.assertEqual(json.loads(control(c.store.get(task['id']),'status').stdout)['status'],'no-session')
+        print('NATIVE_OUTPUT_CONTRACT_EVIDENCE '+json.dumps(evidence))
+
     def test_native_collision_prompt_failure_and_cancel(self):
         fixture=pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'
         evidence=[]

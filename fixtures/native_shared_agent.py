@@ -37,7 +37,15 @@ for line in sys.stdin:
     elif method in ['session/load','session/resume','authenticate']:answer(i,{})
     elif method=='session/prompt':
         text('CALLCLI_STAGE synthetic protocol fixture started\n')
-        if mode=='auth-fail':
+        if mode in {'stage-only', 'tool-only', 'final-answer', 'question-only'}:
+            if mode != 'stage-only':
+                send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'fixture-session','update':{
+                    'sessionUpdate':'tool_call','toolCallId':'synthetic-tool','kind':'other','status':'completed',
+                    'rawOutput':{'synthetic':'PRIVATE_TOOL_RESULT'}}}})
+            if mode == 'final-answer':text('SYNTHETIC_FINAL_RESULT 42')
+            elif mode == 'question-only':text('CALLCLI_QUESTION Q1 Which format?')
+            answer(i,{'stopReason':'end_turn'})
+        elif mode=='auth-fail':
             text('SYNTHETIC_PARTIAL_RESULT\n')
             send({'jsonrpc':'2.0','id':i,'error':{'code':-32000,'message':'PRIVATE_SYNTHETIC_ERROR',
                   'data':{'authRequired':True,'private':'PRIVATE_SYNTHETIC_DATA'}}})

@@ -8,6 +8,8 @@
 - CLI 改接 SDK 时先逐项对照原生连接选项，不假设 SDK 自动加载 CLI 配置。认证在执行设备本地解析并传入 `authCredentials/authPolicy`；核对已安装 CLI 的全局／项目优先级、默认值、空值与非法配置处理，保留凭据字面量，不经控制端任务包、事件或异常正文传送凭据。用合成凭据覆盖配置合并和实际 owner 启动，不能只测试注入 factory。
 - 区分首轮版本检查历史与当前轮执行版本；等待回答期间可能发生允许的兼容更新。每轮在既有共享安装锁内读回当前安装，再核对实际加载的 SDK 包，不拿首轮快照锁死续轮，也不为消除误拒绝而取消包版本一致性校验。覆盖“提问 → 安装版本变化 → 原会话回答续轮”的回归；这不要求实际升级，更不在续轮中新增 registry 查询或升级。
 - 将事件展示与最终结算分开：消费 `turn.events` 时仅投影公开助手文本及必要工具状态，最终等待同一次 `turn.result`。将终结记录绑定协调端生成的 task/turn requestId，拒绝外来、重复、缺失、矛盾和失败回执；助手正文中长得像终结 JSON 的文本不能成为回执。仍共同检查进程退出、有效 stopReason 和实际产物，不把 accepted/queued 当完成。
+- 四个 ACPX 执行目标共用回答证据：有效本轮 `end_turn` / exit 0 之外，须有最后一次工具事件后的非空解码回答，或按精确问题进入 `waiting_reply`；仅 stage、skill 回执、空输出或工具状态记 unknown 并保留写占用，不自动重放。按显式协议标记分类，普通未标记文字仍为回答，不推断业务验收。当前 facade 不传结构化工具正文，ACPX 0.22.0 的 turn.result 没有无文字业务结果契约；工具 completed 不替代成果，未来其他协议只能依据其实际已验证契约结算。取消、失败和 AGY 专属 fatal/工具错误仍保留各层边界。
+- 消费终态时先看 state：unknown 的 `answer_tail`／累计 answer 可保留工具前文字，仅是历史或部分结果对账线索，不代表完成。迟到的重复工具更新仍重置最终回答窗口（通知去重不等于忽略协议边界），其后无新回答或待答问题则保守 unknown；先对账适配器事件顺序，不凭旧回答改写终态。
 - 区分共享客户端断连与取消：`closeStream()`、`shutdown()` 或提交者进程退出不证明已接受工作停止。取消必须经原生控制并观察真实 turn 结算；输出观察/转发失败保留 unknown，不因本地客户端结束就释放写占用或重放业务。
 - 仅失败的 `turn.result.error.code === 'TIMEOUT'` 投影为 `timeout/turn_result_code`，`error.detailCode === 'AGENT_DISCONNECTED'` 投影为 `connection_lost/turn_result_detail`；只传固定类别与来源，不传错误正文或原始字段。认证优先保留 `AUTH_REQUIRED` 及同 requestId、单一 prompt 响应的 watch 关联，不能由通用 `QUEUE_RUNTIME_PROMPT_FAILED` 或耗时推断类别。
 - 这些诊断仍结算为 unknown 并保留占用；connection_lost 只证明运行时报告代理断连，根因未知。新任务默认省略 SDK 两处 timeoutMs，不设执行总截止；需要限时才显式指定，旧任务值不变。省略也会移除 SDK 启动／加载截止，因此公共 runner 单独限制未观察到 prompt 接受的等待为 120s（超界取消后仍 unknown），控制／连接保持有界。每段连续 600s 无可见公开事件只提醒一次，不取消或断言挂死。阶段先保存产物，外部写入后读回；结果不明先对账再决定授权续办，close 不等于 rollback，不盲重放。
