@@ -84,6 +84,7 @@ separate service activation. No service/configuration command is included here.
 Rollback is also manual and only for an exact postimage, with no intervening edits:
 
 ```sh
+cd "$HERMES" &&
 python3 "$COMPAT/check.py" "$HERMES" --state after &&
 git apply --reverse --check "$COMPAT/hermes-2bd378ed-silence.patch" &&
 git apply --reverse "$COMPAT/hermes-2bd378ed-silence.patch" &&
