@@ -24,7 +24,7 @@ metadata:
 
 1. **一次逻辑启动检查**：[维护源与安装检查](references/maintenance.md)覆盖 call-cli、本轮参与 CLI 的协作 skill；任务所选 skill 另查来源／版本、目标可读性与采用。记录 installed／available／unknown，查询失败不称最新；同任务 status／续轮复用结果，不重复全检。检查不是升级授权。
 2. **在哪里、做什么**：按[设备发现约定](references/devices.md)复用私有清单或本任务现有别名，确定目标绝对 cwd、输入、写入范围、产物和验证。跨设备文件不自动同步；复杂任务用[任务模板](templates/task.md)。
-3. **真实返回路径**：先核验发起宿主如何消费事件、收原会话输入与继续行动，再选执行端。命名 runtime 或 client handle 不是认证来源；保存设备、DB、client/task/session/turn、原生 process 与 cursor，不能猜“最近任务”。
+3. **真实返回路径与责任方**：先核验发起宿主如何消费事件、收原会话输入与继续行动，再选入口与执行端；跨轮任务及短命发起方按[生命周期责任](references/coordination.md#单一-owner-与有效上下文)明确持续协调与收尾。命名 runtime 或 client handle 不是认证来源；保存设备、DB、client/task/session/turn、原生 process 与 cursor，不能猜“最近任务”。
 
 | 入口 | 来源与回流 | 使用条件 |
 | --- | --- | --- |
@@ -51,7 +51,9 @@ OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请�
 
 方法材料先本地选择，不足再按相关性、维护来源与实质更新找公开候选；[任务技能传递](references/skill-passing.md)提供 required／optional／reference 快照与逐轮读取／采用核验。暂存、读取、自报采用、独立验收是不同证据；传递 skill 不扩大业务权限，也不默认全局安装。
 
-保留单一生命周期 owner 和同写面唯一 writer。复用公共核心、发起端适配、执行端适配及工具链／skill 传递的小接口，仅隔离真实差异。已有平台编排的工作交回其 owner；不建立竞争调度。Git 发布、部署、系统安装、凭据操作、其他 profile、服务重启及删除无关文件都需要针对性授权；普通派工或维护检查不包含这些权限。
+按[生命周期责任](references/coordination.md#单一-owner-与有效上下文)保留单一 owner 和同写面唯一 writer。复用公共核心、发起端适配、执行端适配及工具链／skill 传递的小接口，仅隔离真实差异。已有平台编排的工作交回其 owner；不建立竞争调度。Git 发布、部署、系统安装、凭据操作、其他 profile、服务重启及删除无关文件须有针对性授权；已授权同目标发布的普通返工按原权限继续，新增目标或重要权限变化再确认。普通派工或维护检查不包含这些权限，详见[发布边界](references/deployment.md)。
+
+Hermes native task 在旋转式 compaction 后仅可沿同一已验证 profile 的 committed compression metadata，由 SID 新段续办原有 task；不能据此接管其他 session／subagent。细节与 fail-closed 边界见[Hermes P1 连续性](references/hermes-host.md#轮转压缩后的同源任务访问)。
 
 只负责派工、短 wait 和转述的中继使用 `write:false`；在同一 cwd 发起内层 writer 时，中继不占用写锁。只有实际修改该写面的执行任务声明 `write:true`。scratch cwd 可用于职责隔离，但不是同 cwd 中继的必要条件；不要通过另一个 DB 或放宽锁绕过占用。
 

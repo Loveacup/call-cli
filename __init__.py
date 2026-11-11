@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import shlex
+import sqlite3
 import sys
-from .bridge import Store, capture_origin
+from .bridge import capture_origin
+from .native_continuity import NativeStore as Store
 from .runner import control
 from .transport import device_identity
 from .backends import BACKENDS, prepare_start
@@ -37,16 +39,18 @@ SCHEMA={
 
 
 class Coordinator:
-    def __init__(self,ctx,home,get_env):
+    def __init__(self,ctx,home,get_env,*,hermes_home=None,hermes_root=None):
         self.ctx=ctx
         self.home=Path(home)
         self.get_env=get_env
+        self.hermes_home=hermes_home
+        self.hermes_root=hermes_root
 
     def handle(self,args):
         if self.ctx.get_config('enabled',False) is not True:
             raise PermissionError('call-cli bridge is disabled')
         origin=capture_origin(self.get_env,self.ctx.profile_name)
-        store=Store(self.home/'call-cli'/'tasks.sqlite3')
+        store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root)
         action=args['action']
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
         if action in {'status','events','reply','intervene','cancel','close'}:
@@ -150,8 +154,19 @@ def register(ctx):
         from gateway.session_context import get_session_env
         from hermes_constants import get_hermes_home, get_default_hermes_root
         try:
-            return json.dumps(Coordinator(ctx,Path(get_default_hermes_root(home=get_hermes_home()))/'plugin-data',get_session_env).handle(args),ensure_ascii=False)
-        except (ValueError,PermissionError,KeyError,RuntimeError,OSError) as exc:
+            home=Path(get_hermes_home()).resolve()
+            task_root=Path(get_default_hermes_root(home=home)).resolve()
+            metadata_home=metadata_root=None
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                if get_active_profile_name() == ctx.profile_name:
+                    metadata_home=home
+                    metadata_root=Path(get_default_hermes_root()).resolve()
+            except (ImportError,OSError,RuntimeError,ValueError):
+                pass  # Unavailable lineage identity must not disable exact-origin access.
+            return json.dumps(Coordinator(ctx,task_root/'plugin-data',get_session_env,
+                hermes_home=metadata_home,hermes_root=metadata_root).handle(args),ensure_ascii=False)
+        except (ValueError,PermissionError,KeyError,RuntimeError,OSError,sqlite3.Error) as exc:
             return json.dumps({'error':str(exc),'error_type':type(exc).__name__})
     ctx.register_tool(name='call_cli',toolset='call_cli',schema=SCHEMA,handler=handle,
                       check_fn=lambda:ctx.get_config('enabled',False) is True,

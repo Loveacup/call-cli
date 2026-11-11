@@ -75,12 +75,11 @@ hermes plugins doctor call-cli
   "agent": "omp",
   "cwd": "/absolute/approved/workspace",
   "prompt": "只读检查指定文件并报告结果，不修改文件。",
-  "write": false,
-  "timeout": 120
+  "write": false
 }
 ```
 
-保留真实返回的 `task.id` 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造这些来源字段。
+上例无执行预算，省略 timeout；有明确 SLA 时可显式设置（如 300／420 秒），已有显式预算继续生效，与短轮询不同。保留真实返回的 `task.id` 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造这些来源字段。
 
 原生工具支持 `start/list/status/events/reply/intervene/cancel/close`。运行期介入使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`；重试复用相同 ID。`pending/cancelling` 不是生效证明：先等旧轮结算，再调用 `status` 或 `events` 推进同 session 续轮；重复查询不重复启动，`unknown` 不续派。`cancel` 撤回待执行介入。通用 CLI 声明 `--runtime hermes` 不产生原生来源绑定或通知能力，两条路径不能混称同一次验收。
 
@@ -126,7 +125,7 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 安装按入口生成文件与 SHA-256 manifest，不用旧总数推算。当前 import 与相邻资源读取关系如下；这些文件须来自同一固定 commit，源码更新不自动更新已安装副本或内存 schema。
 
-- 公共 core／runner 闭包：`bridge.py`、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`。后两个资源分别由 `skills.py`、`acpx_backend.py` 相邻读取。
+- 公共 core／runner 闭包：`bridge.py`、`native_continuity.py`（Hermes native wrapper 使用；只读当前 profile `state.db` metadata）、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`。后两个资源分别由 `skills.py`、`acpx_backend.py` 相邻读取。`collab.py` 仍直用基础 `Store`，不启用 native metadata continuity。
 - 通用 POSIX 入口：公共闭包加 `collab.py`。
 - Hermes 插件入口：公共闭包加 `__init__.py`、`plugin.yaml`；manifest 声明 `call_cli`，不声明或全局启用 OMP extension。已有插件若提供 `collab.py`、`models.cjs`、`remote-client.cjs` 等附带入口，按其实际依赖保留，不替换整个物理目录或删除未列文件。
 - 实验性 OMP 宿主入口：公共闭包加 `collab.py`、`omp_bridge.py`、`omp-extension.mjs`；`.mjs` 通过相邻路径启动 Python bridge，后者导入 `collab.py`，再复用现有 runner。它不是 Hermes 插件注册项。

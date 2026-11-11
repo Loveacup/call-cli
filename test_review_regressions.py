@@ -23,6 +23,37 @@ class ReviewRegressions(unittest.TestCase):
     def start(self, prompt='BLOCK'):
         return self.c.start(self.client, prompt=prompt, cwd=str(self.fixture.root), timeout=10, write=True)
 
+    def test_explicit_sla_timeout_retains_writer_and_owner_until_verified_close(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        other = self.c.connect('omp')['client_id']
+        for budget in (300, 420):
+            with self.subTest(budget=budget):
+                task = self.c.start(self.client, prompt='bounded inspection',
+                    cwd=str(self.fixture.root), timeout=budget, write=True)
+                frame = dict(status='failed', stopReason=None,
+                    errorCategory='timeout', errorSource='turn_result_code')
+                with patch.dict(os.environ, ACPX_FAKE_RESULT_FRAME=json.dumps(frame)), \
+                        redirect_stdout(StringIO()):
+                    self.assertEqual(runner.run_task(self.c.store.path, task['id']), 1)
+                result = self.c.status(self.client, task['id'])
+                self.assertEqual((result['state'], result['timeout']), ('unknown', budget))
+                options = [json.loads(line) for line in
+                    (self.fixture.root/'shared-options.jsonl').read_text().splitlines()]
+                owned = next(item for item in options if item['sessionName'] == task['session'])
+                self.assertEqual(owned['timeoutMs'], {300: 300000, 420: 420000}[budget])
+                with self.assertRaises(PermissionError):
+                    self.c.close(other, task['id'])
+                with self.assertRaises(ValueError):
+                    self.c.start(other, prompt='competing writer', cwd=task['cwd'], write=True)
+                with self.assertRaises(ValueError):
+                    self.c.intervene(self.client, task['id'], 'replay', command_id='revision')
+                with patch.dict(os.environ, ACPX_STATUS_MODE='running'):
+                    self.assertEqual(self.c.close(self.client, task['id'])['state'], 'unknown')
+                with self.assertRaises(ValueError):
+                    self.c.start(other, prompt='still competing', cwd=task['cwd'], write=True)
+                self.assertEqual(self.c.close(self.client, task['id'])['state'], 'closed')
+
     def test_main_wait_deadline_includes_real_constructor(self):
         from contextlib import redirect_stdout
         from io import StringIO

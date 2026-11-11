@@ -18,10 +18,12 @@
 python3 /absolute/collab.py --db /absolute/tasks.sqlite3 connect --runtime codex
 python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID start \
   --device EXISTING_SSH_ALIAS --agent omp --cwd /absolute/target/workspace \
-  --timeout 120 --prompt '目标、范围、产物和验证方法'
+  --prompt '目标、范围、产物和验证方法'
 ```
 
-按实际发起端选择 runtime 标签；支持的标签从当前帮助读取。client_id 是私有协作句柄，声明的 runtime 不是认证过的原生 CLI 身份。原生身份验证另从真实运行时取证，不由模型编造 session ID 或 Telegram 来源。目标为 Windows 时设置 powershell；只有已获写入授权才启用 write。保留 client、task、目标 session 与 turn，不用最近会话猜目标。
+按实际发起端选择 runtime 标签；支持的标签从当前帮助读取。client_id 是私有协作句柄，声明的 runtime 不是认证过的原生 CLI 身份。原生身份验证另从真实运行时取证，不由模型编造 session ID 或 Telegram 来源。有长期责任方时由该方创建并保存跨轮任务句柄；短命发起方须先明确宿主支持的持续协调与收尾路径，不能靠新 connect 或父子关系自动接管。目标为 Windows 时设置 powershell；只有已获写入授权才启用 write。保留 client、task、目标 session 与 turn，不用最近会话猜目标。
+
+上例无执行预算，省略 start 的 timeout。确有 SLA 时显式加 `--timeout SECONDS`，例如 `--timeout 300` 或 `--timeout 420`；这些已有显式预算继续生效，与 `wait --timeout 5` 的短轮询不同。到期或 TIMEOUT 不证明已停写；unknown 保留占用并先对账。
 
 中继只派工和消费事件时保持 `write:false`，即使内层任务会修改同一 cwd；只有实际编辑者传 `--write`。中继误声明写入会在内层任务创建前正确触发冲突，不是锁泄漏。使用同一个任务库对账，不新增父子交接或绕过锁；另选 scratch cwd 只做职责隔离。
 

@@ -100,7 +100,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" lis
 
 #### Stage B: Real read-only collaboration (requires ACPX & logged-in target CLI)
 
-Continue in the **same shell** (reusing `CALL_CLI_HOME`, `CALL_CLI_DB` and `CLIENT_ID`) to launch a fresh read-only session:
+Continue in the **same shell** (reusing `CALL_CLI_HOME`, `CALL_CLI_DB` and `CLIENT_ID`) to launch a fresh read-only session. This example has no execution deadline; add `--timeout SECONDS` only for an explicit budget or SLA. The bounded `wait` below is a poll slice, not a task deadline.
 
 ```sh
 # Check ACPX on the execution device
@@ -109,7 +109,7 @@ acpx --version
 # Start a read-only OMP task in the current repository (no --write granted)
 TASK_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" \
   --client "$CLIENT_ID" start --device local --agent omp --cwd "$CALL_CLI_HOME" \
-  --timeout 120 --prompt 'Read collab.py and summarize the CLI subcommands in 3 bullet points. Do not modify files.')"
+  --prompt 'Read collab.py and summarize the CLI subcommands in 3 bullet points. Do not modify files.')"
 printf '%s\n' "$TASK_JSON"
 
 TASK_ID="$(printf '%s' "$TASK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"

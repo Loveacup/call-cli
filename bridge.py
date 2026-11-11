@@ -190,7 +190,7 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
-            if not row or row['owner'] != origin.key():
+            if not row or not self._allows(row['owner'], origin):
                 raise PermissionError('Task belongs to another Hermes session/topic')
             task = json.loads(row['data'])
             if (task['state'] not in {'waiting_reply','completed'}
@@ -214,10 +214,12 @@ class Store:
             self._save(db, task)
         return task
 
-    @staticmethod
-    def _owned(db,task_id,origin):
+    def _allows(self, owner, origin):
+        return owner == origin.key()
+
+    def _owned(self,db,task_id,origin):
         row=db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone()
-        if not row or row['owner']!=origin.key():
+        if not row or not self._allows(row['owner'], origin):
             raise PermissionError('Task belongs to another Hermes session/topic')
         return json.loads(row['data'])
 
@@ -380,6 +382,6 @@ class Store:
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
         if not row:
             raise KeyError('Unknown call-cli task')
-        if origin is not None and row['owner'] != origin.key():
+        if origin is not None and not self._allows(row['owner'], origin):
             raise PermissionError('Task belongs to another Hermes session/topic')
         return json.loads(row['data'])

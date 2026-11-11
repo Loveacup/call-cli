@@ -96,7 +96,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" lis
 
 #### 阶段 B：真实只读协作（需要 ACPX 与已登录的目标 CLI）
 
-在**同一个 shell** 中继续（复用已赋值的 `CALL_CLI_HOME`、`CALL_CLI_DB` 和 `CLIENT_ID`），发起一次只读协作：
+在**同一个 shell** 中继续（复用已赋值的 `CALL_CLI_HOME`、`CALL_CLI_DB` 和 `CLIENT_ID`），发起一次只读协作。此例不设执行总截止；有明确预算或 SLA 才加 `--timeout SECONDS`，下方有界 `wait` 只是短轮询，不是任务截止。
 
 ```sh
 # 检查执行设备上的 ACPX 版本
@@ -105,7 +105,7 @@ acpx --version
 # 启动只读 OMP 任务检查当前仓库（不传 --write，不授予写权限）
 TASK_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" \
   --client "$CLIENT_ID" start --device local --agent omp --cwd "$CALL_CLI_HOME" \
-  --timeout 120 --prompt 'Read collab.py and summarize the CLI subcommands in 3 bullet points. Do not modify files.')"
+  --prompt 'Read collab.py and summarize the CLI subcommands in 3 bullet points. Do not modify files.')"
 printf '%s\n' "$TASK_JSON"
 
 TASK_ID="$(printf '%s' "$TASK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"

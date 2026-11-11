@@ -18,6 +18,7 @@ acpx --cwd /absolute/project --format json omp sessions list --local
 acpx --cwd /absolute/project --format json omp sessions show session-name
 acpx --cwd /absolute/project --format json omp sessions read --tail 10 session-name
 acpx --cwd /absolute/project --format json omp sessions watch --name session-name --cursor cursor-value
+# 独立单次诊断，显式预算 120 秒；不是常规协作的默认截止
 acpx --cwd /absolute/project --format json --deny-all --timeout 120 omp exec "仅回答简短问题"
 ```
 
