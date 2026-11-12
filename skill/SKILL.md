@@ -41,6 +41,7 @@ OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请�
 
 - 用数值 `seq` 增量消费公开事件，有界 `wait` 给原宿主输入让出控制权；心跳仅是唤醒，不是完整记录。区分事件产生、持久化、回注、协调者消费与用户实际收到。实质阶段、待决策与失败及时转述，不逐 token 或重复心跳刷屏。
 - 发起 agent 根据偏差／阻塞在授权内主动协调，不只转发用户。问题保留精确 `question_id`，能自行决定就回答并观察续轮；真正需用户决定才回原会话询问。多个待答问题逐条结算，不能提问后失去后续责任。
+- 公共 runner 每 600s 至多发一次复核请求，长期活跃与静默共享冷却；发起 agent 读精确 task/turn/seq 和真实现状后选择等待、明确介入或取消，不将提醒自动升级为终止，也不必逐条转给用户。Hermes/OMP 不接收硬 timeout，旧 CLI/Python 显式硬预算仅非常规兼容且未清除仍生效；受支持 reply/intervene 可 clear_timeout，queued 拒绝清除，unknown 不绕锁。具体多问与介入替换契约见调用手册；入队不证明已消费，通用 CLI 依赖活跃 owner 轮询。
 - 用户修订按精确 task 与稳定 `command_id` 传递；重复提交沿用同 ID。**steer、queue、cancel+resume 是不同语义**：先查所用栈的真实能力，再明确采用方式。当前 Shared Runtime 拒绝 steer；`intervene` 是取消、结算、同 session 续轮，不是无损热修改。详见[控制语义及生效判据](references/online-collab.md)。
 - 区分命令已保存、待续轮、执行端已接收与结果实际体现；`pending/queued` 不等于生效。绑定目标 turn 的事件、修订相关结果与产物验证，不凭自报或状态名判定有效。旧 runner 完成不等于新轮完成；续轮重新跟踪实际 process/turn。
 - 只汇报有用变化；静默不等于失败，alive 不等于有进展。`unknown`、断线或工具失败先按原句柄对账，不换模型、换通道或新派任务盲目重放。公开 SDK 不可观测的权限决定如实写未知。

@@ -101,8 +101,9 @@ class Collaboration:
     def list(self, client):
         return self.store.list(self.origin(client))
 
-    def intervene(self, client, task_id, prompt, *, command_id=None):
-        task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id)
+    def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False):
+        task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id,
+                                           clear_timeout=clear_timeout)
         if launch:
             self._dispatch(task)
         return self.status(client, task_id)
@@ -145,30 +146,10 @@ class Collaboration:
         finally:
             _polling.reset(token)
 
-    def reply(self, client, task_id, question_id, prompt):
-        origin = self.origin(client)
-        launch = False
-        with self.store.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            task = self.store._owned(db, task_id, origin)
-            questions = task.get('questions', [])
-            if (task['state'] not in {'waiting_reply', 'completed'} or not question_id
-                    or question_id not in questions or not prompt.strip()
-                    or task.get('intervention', {}).get('status') == 'pending'):
-                raise ValueError('Reply requires an unanswered question_id in a settled turn')
-            task.setdefault('answers', {})[question_id] = prompt
-            questions.remove(question_id)
-            if questions:
-                task['question_id'] = questions[0]
-            else:
-                answers = list(task['answers'].items())
-                text = answers[0][1] if len(answers) == 1 else '\n'.join(k+': '+v for k, v in answers)
-                task.update(turn=task['turn']+1, state='queued', prompt=text,
-                            process_id='', runner_pid=0, question_id='', questions=[], answers={})
-                self.store._check_writers(db, task)
-                launch = True
-            self.store._save(db, task)
-        if launch:
+    def reply(self, client, task_id, question_id, prompt, *, clear_timeout=False):
+        task = self.store.reply(task_id, self.origin(client), question_id, prompt,
+                                clear_timeout=clear_timeout, require_question=True)
+        if task['state'] == 'queued':
             self._dispatch(task)
         return self.status(client, task_id)
 
@@ -236,7 +217,7 @@ def main(argv=None):
     start.add_argument('--write', action='store_true')
     start.add_argument('--resource', default='')
     start.add_argument('--timeout', type=lambda value: None if value == 'none' else float(value),
-                       help='Optional execution limit in seconds; omitted or none means no execution deadline')
+                       help='Uncommon explicit hard execution limit in seconds, not a review reminder; omitted or none means no execution deadline')
     start.add_argument('--prompt', required=True)
     start.add_argument('--skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot a coordinator-side skill directory')
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
@@ -251,6 +232,8 @@ def main(argv=None):
             p.add_argument('--timeout', type=float, default=5)
         if action in {'reply', 'intervene'}:
             p.add_argument('--prompt', required=True)
+            p.add_argument('--clear-timeout', action='store_true',
+                           help='Clear inherited execution limit on the next settled continuation')
         if action == 'reply':
             p.add_argument('--question-id', required=True)
         if action == 'intervene':

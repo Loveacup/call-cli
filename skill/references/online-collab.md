@@ -23,7 +23,7 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 按实际发起端选择 runtime 标签；支持的标签从当前帮助读取。client_id 是私有协作句柄，声明的 runtime 不是认证过的原生 CLI 身份。原生身份验证另从真实运行时取证，不由模型编造 session ID 或 Telegram 来源。有长期责任方时由该方创建并保存跨轮任务句柄；短命发起方须先明确宿主支持的持续协调与收尾路径，不能靠新 connect 或父子关系自动接管。目标为 Windows 时设置 powershell；只有已获写入授权才启用 write。保留 client、task、目标 session 与 turn，不用最近会话猜目标。
 
-上例无执行预算，省略 start 的 timeout。确有 SLA 时显式加 `--timeout SECONDS`，例如 `--timeout 300` 或 `--timeout 420`；这些已有显式预算继续生效，与 `wait --timeout 5` 的短轮询不同。到期或 TIMEOUT 不证明已停写；unknown 保留占用并先对账。
+常规任务省略执行 timeout，先复核再决定介入/取消。Hermes/OMP 模型工具拒绝该参数；旧 CLI start --timeout SECONDS|none 与 Python timeout= 仅保留非常规显式硬预算兼容，旧值未清除仍会到期，不是软提醒。wait --timeout 5 只是轮询。clear_timeout/--clear-timeout 仅通过受支持 reply/intervene 对下一轮生效，queued 一律拒绝清除，unknown 保留占用；多问与介入替换规则见调用手册。
 
 中继只派工和消费事件时保持 `write:false`，即使内层任务会修改同一 cwd；只有实际编辑者传 `--write`。中继误声明写入会在内层任务创建前正确触发冲突，不是锁泄漏。使用同一个任务库对账，不新增父子交接或绕过锁；另选 scratch cwd 只做职责隔离。
 
@@ -31,6 +31,7 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 1. 调用 `wait --task TASK_ID --after CURSOR --timeout 5`，接续返回游标。
 2. 结合 task.state、turn、公开阶段、工具状态和产物判断进展；只向用户汇报实质变化、阻塞或决策。静默不等于失败。
+   收到 stage + quiet_notice 的复核请求时读取精确 task/turn/seq 和真实现状，选择继续等待、明确介入或取消；静默/持续活跃共享每 600s 一次冷却。复核供协调者内部判断，不必逐条转给用户；不自动取消/关闭/续跑，事件可读不代表已消费。CLI 依赖活跃 owner 持续 wait，owner 消失不保证及时介入或终止。
 3. 收到问题后使用 `reply --task TASK_ID --question-id TOKEN --prompt ANSWER`。发起 CLI 自行回答或征询用户，再消费后续结果；测试脚本不能绕开发起 CLI 代答。
 4. 发起端依据进展主动纠偏，或消费用户在其自身原生输入通道送入的新要求后，使用 `intervene --task TASK_ID --command-id UNIQUE_ID --prompt REVISION`。
 5. 继续短 wait，区分请求收到、排队与对应轮次已执行。pending／queued 是提交阶段，不是生效证明；重试提交沿用同一个 command_id，不另造一次业务执行。

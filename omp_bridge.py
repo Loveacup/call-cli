@@ -45,13 +45,15 @@ class HostBridge(Collaboration):
         self.binding = self.identity(host)
         self.origin(capability)
         allowed = {
-            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'timeout', 'model', 'effort', 'agy_approval', 'skills'},
+            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'skills'},
             'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
-            'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt'},
-            'intervene': {'task_id', 'prompt', 'command_id'}, 'cancel': {'task_id'}, 'close': {'task_id'},
+            'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout'},
+            'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout'}, 'cancel': {'task_id'}, 'close': {'task_id'},
         }
         args = dict(args)
         action = args.pop('action', '')
+        if action != 'wait' and 'timeout' in args:
+            raise ValueError('call_cli_omp does not accept timeout; omit it. Explicit execution budgets remain available through CLI/Python start.')
         if action not in allowed or set(args) - allowed[action]:
             raise ValueError('Unsupported action or model-supplied host field')
         if action == 'intervene' and not args.get('command_id'):

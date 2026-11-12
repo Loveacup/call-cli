@@ -167,6 +167,9 @@ class NativeSharedTests(unittest.TestCase):
                 else:args+=[action,'-s',task['session']]
                 return subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
             futures=[]
+            from types import SimpleNamespace
+            clock_offset = [0]
+            clock = SimpleNamespace(monotonic=lambda: time.monotonic()+clock_offset[0])
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 class SyntheticHost(Ctx):
                     def dispatch_tool(self,name,args,**kwargs):
@@ -175,8 +178,10 @@ class NativeSharedTests(unittest.TestCase):
                         return json.dumps({'session_id':'synthetic-process-'+str(len(futures))})
                 env={'HERMES_SESSION_ID':'synthetic-origin','HERMES_SESSION_KEY':'synthetic-key'}
                 c=mod.Coordinator(SyntheticHost(),work,lambda k,d='':env.get(k,d))
-                with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch.object(mod,'control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}),contextlib.redirect_stdout(io.StringIO()):
-                    task=c.handle({'action':'start','agent':'omp','cwd':str(work),'prompt':'INITIAL_BLOCK','timeout':35})['task']
+                with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch.object(mod,'control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}),patch('acpx_backend.time',clock),contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(ValueError):
+                        c.handle({'action':'start','agent':'omp','cwd':str(work),'prompt':'INITIAL_BLOCK','timeout':35})
+                    task=c.handle({'action':'start','agent':'omp','cwd':str(work),'prompt':'INITIAL_BLOCK'})['task']
                     store=mod.Store(work/'call-cli/tasks.sqlite3')
                     origin=mod.capture_origin(lambda k,d='':env.get(k,d),'default')
                     args={'action':'intervene','task_id':task['id'],'command_id':'synthetic-stable','prompt':'SYNTHETIC_REVISION'}
@@ -186,6 +191,18 @@ class NativeSharedTests(unittest.TestCase):
                             if any(e['kind']=='stage' for e in store.events(task['id'],origin)):break
                             time.sleep(.05)
                         else:self.fail('Synthetic initial turn never became active')
+                        clock_offset[0] = 601
+                        deadline=time.monotonic()+10
+                        while time.monotonic()<deadline:
+                            notices=[e for e in store.events(task['id'],origin) if e.get('quiet_notice')]
+                            if notices:break
+                            time.sleep(.05)
+                        else:self.fail('Native runner did not publish review request')
+                        self.assertEqual((store.get(task['id'])['state'],len(futures)),('running',1))
+                        self.assertFalse(futures[0].done())
+                        self.assertEqual(notices[0]['turn'],1)
+                        wire_before=[json.loads(line) for line in trace.read_text().splitlines()]
+                        self.assertFalse(any(e.get('method')=='session/cancel' for e in wire_before))
                         pending=c.handle(args)['task']
                         self.assertEqual((pending['state'],pending['intervention']['status']),('cancelling','pending'))
                         c.handle(args)
@@ -216,7 +233,75 @@ class NativeSharedTests(unittest.TestCase):
                         for future in futures:future.result(timeout=35)
                         c.handle({'action':'close','task_id':task['id']})
                         self.assertEqual(json.loads(control(store.get(task['id']),'status').stdout)['status'],'no-session')
-            print('NATIVE_INTERVENTION_EVIDENCE '+json.dumps(dict(turns=2,prompts=2,session_creations=1,duplicate_replayed=False,status='target_completed',closed=True,no_session=True,host='synthetic-native-adapter',model=False)))
+            print('NATIVE_INTERVENTION_EVIDENCE '+json.dumps(dict(turns=2,prompts=2,session_creations=1,review_before_cancel=True,duplicate_replayed=False,status='target_completed',closed=True,no_session=True,host='synthetic-native-adapter',model=False)))
+
+    def test_cli_and_omp_review_then_intentional_same_session_intervention(self):
+        import collab
+        from omp_bridge import HostBridge
+        from types import SimpleNamespace
+        fixture=pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'
+        evidence=[]
+        for surface in ('cli','omp'):
+            with self.subTest(surface=surface), tempfile.TemporaryDirectory(dir=pathlib.Path.home()/'.hermes/cache/scratch') as tmp:
+                work=pathlib.Path(tmp);home=work/'home';home.mkdir();trace=work/'wire.jsonl'
+                agent=shlex.join([sys.executable,'-B',str(fixture),str(trace),'intervention'])
+                def control(task,action,timeout=20):
+                    args=['acpx','--agent',agent,'--cwd',task['cwd'],'--format','json']
+                    if action=='new':args+=['sessions','new','--name',task['session']]
+                    elif action in ('close','show'):args+=['sessions',action,task['session']]
+                    else:args+=[action,'-s',task['session']]
+                    return subprocess.run(args,stdin=subprocess.DEVNULL,capture_output=True,timeout=timeout)
+                offset=[0];clock=SimpleNamespace(monotonic=lambda:time.monotonic()+offset[0])
+                futures=[]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    def launch(task):futures.append(pool.submit(run_task,work/'tasks.db',task['id']))
+                    c=(HostBridge if surface=='omp' else Collaboration)(work/'tasks.db',launch=launch,control=control)
+                    host=dict(session_id='synthetic-session',agent_id='synthetic-agent')
+                    client=c.bind(host) if surface=='omp' else c.connect('pi')['client_id']
+                    def call(action,**args):
+                        if surface=='omp':return c.handle(host,client,dict(action=action,**args))
+                        argv=['--db',str(c.store.path),'--client',client,action]
+                        for key,value in args.items():argv+=['--'+('task' if key=='task_id' else key.replace('_','-')),str(value)]
+                        responses=[]
+                        with patch.object(collab,'Collaboration',return_value=c), \
+                                patch.object(collab,'print',side_effect=lambda text, **kw: responses.append(text),create=True):
+                            rc=collab.main(argv)
+                        self.assertEqual(rc,0,responses)
+                        result=json.loads(responses[0])
+                        return {'task':result} if action in ('start','intervene','close') else result
+                    with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}),patch('acpx_backend.time',clock),contextlib.redirect_stdout(io.StringIO()):
+                        task=call('start',agent='omp',cwd=str(work),prompt='INITIAL_BLOCK')['task'];tid=task['id']
+                        try:
+                            until=time.monotonic()+25
+                            while time.monotonic()<until:
+                                if any(e['kind']=='stage' for e in c.events(client,tid)):break
+                                time.sleep(.05)
+                            else:self.fail('Synthetic initial prompt not active')
+                            offset[0]=601
+                            until=time.monotonic()+10
+                            while time.monotonic()<until:
+                                packet=call('wait',task_id=tid,timeout=0)
+                                if any(e.get('quiet_notice') for e in packet['events']):break
+                                time.sleep(.05)
+                            else:self.fail('Review not available to initiating owner')
+                            self.assertEqual(packet['task']['state'],'running')
+                            self.assertFalse(futures[0].done())
+                            call('intervene',task_id=tid,prompt='SYNTHETIC_REVISION',command_id='intentional')
+                            self.assertEqual(futures[0].result(timeout=35),0)
+                            record=c.store.get(tid)['acpx_record_id']
+                            call('wait',task_id=tid,timeout=0)
+                            self.assertEqual(futures[1].result(timeout=35),0)
+                            final=c.status(client,tid)
+                            self.assertEqual((final['state'],final['turn'],final['acpx_record_id']),('completed',2,record))
+                            wire=[json.loads(line) for line in trace.read_text().splitlines()]
+                            self.assertEqual(sum(e.get('method')=='session/prompt' for e in wire),2)
+                            evidence.append(dict(surface=surface,review_running=True,turns=2,model=False))
+                        finally:
+                            if c.status(client,tid)['state'] in ('running','queued','cancelling'):c.cancel(client,tid)
+                            for future in futures:future.result(timeout=35)
+                            self.assertEqual(call('close',task_id=tid)['task']['state'],'closed')
+                            self.assertEqual(json.loads(control(c.store.get(tid),'status').stdout)['status'],'no-session')
+        print('NATIVE_COORDINATOR_REVIEW_EVIDENCE '+json.dumps(evidence))
 
     def test_numbered_restatement_and_independent_questions_continue_same_session(self):
         fixture=pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'

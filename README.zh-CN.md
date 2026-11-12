@@ -96,7 +96,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" lis
 
 #### 阶段 B：真实只读协作（需要 ACPX 与已登录的目标 CLI）
 
-在**同一个 shell** 中继续（复用已赋值的 `CALL_CLI_HOME`、`CALL_CLI_DB` 和 `CLIENT_ID`），发起一次只读协作。此例不设执行总截止；有明确预算或 SLA 才加 `--timeout SECONDS`，下方有界 `wait` 只是短轮询，不是任务截止。
+在**同一个 shell** 中继续（复用已赋值的 CALL_CLI_HOME、CALL_CLI_DB 和 CLIENT_ID），发起一次只读协作。常规协作不设执行总截止，由发起 agent 先复核再决定等待、介入或取消；旧 CLI --timeout SECONDS 仅保留非常规显式硬预算能力，下方 wait 只是短轮询。
 
 ```sh
 # 检查执行设备上的 ACPX 版本
@@ -184,6 +184,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 - **如实结算业务结果：** 协议层 `end_turn` / exit `0` 不直接等于业务成功。对 AGY 任务，若任一工具调用状态为 `failed` 且最后一次工具事件后既无最终回答也无待答问题——或公开输出最后一个非空行恰为致命错误标记 `⚠ Agent execution terminated due to error.`——该轮如实结算为 `unknown` 并记录 `settlement_note`（不自动重放）。待答问题仍保留 `waiting_reply` 可正常回复（致命错误最终行优先覆盖）；工具失败后若恢复并输出最终回答则可正常完成。公开事件仅保留安全工具标识符、类别与状态；因当前公共 Shared Runtime 事件不暴露权限决策，`permission_diagnostics.permission_decisions` 统一记为 `unobservable`，不把工具失败臆测为权限拒绝。详见 [AGY 模型与审批工作流（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
 - **安全认证诊断：** 失败轮可识别精确 `error.detailCode: "AUTH_REQUIRED"`，或通过公开 `runtime.watchSession()` 做有界被动回放（1 秒／1000 条当前请求事件／10000 条总事件）。后者要求精确 host request、turn_started、唯一主 prompt RPC／response 及 failed turn_result，且结构字段 `error.code === -32000`、`data.authRequired === true` 同时成立。回调 ID 碰撞、重复、缺 journal 或超时均保持原因未知。只回流固定类别和来源标签；不匹配错误正文、不回流原消息／任意 data／adapter stderr，不扫描 AGY 日志，不改凭据或重放。
   已在安装的 ACPX 0.22.0 配合隔离合成 ACP 端点实测认证分类、普通错误不分类、正常结果不变、单次 prompt 与 close/no-session。通用 queue detailCode 本身不是认证证据；fatal-only executor HTTP 401 与认证生命周期仍未解决，也不证明 Hermes/Telegram 投递通过。
+- **先复核、再有意介入或取消：** Hermes/OMP 模型工具拒绝 timeout，包括旧缓存参数；这不是 shell 权限边界。公共 runner 在原循环每 600s 至多请求一次复核，静默与长期活跃共享冷却，持续活动不能推迟检查点；提醒不自动取消、关闭或续跑，也不要求逐条转给用户。发起 agent 据真实事件/成果决定下一步，通知入队不证明消费，CLI 依赖活跃 owner 轮询。原 CLI/Python 显式硬 timeout 与存量预算在受支持续轮清除前仍生效；reply/intervene 支持 clear_timeout（CLI --clear-timeout），queued 一律拒绝该清除、unknown 保留锁。多问/替换/撤回规则见 [调用手册](docs/usage.md)。启动、控制、连接有界，其中无预算轮保留 120s prompt 接受边界；不承诺多轮墙钟或费用上限。
 
 ### 2. 按任务固定传递技能（`skills.py`、`skill-stage.cjs`）
 

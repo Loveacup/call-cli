@@ -23,6 +23,28 @@ class HostBridgeTests(unittest.TestCase):
     def call(self, action, **args):
         return self.bridge.handle(self.a, self.key, dict(action=action, **args))
 
+    def test_model_limits_rejected_but_legacy_budget_can_be_cleared(self):
+        for value in (300, None):
+            with self.assertRaisesRegex(ValueError, 'timeout'):
+                self.call('start', prompt='inspect', cwd='/project', timeout=value)
+        self.assertEqual(self.call('list')['tasks'], [])
+        task = self.call('start', prompt='inspect', cwd='/project')['task']
+        tid = task['id']
+        self.bridge.store.update(tid, timeout=420, state='running')
+        self.bridge.store.event(tid, 'q1', 'question', 'Q1 format?')
+        with self.assertRaises(ValueError):
+            self.call('status', task_id=tid, timeout=300)
+        self.assertEqual(self.call('wait', task_id=tid, timeout=0)['task']['state'], 'running')
+        pending = self.call('intervene', task_id=tid, prompt='revise', command_id='clear', clear_timeout=True)['task']
+        self.assertEqual((pending['state'], pending['timeout']), ('cancelling', 420))
+        self.bridge.store.finish_turn(tid, 1, 'cancelled', 0, 'cancelled')
+        resumed = self.call('wait', task_id=tid, timeout=0)['task']
+        self.assertEqual((resumed['turn'], resumed['timeout']), (2, None))
+        self.bridge.store.update(tid, timeout=300, state='waiting_reply')
+        self.bridge.store.event(tid, 'q2', 'question', 'Q1 continue?')
+        replied = self.call('reply', task_id=tid, question_id='q2', prompt='yes', clear_timeout=True)['task']
+        self.assertEqual((replied['turn'], replied['timeout']), (3, None))
+
     def test_native_binding_rejects_other_session_and_model_origin(self):
         task = self.call('start', prompt='inspect', cwd='/project', agent='omp')['task']
         self.assertEqual(task['host_binding'], 'omp-extension')

@@ -8,7 +8,7 @@
 
 已实现的原生 launch 经 `ctx.dispatch_tool('terminal', ...)` 调用 background=true、notify=true、heartbeat=60；它捕获原会话，不代表实际 Telegram 投递已验。心跳按有新增输出合并，可能只有尾部；用数值 seq 读取完整公开事件，不从心跳尾文重构全程。oneshot、会话结束及宿主生命周期对通知的影响要另查，不能宣称离线唤醒或重启恢复。
 
-新任务未设 timeout 时，call-cli 的后台 terminal 调用省略该键；已核对的 Hermes 后台 spawn 路径没有执行总限时参数，不能用 0／Infinity 或巨大数冒充无限。显式 timeout（包括 300／420 秒）仍生效，terminal 传 T+180；这不是 wait 的轮询时限，也不保证到期已停写。该结论是源码契约，不证明宿主退出、其他版本或真实通知投递；能力不符时报告缺口，不改宿主或配置。启动／控制边界与静默提醒在公共 runner 中处理，不依赖 Hermes 专属调度。
+Hermes/OMP 模型工具均拒绝 timeout（含旧缓存字段），新任务的后台 terminal 省略执行总限时；CLI/Python 的原显式硬预算能力仍保留为非常规路径，不是权限边界。已有预算轮在 clear_timeout 生效前仍传 T+180，不能靠改 DB 撤回已派发进程计时器。reply/intervene 支持下一轮清除，queued 一律拒绝该清除；多问到最后一答才生效，中途介入替换答题序列时由介入自身 clear 选择决定。公共 runner 每 600s 至多发一条复核，静默与持续活跃共享冷却，无自动取消/关闭；发起 agent 核实后选择等待、介入或取消，不强制逐条告知用户。heartbeat/入队不等于已消费，真实回流单独验收；不增加 Hermes 专属调度。
 
 `reply` 使用原 question_id；多个问题全部记录后才续轮。`intervene` 必填稳定 command_id，采用取消旧轮、结算、同 session 续轮。Hermes status/events 会推进已授权的 pending 介入，可能启动新轮，不是纯查询；只读排查不要误触。unknown 不自动推进。续轮核对新 process/turn；旧 runner 完成不能代替新轮结算。
 

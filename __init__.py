@@ -33,7 +33,7 @@ SCHEMA={
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
         'after':{'type':'integer','default':0},
-        'timeout':{'type':'integer','minimum':30,'maximum':7200,'description':'Optional execution limit in seconds; omitted means no execution deadline; control/startup remain bounded'}
+        'clear_timeout':{'type':'boolean','description':'reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'}
     },'required':['action'],'additionalProperties':False}
 }
 
@@ -49,6 +49,12 @@ class Coordinator:
     def handle(self,args):
         if self.ctx.get_config('enabled',False) is not True:
             raise PermissionError('call-cli bridge is disabled')
+        if 'timeout' in args:
+            raise ValueError('call_cli does not accept timeout; omit it. Explicit execution budgets remain available through CLI/Python start.')
+        if set(args) - set(SCHEMA['parameters']['properties']):
+            raise ValueError('Unknown call_cli field')
+        if 'clear_timeout' in args and args.get('action') not in {'reply', 'intervene'}:
+            raise ValueError('clear_timeout requires reply or intervene')
         origin=capture_origin(self.get_env,self.ctx.profile_name)
         store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root)
         action=args['action']
@@ -65,11 +71,8 @@ class Coordinator:
             from .transport import command
             fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
-            timeout=args.get('timeout')
-            if timeout is not None and (type(timeout) is not int or not 30<=timeout<=7200):
-                raise ValueError('timeout must be omitted or 30..7200')
             task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'))
-            task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=timeout,
+            task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=None,
                               needs_session=True,acpx_created=False,session_creation_attempted=False,**fields)
             return self.launch(store,task)
         if action=='intervene':
@@ -77,7 +80,8 @@ class Coordinator:
             command_id=args.get('command_id','')
             if not prompt.strip():raise ValueError('intervene requires prompt')
             if not command_id:raise ValueError('intervene requires command_id')
-            task,launch=store.intervene(task['id'],origin,prompt,command_id=command_id,legacy_hermes=True)
+            task,launch=store.intervene(task['id'],origin,prompt,command_id=command_id,legacy_hermes=True,
+                                        clear_timeout=args.get('clear_timeout',False))
             if launch:return self.launch(store,task)
             status=task.get('intervention',{}).get('status','')
             note='Intervention pending cancellation settlement; use status or events to resume' if status=='pending' else f'Intervention status: {status or "none"}'
@@ -93,7 +97,8 @@ class Coordinator:
         if action=='reply':
             prompt=args.get('prompt','')
             if not prompt.strip():raise ValueError('reply requires prompt')
-            task=store.reply(task['id'],origin,args.get('question_id',''),prompt)
+            task=store.reply(task['id'],origin,args.get('question_id',''),prompt,
+                             clear_timeout=args.get('clear_timeout',False))
             if task['state']=='waiting_reply':
                 return {'task':self.public(task),'note':'Answer recorded; other pending questions remain'}
             return self.launch(store,task)

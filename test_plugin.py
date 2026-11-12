@@ -28,19 +28,30 @@ class Ctx:
 
 
 class HostTimeoutTests(unittest.TestCase):
-    def test_optional_deadline_preserves_cancellation_and_explicit_launch_bound(self):
+    def test_host_rejects_numeric_limits_but_preserves_legacy_continuations(self):
         mod = load_plugin()
         with tempfile.TemporaryDirectory() as d:
             env = {'HERMES_SESSION_ID':'s1', 'HERMES_SESSION_KEY':'key'}
             ctx = Ctx(); c = mod.Coordinator(ctx, Path(d), lambda k,x='':env.get(k,x))
+            for value in (30, None):
+                with self.assertRaises(ValueError):
+                    c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect','timeout':value})
+            self.assertFalse(hasattr(ctx, 'calls'))
+            self.assertEqual(c.handle({'action':'list'})['tasks'], [])
             task = c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect'})['task']
-            self.assertIsNone(task.get('timeout'))
             self.assertNotIn('timeout', ctx.called[1])
-            self.assertEqual(c.handle({'action':'cancel','task_id':task['id']})['task']['state'], 'cancelled')
-            bounded = c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect','timeout':30})['task']
-            self.assertEqual(bounded['timeout'], 30)
-            self.assertEqual(ctx.called[1]['timeout'], 210)
-            self.assertNotIn('default', mod.SCHEMA['parameters']['properties']['timeout'])
+            store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
+            store.update(task['id'], state='completed', timeout=300)
+            bounded = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue'})['task']
+            self.assertEqual((bounded['turn'], bounded['timeout'], ctx.called[1]['timeout']), (2, 300, 480))
+            with self.assertRaises(ValueError):
+                c.handle({'action':'intervene','task_id':task['id'],'prompt':'revise',
+                          'command_id':'unsafe','clear_timeout':True})
+            self.assertEqual(store.get(task['id'])['timeout'], 300)
+            store.update(task['id'], state='completed')
+            cleared = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue','clear_timeout':True})['task']
+            self.assertEqual((cleared['turn'], cleared['timeout']), (3, None))
+            self.assertNotIn('timeout', ctx.called[1])
 
 class PluginTests(unittest.TestCase):
     def test_launch_reuses_native_notification_route_without_model_supplied_origin(self):

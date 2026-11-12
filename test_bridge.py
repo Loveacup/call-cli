@@ -57,6 +57,62 @@ class StoreTests(unittest.TestCase):
         self.assertIn('JSON',final['prompt'])
         self.assertIn('Chinese',final['prompt'])
 
+    def test_clear_timeout_waits_for_last_answer_and_preserves_default_budget(self):
+        t = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+        self.store.update(t['id'], timeout=420)
+        self.store.event(t['id'], 'q1', 'question', 'Q1 format?')
+        self.store.event(t['id'], 'q2', 'question', 'Q2 language?')
+        partial = self.store.reply(t['id'], self.a, 'q1', 'JSON', clear_timeout=True)
+        self.assertEqual((partial['turn'], partial['timeout']), (1, 420))
+        final = self.store.reply(t['id'], self.a, 'q2', 'English')
+        self.assertEqual((final['turn'], final['timeout']), (2, None))
+        self.store.update(t['id'], state='completed', timeout=300)
+        inherited = self.store.reply(t['id'], self.a, '', 'continue')
+        self.assertEqual(inherited['timeout'], 300)
+
+    def test_intervention_clear_is_delayed_idempotent_and_withdrawable(self):
+        for withdraw in (False, True):
+            with self.subTest(withdraw=withdraw):
+                t = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+                self.store.update(t['id'], state='running', timeout=300)
+                pending, launch = self.store.intervene(t['id'], self.a, 'revise', 'c1', clear_timeout=True)
+                self.assertEqual((pending['state'], pending['timeout'], launch), ('cancelling', 300, False))
+                self.store.intervene(t['id'], self.a, 'revise', 'c1', clear_timeout=True)
+                with self.assertRaises(ValueError):
+                    self.store.intervene(t['id'], self.a, 'revise', 'c1')
+                if withdraw:
+                    self.store.request_cancel(t['id'], self.a)
+                self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled')
+                resumed, launch = self.store.advance_intervention(t['id'], self.a)
+                self.assertEqual((resumed['turn'], resumed['timeout'], launch),
+                                 (1, 300, False) if withdraw else (2, None, True))
+
+    def test_clear_rejects_all_queued_and_unknown_without_mutation(self):
+        for state, launch_turn in (('queued', 0), ('queued', 1), ('unknown', 1)):
+            with self.subTest(state=state, launch_turn=launch_turn):
+                t = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+                self.store.update(t['id'], timeout=420, state=state, launch_turn=launch_turn)
+                before = self.store.get(t['id'])
+                with self.assertRaises(ValueError):
+                    self.store.intervene(t['id'], self.a, 'revise', 'clear', clear_timeout=True)
+                self.assertEqual(self.store.get(t['id']), before)
+
+    def test_intervention_replaces_partial_reply_clear_choice(self):
+        for explicit_clear in (False, True):
+            with self.subTest(explicit_clear=explicit_clear):
+                t = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False)
+                self.store.update(t['id'], timeout=420)
+                self.store.event(t['id'], 'q1', 'question', 'Q1 format?')
+                self.store.event(t['id'], 'q2', 'question', 'Q2 language?')
+                self.store.reply(t['id'], self.a, 'q1', 'JSON', clear_timeout=True)
+                resumed, launch = self.store.intervene(t['id'], self.a, 'new instructions', 'c1',
+                                                       clear_timeout=explicit_clear)
+                expected = None if explicit_clear else 420
+                self.assertEqual((resumed['turn'], resumed['timeout'], launch), (2, expected, True))
+                self.store.update(t['id'], state='completed')
+                final = self.store.reply(t['id'], self.a, '', 'continue')
+                self.assertEqual(final['timeout'], expected)
+
     def test_cancel_and_close_claim_current_state_atomically(self):
         t=self.store.create(self.a,'local','omp','/race','write',True)
         self.store.update(t['id'],state='running')

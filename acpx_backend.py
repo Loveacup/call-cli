@@ -271,10 +271,10 @@ class AcpxBackend:
             startup_deadline = started_at+STARTUP_TIMEOUT if deadline is None else None
             startup_expired = False
             last_visible = started_at
-            quiet_notified = False
+            last_notice = started_at
             last_summary = 'No stage or tool status observed.'
             def consume(line):
-                nonlocal ended, last_visible, quiet_notified, last_summary
+                nonlocal ended, last_visible, last_summary
                 if line is None:
                     ended = True
                     return
@@ -291,7 +291,6 @@ class AcpxBackend:
                              or (public.get('type') == 'tool_call' and bool(decoded))))
                 if activity:
                     last_visible = time.monotonic()
-                    quiet_notified = False
                 for kind,text in decoded:
                     if kind in {'stage', 'tool'}:last_summary = text[:500]
                     emit(kind,text)
@@ -330,11 +329,19 @@ class AcpxBackend:
                     raise RuntimeError('Transport output observation failed; remote fate unknown')
                 if cancelling and time.monotonic()-stop_started>25:
                     raise RuntimeError('Cancel accepted but prompt has not settled')
-                if not cancelling and not quiet_notified and now-last_visible >= QUIET_NOTICE_SECONDS:
-                    emit('stage', 'No visible public events for '+str(QUIET_NOTICE_SECONDS)+'s; '
-                         'silence does not establish lack of progress or a hang. No cancellation requested. '
-                         'Last visible status: '+last_summary, quiet_notice=True)
-                    quiet_notified = True
+                if (not cancelling and current['state'] == 'running'
+                        and now-last_notice >= QUIET_NOTICE_SECONDS):
+                    with received_lock:
+                        receive()
+                        if not received_terminal and not reader_ended:
+                            notice_kind = 'quiet' if now-last_visible >= QUIET_NOTICE_SECONDS else 'checkpoint'
+                            emit('stage', 'Coordinator review requested ('+notice_kind+'); elapsed '
+                                 +str(int(now-started_at))+'s. Inspect this task and its events, then choose to '
+                                 'keep waiting, explicitly intervene, or cancel. Activity or silence alone does not '
+                                 'establish success or a hang. No cancellation or closure requested. '
+                                 'Last visible status: '+last_summary, quiet_notice=True,
+                                 notice_kind=notice_kind, elapsed=int(now-started_at))
+                            last_notice = now
                 try:consume(output.get(timeout=.25))
                 except queue.Empty:continue
             if received_terminal and not decoder.shared_result_seen:

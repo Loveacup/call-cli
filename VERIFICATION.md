@@ -258,3 +258,15 @@ node --check remote-client.cjs
 ```
 
 Unit tests use fake transports and do not require model credentials. Live verification requires existing authorized ACPX/CLI authentication and isolated workspaces; do not replay uncertain business tasks just to repeat a smoke test.
+
+## 2026-11-12: Coordinator-first timeout review
+
+Candidate source only; no installation, restart, production database access or real model run. Hermes/OMP model tools reject execution timeout; legacy CLI/Python explicit hard budgets remain unchanged. The existing runner loop shares one 600-second review cooldown for quiet and sustained-active turns; review events never automatically cancel, close or resume. Next-turn clear_timeout is covered for multi-question replies, replacement, command replay, withdrawal, conservative queued refusal and unknown reservation.
+
+- `python3 -B -m unittest discover -v`: 193 tests, 197.489s, OK (9 skipped). The skipped native shared tests were explicitly exercised separately below; live-model and native skill-transfer opt-ins were not enabled.
+- `node --test test_shared_prompt.cjs test_codex_ssh.cjs test_models.cjs test_skill_stage.cjs test_omp_extension.mjs`: 74 passed, no skips.
+- `RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest -v test_native_shared`: 6 passed, 85.783s, real installed ACPX/Shared Runtime with isolated HOME/DB and synthetic ACP agents, zero model calls. Hermes synthetic dispatch, CLI parser and OMP HostBridge each observed a running turn's review before intentional cancellation/intervention, same-session target completion and verified owned close/no-session. The old Hermes timeout-bearing start was changed to assert refusal and then start without a budget.
+- Deterministic RED/GREEN regressions cover active review despite recent public activity, shared quiet/checkpoint cooldown, cancellation committed before notice insertion and authoritative terminal parsing at the review boundary. Review insertion checks running state transactionally; terminal receipt and emission share the existing receive lock.
+- Independent read-only review identified the cancellation/terminal races and a threaded CLI-output capture hazard; these were corrected. Final review reported no remaining material findings. Reviewer did not run checks; the executions above were performed by the writer.
+
+Limits: synthetic host dispatch and followUp admission do not prove live host/model consumption, user-visible delivery or bounded reaction latency. CLI still needs an active polling owner. Legacy hard budgets may expire before a review, and shell callers can still explicitly set them. Cancel-and-resume is not steer or rollback; uncertain external writes retain reconciliation requirements. No deployment or cross-device acceptance is claimed.

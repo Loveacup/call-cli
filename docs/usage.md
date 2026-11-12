@@ -22,7 +22,8 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - `--agent` 取 `omp/codex/pi/agy`：是真正的执行目标；AGY 另传当前发现的 `--model`。
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
-- 新任务省略 `--timeout`（或传 `none`）默认不设执行总截止；需要限时才显式传秒数，旧任务的已存 timeout 不变。显式值仍用于 ACPX 每步／prompt 截止和 runner 的 T+90 取消保护，不是精确总墙钟或费用上限。连接与控制限时保留；无预算轮等待 prompt 接受最多 120s，超出请求取消并记 unknown、保留占用。正常运行期间每段连续 600s 没有可见公开事件只发一条 stage 提醒，有公开活动后重新计时；提醒不取消，也不证明无进展或挂死。随时可显式 cancel。
+- 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
+- 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
 
@@ -81,6 +82,10 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 同一次提交的重试复用同一个 command ID。`pending/queued` 仅证明提交，不证明改向生效。实现语义是：请求介入 → 原轮取消 → 确认原轮结算 → 同目标会话续轮 → 读取修订结果。继续短 `wait` 驱动和观察状态转换，不宣称无损热修改。
 
+清除误设/继承预算：reply/intervene 支持布尔 `clear_timeout`，CLI 对应 `--clear-timeout`；省略保留预算。reply 需等原轮结算，多个问题的清除选择暂存到最后一答推进新轮；中途 intervene 替换答题序列会丢弃该暂存选择，由介入自身的 clear 决定。running/cancelling 介入只记录下一轮清除，确认原轮结算后原子应用；撤回不改旧预算。所有 queued 清除保守拒绝（后台进程可能已捕获旧预算），可等待结算或显式取消后再介入；普通 queued 介入不变。unknown 仍拒绝续轮并保留锁。CLI/OMP reply 必须有真实未答 question_id，completed 无问题用 intervene；Hermes 保留无问题的 completed reply 能力。
+
+例如 `collab.py --client CLIENT_ID intervene --task TASK_ID --prompt '修订要求' --command-id STABLE_ID --clear-timeout`；这是有意取消结算后同 session 续轮，不是当前轮热修改。cancel 不等于 close，也不删除已有文件；半写入/外部副作用需要对账，不保证回滚。
+
 `commands[command_id].status` 跟踪该命令的精确 `target_turn`，`intervention.status` 同步最近一条命令：
 
 | 状态 | 框架能证明的事实 |
@@ -94,7 +99,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 | `superseded` | 领取前被同一 queued turn 的另一条修订替换，不归功于后来执行 |
 | `withdrawn` | 待执行介入被显式 cancel 或 close 撤回 |
 
-`target_completed` 不是业务目标达成或调整生效证明；协调者仍需评估回答、问题与产物。问题回复可继续同 session 的后续 turn，但不改变该命令的原 `target_turn`，也不重新提交它。同 task 的相同 command ID / 相同 prompt 在任意轮重试均不重派；同 ID / 不同 prompt 拒绝。旧轮或重复结算不能覆盖后继状态；已关闭历史记录不补写、不重放。这里仍是 cancel+resume，不是 steer，也不新增 queue 模式。
+`target_completed` 不是业务目标达成或调整生效证明；协调者仍需评估回答、问题与产物。问题回复可继续同 session 的后续 turn，但不改变该命令的原 target_turn，也不重新提交它。同 task 的相同 command ID、prompt 与 clear_timeout 重试均不重派；同 ID 不同参数拒绝（旧记录缺 clear 按 false）。旧轮或重复结算不能覆盖后继状态；已关闭历史不补写、不重放。这里仍是 cancel+resume，不是 steer，也不新增 queue 模式。
 
 显式 close 会撤回尚无目标轮的 pending 介入；若仍有目标轮的 queued/target_started 记录而任务已允许关闭，则记 target_unknown，不猜测其执行结果。关闭失败也不恢复续派授权。已结算命令保持原状态。
 

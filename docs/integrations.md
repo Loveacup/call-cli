@@ -79,7 +79,7 @@ hermes plugins doctor call-cli
 }
 ```
 
-上例无执行预算，省略 timeout；有明确 SLA 时可显式设置（如 300／420 秒），已有显式预算继续生效，与短轮询不同。保留真实返回的 `task.id` 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造这些来源字段。
+上例无执行预算；Hermes 模型工具拒绝 timeout，OMP 模型工具同样收口，旧缓存字段会明确报错。非常规显式硬预算仍可通过原 CLI/Python start 接口表达，shell 不受此 schema 约束；存量显式值在受支持续轮清除前继续生效。保留真实返回的 task.id 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造来源。
 
 原生工具支持 `start/list/status/events/reply/intervene/cancel/close`。运行期介入使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`；重试复用相同 ID。`pending/cancelling` 不是生效证明：先等旧轮结算，再调用 `status` 或 `events` 推进同 session 续轮；重复查询不重复启动，`unknown` 不续派。`cancel` 撤回待执行介入。通用 CLI 声明 `--runtime hermes` 不产生原生来源绑定或通知能力，两条路径不能混称同一次验收。
 
@@ -101,7 +101,7 @@ hermes plugins doctor call-cli
 
 每个短批次把 stage 合并为最新一条，连续相同 stage 文本不再唤醒；有变化的阶段仍可主动唤醒纠偏。问题、失败、完成在下一次成功读取时及时以官方 `sendMessage` follow-up 投递，工具状态等无业务变化不唤醒；不是 steer。回答片段合并到结算通知，游标依据实际读到并获宿主队列接纳的批次推进，不依据 stdout 尾号；队列接纳不等于模型已经理解或用户已经看到。同 session 的首次并发 start 共用一次 bind，不串行所有任务；reply/intervene 等重新激活跟踪后，旧读取结果按请求 revision 丢弃并由新读取补齐，不得覆盖新轮状态。intervene 仍是 core 的 cancel+resume，不是 OMP steer。
 
-静默提醒沿用 stage 事件并带固定 `quiet_notice: true`；这类事件不参与普通 stage 合并或同文去重，避免后来阶段把提醒吞掉。runner 每段连续静默只产出一条，公开活动后可开启下一段，不增加轮询器或取消行为。新任务省略 timeout 默认不设执行总截止，显式旧值继续透传；同一公共 runner 的启动／控制边界适用于所有现有执行 CLI。
+复核请求沿用 stage + quiet_notice:true，附 notice_kind（quiet/checkpoint）与 elapsed，并保留 turn/seq；这类事件绕过普通 stage 合并和同文去重。公共 runner 复用同一循环/600s 常量，静默与长期活跃共享冷却，每 600s 至多一条，活动不会推迟检查点；取消/结算后停止。发起方据真实状态选择等待、明确介入或取消，不自动终止/续跑，也不要求逐条转给用户。followUp 入队不证明已消费，CLI 依赖活跃 owner wait；退出后无介入/终止保证。reply/intervene 的 clear_timeout 只作用于受支持的下一轮，queued 保守拒绝，详见 usage 的清除契约。新宿主任务无硬预算，旧值不清除仍保留硬截止；启动/控制边界不变。
 
 session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递，不自动取消、关闭或改写业务状态。runner 复用现有 detached/DEVNULL 启动，one-shot bridge stdout 断开不影响 runner 输出或 Store 持久化。退出后任务可能自行完成，也可能保留 pending/unknown；不承诺离线回注、自动续轮或恢复，操作者需按精确任务对账。主动 cancel 是另一个明确动作，不能用宿主断连代替取消结算。
 

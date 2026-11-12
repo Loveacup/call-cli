@@ -12,7 +12,7 @@
 - 消费终态时先看 state：unknown 的 `answer_tail`／累计 answer 可保留工具前文字，仅是历史或部分结果对账线索，不代表完成。迟到的重复工具更新仍重置最终回答窗口（通知去重不等于忽略协议边界），其后无新回答或待答问题则保守 unknown；先对账适配器事件顺序，不凭旧回答改写终态。
 - 区分共享客户端断连与取消：`closeStream()`、`shutdown()` 或提交者进程退出不证明已接受工作停止。取消必须经原生控制并观察真实 turn 结算；输出观察/转发失败保留 unknown，不因本地客户端结束就释放写占用或重放业务。
 - 仅失败的 `turn.result.error.code === 'TIMEOUT'` 投影为 `timeout/turn_result_code`，`error.detailCode === 'AGENT_DISCONNECTED'` 投影为 `connection_lost/turn_result_detail`；只传固定类别与来源，不传错误正文或原始字段。认证优先保留 `AUTH_REQUIRED` 及同 requestId、单一 prompt 响应的 watch 关联，不能由通用 `QUEUE_RUNTIME_PROMPT_FAILED` 或耗时推断类别。
-- 这些诊断仍结算为 unknown 并保留占用；connection_lost 只证明运行时报告代理断连，根因未知。新任务默认省略 SDK 两处 timeoutMs，不设执行总截止；需要限时才显式指定，旧任务值不变。省略也会移除 SDK 启动／加载截止，因此公共 runner 单独限制未观察到 prompt 接受的等待为 120s（超界取消后仍 unknown），控制／连接保持有界。每段连续 600s 无可见公开事件只提醒一次，不取消或断言挂死。阶段先保存产物，外部写入后读回；结果不明先对账再决定授权续办，close 不等于 rollback，不盲重放。
+- 这些诊断仍结算为 unknown 并保留占用；connection_lost 只证明运行时报告断连，根因未知。新宿主任务不接受执行 timeout；CLI/Python 非常规硬预算和旧值继续传 SDK 两处 timeoutMs，不静默改为提醒。无预算轮仍有公共 runner 120s prompt 接受边界，控制/连接有界。原循环每 600s 至多请求一次协调者复核，静默/持续活跃共享冷却，不自动取消、关闭或续跑；发起 agent 先核实再决策，入队不证明消费。旧预算只能在受支持的下一轮显式清除，unknown 不绕锁。阶段先保存产物，外部写入后读回；结果不明先对账，close 不等于 rollback，不盲重放。
 - 用真实失败流的脱敏形状建立 RED，再验证真实调用组合。对同号回调问题，可用明确标注的合成 ACP endpoint 经实际 Node bootstrap、Shared Runtime/queue-owner 触发同号请求和真实读错误，同时覆盖真正 prompt error、运行中取消及每次后端 prompt 数量；不要 mock 掉正在验证的加载器、SDK 或排队层。合成端点使用隔离 HOME 和自有临时项目配置，防止原生 CLI 自动把真实全局认证注入测试进程；只记录认证是否成功，不记录值。再用新建真实模型会话验证文件内容、跨设备编码、同会话问答与关闭读回。真实模型跑通但未触发原反例，只是正向 smoke；合成 endpoint、原生传输和真实模型证据分别报告。不要把状态改写、人工添加方向或 mock 结果当修复。
 - `Internal error` 不能证明文件缺失。未核实目标端当时的文件状态或权限时，只写“读取回调失败”，不把推测固化为根因；当前文件存在也不能反证过去一定存在。
 - 安装与版本、登录与原生协议、受限 shell 和实际代码任务分层报告。Windows SSH 下 `0xC0000142` 不因包安装成功而消失；另一 CLI 的成功不算原 CLI 修好。不要关闭沙箱、改 ACL 或新增 daemon 来凑通过，超出原修复范围的变化先取得针对性授权。

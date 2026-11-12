@@ -212,8 +212,67 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     self.assertIsNone(decoder.error_category)
                     self.assertIsNone(decoder.error_source)
 
-    def test_quiet_unbudgeted_turn_notifies_once_per_episode_and_never_cancels(self):
-        self._timed_turn_scenario('quiet')
+    def test_review_checkpoints_share_quiet_cooldown_and_never_cancel(self):
+        self._timed_turn_scenario('review')
+
+    def test_cancel_committed_before_review_insertion_suppresses_notice(self):
+        import contextlib, io, json, time
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from bridge import Store
+        from runner import run_task
+        task = self.task('BLOCK')
+        self.store.update(task['id'], timeout=None)
+        now = [0.0]
+        original = Store.event
+        def cancel_before_notice(store, task_id, token, kind, text='', **metadata):
+            if metadata.get('quiet_notice'):
+                store.request_cancel(task_id, self.origin)
+            return original(store, task_id, token, kind, text, **metadata)
+        output = io.StringIO()
+        with patch('acpx_backend.time', SimpleNamespace(monotonic=lambda: now[0])), \
+                patch.object(Store, 'event', cancel_before_notice), contextlib.redirect_stdout(output), \
+                ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_task, self.store.path, task['id'])
+            try:
+                until = time.monotonic()+5
+                while not (self.root/'shared-options.jsonl').exists() and time.monotonic()<until:
+                    time.sleep(.02)
+                time.sleep(.35)
+                now[0] = 601
+                self.assertEqual(future.result(timeout=5), 0)
+            finally:
+                if not future.done():
+                    self.store.request_cancel(task['id'], self.origin)
+                    future.result(timeout=5)
+        self.assertEqual(self.store.get(task['id'])['state'], 'cancelled')
+        self.assertFalse(any(e.get('quiet_notice') for e in self.store.events(task['id'], self.origin)))
+        self.assertFalse(any(json.loads(line).get('quiet_notice') for line in output.getvalue().splitlines()))
+
+    def test_terminal_receipt_precedes_review_insertion(self):
+        import contextlib, io, json, threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from runner import run_task
+        task=self.task('normal task');self.store.update(task['id'],timeout=1000)
+        parsing=threading.Event();release=threading.Event();loads=json.loads;ticks=[0]
+        def parse(value,*args,**kwargs):
+            if threading.current_thread().name=='callcli-transport-reader' and 'callcli.shared.result' in value:
+                parsing.set();self.assertTrue(release.wait(3))
+            return loads(value,*args,**kwargs)
+        def clock():
+            ticks[0]+=1
+            if ticks[0]==1:return 0
+            self.assertTrue(parsing.wait(3))
+            if ticks[0]==2:threading.Timer(.2,release.set).start()
+            return 601
+        with patch('acpx_backend.json.loads',side_effect=parse), \
+                patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc=run_task(self.store.path,task['id'])
+        self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
+        self.assertFalse(any(e.get('quiet_notice') for e in self.store.events(task['id'],self.origin)))
 
     def test_unbudgeted_startup_is_bounded_without_claiming_runtime_timeout(self):
         self._timed_turn_scenario('startup')
@@ -584,7 +643,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 time.sleep(.02)
             self.fail('timed turn did not reach expected public state')
         def events():return self.store.events(task['id'], self.origin)
-        def reminders():return [e for e in events() if e['kind']=='stage' and 'No visible public events' in e['text']]
+        def reminders():return [e for e in events() if e.get('quiet_notice')]
         with patch('acpx_backend.time', SimpleNamespace(monotonic=lambda:now[0])), \
                 patch.dict(os.environ, {'ACPX_FAKE_NO_START':'1' if mode=='startup' else ''}), \
                 contextlib.redirect_stdout(output), ThreadPoolExecutor(max_workers=1) as pool:
@@ -592,18 +651,39 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             try:
                 wait_for(lambda:(self.root/'shared-options.jsonl').exists())
                 time.sleep(.35)
-                if mode=='quiet':
+                if mode=='review':
+                    now[0]=590
+                    (self.root/('activity-'+task['session'])).write_text('CALLCLI_STAGE active work\n')
+                    wait_for(lambda:any(e['text']=='active work' for e in events()))
                     now[0]=601
                     wait_for(lambda:len(reminders())==1)
-                    now[0]=1202;time.sleep(.35)
-                    self.assertEqual(len(reminders()),1)
+                    first = reminders()[0]
+                    self.assertEqual((first['notice_kind'], first['elapsed'], first['turn']),
+                                     ('checkpoint', 601, 1))
+                    self.assertIn('active work', first['text'])
                     self.assertEqual(self.store.get(task['id'])['state'],'running')
                     self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+                    now[0]=1191;time.sleep(.35)
+                    self.assertEqual(len(reminders()),1)
+                    now[0]=1202
+                    wait_for(lambda:len(reminders())==2)
+                    self.assertEqual(reminders()[1]['notice_kind'], 'quiet')
+                    self.assertFalse((self.root/('cancel-'+task['session'])).exists())
+                    now[0]=1210
                     (self.root/('activity-'+task['session'])).write_text('CALLCLI_STAGE resumed\n')
                     wait_for(lambda:any(e['text']=='resumed' for e in events()))
                     now[0]=1803
-                    wait_for(lambda:len(reminders())==2)
+                    wait_for(lambda:len(reminders())==3)
+                    self.assertEqual(reminders()[2]['notice_kind'], 'checkpoint')
+                    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+                    published = [e for e in frames if e.get('quiet_notice')]
+                    self.assertEqual([e['event_id'] for e in published], [e['token'] for e in reminders()])
+                    self.assertEqual([e['seq'] for e in published], [e['seq'] for e in reminders()])
+                    self.assertTrue(all(e['task_id']==task['id'] for e in published))
                     self.store.request_cancel(task['id'],self.origin)
+                    now[0]=2404
+                    time.sleep(.35)
+                    self.assertEqual(len(reminders()),3)
                 elif mode=='duplicate_tool':
                     trigger=self.root/('tool-'+task['session'])
                     trigger.touch()

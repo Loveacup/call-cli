@@ -144,6 +144,8 @@ class Store:
             task = json.loads(row[0])
             if metadata.get('turn',task['turn']) != task['turn']:
                 return False
+            if metadata.get('quiet_notice') and task['state'] != 'running':
+                return False
             if db.execute('SELECT 1 FROM events WHERE task=? AND token=?', (task_id, token)).fetchone():
                 return False
             if kind == 'question':
@@ -186,7 +188,9 @@ class Store:
                 self._save(db, task)
         return inserted.lastrowid
 
-    def reply(self, task_id, origin, question_id, prompt):
+    def reply(self, task_id, origin, question_id, prompt, *, clear_timeout=False, require_question=False):
+        if type(clear_timeout) is not bool:
+            raise ValueError('clear_timeout must be boolean')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
@@ -197,8 +201,12 @@ class Store:
                     or task.get('intervention', {}).get('status') == 'pending'):
                 raise ValueError('Previous turn is not settled or intervention is pending')
             questions = task.get('questions', [])
+            if require_question and (not question_id or question_id not in questions or not prompt.strip()):
+                raise ValueError('Reply requires an unanswered question_id in a settled turn')
             if questions and question_id not in questions:
                 raise ValueError('Reply must name the pending question_id')
+            if clear_timeout:
+                task['clear_timeout_pending'] = True
             if questions:
                 task.setdefault('answers', {})[question_id] = prompt
                 questions.remove(question_id)
@@ -210,6 +218,8 @@ class Store:
                 prompt = answers[0][1] if len(answers)==1 else '\n'.join(k+': '+v for k,v in answers)
             task.update(turn=task['turn']+1, prompt=prompt, state='queued', question_id='', process_id='')
             task.update(questions=[], answers={})
+            if task.pop('clear_timeout_pending', False):
+                task['timeout'] = None
             self._check_writers(db, task)
             self._save(db, task)
         return task
@@ -242,7 +252,9 @@ class Store:
             raise ValueError('Legacy session creation is unverified; intervention refused. Use a new start after reconciling the old task.')
         task.update(needs_session=True, acpx_created=False, session_creation_attempted=False)
 
-    def intervene(self, task_id, origin, prompt, command_id=None, *, legacy_hermes=False):
+    def intervene(self, task_id, origin, prompt, command_id=None, *, legacy_hermes=False, clear_timeout=False):
+        if type(clear_timeout) is not bool:
+            raise ValueError('clear_timeout must be boolean')
         if not prompt.strip():
             raise ValueError('Nonempty intervention required')
         command_id = command_id or str(uuid.uuid4())
@@ -252,18 +264,23 @@ class Store:
             task = self._owned(db, task_id, origin)
             commands = task.setdefault('commands', {})
             if command_id in commands:
-                if commands[command_id]['prompt'] != prompt:
-                    raise ValueError('command_id already used for a different prompt')
+                if (commands[command_id]['prompt'] != prompt or
+                        commands[command_id].get('clear_timeout', False) != clear_timeout):
+                    raise ValueError('command_id already used with different parameters')
                 return task, False
             if task.get('intervention', {}).get('status') == 'pending':
                 raise ValueError('Another intervention is pending; wait or cancel it first')
             if task['state'] not in {'queued', 'running', 'cancelling', 'cancelled', 'completed', 'waiting_reply'}:
                 raise ValueError('Task fate is not settled; intervention refused')
+            if task['state'] == 'queued' and clear_timeout:
+                # A queued turn may already have a native process with a captured deadline.
+                raise ValueError('Cannot clear timeout while queued; wait for settlement or cancel before continuing')
             if legacy_hermes:
                 self._prepare_legacy_hermes_session(db, task)
             if task['state'] == 'queued':
                 self._target_commands(task, 'superseded')
-            entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'], status='pending')
+            entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'],
+                         status='pending', clear_timeout=clear_timeout)
             commands[command_id] = entry
             task['intervention'] = entry
             if task['state'] == 'queued':
@@ -281,6 +298,9 @@ class Store:
     def _resume_intervention(self, db, task, entry):
         task.update(turn=task['turn']+1, state='queued', prompt=entry['prompt'],
                     process_id='', runner_pid=0, question_id='', questions=[], answers={})
+        task.pop('clear_timeout_pending', None)
+        if entry.get('clear_timeout', False):
+            task['timeout'] = None
         entry.update(status='queued', target_turn=task['turn'])
         task['commands'][entry['command_id']] = entry
         self._check_writers(db, task)
@@ -306,6 +326,7 @@ class Store:
             if entry.get('status') in {'pending', 'queued'}:
                 entry['status'] = 'withdrawn'
                 task['commands'][entry['command_id']] = entry
+            task.pop('clear_timeout_pending', None)
             if task['state']=='queued':task.update(state='cancelled',prompt='')
             elif task['state']=='running':task['state']='cancelling'
             self._save(db,task)
@@ -321,6 +342,7 @@ class Store:
             if entry.get('status') == 'pending':
                 entry['status'] = 'withdrawn'
                 task['commands'][entry['command_id']] = entry
+            task.pop('clear_timeout_pending', None)
             self._target_commands(task, 'target_unknown')
             task['state']='closing'
             self._check_writers(db,task)

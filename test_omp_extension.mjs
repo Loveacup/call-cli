@@ -20,6 +20,19 @@ function fixture(override) {
   return {adapter,ctx,sent,timers,calls,setPacket:p=>packet=p,switch:()=>{sid='host-b';adapter.detach();}};
 }
 
+test('model timeout is refused before binding and continuation clear remains available', async () => {
+  const f=fixture();
+  for(const timeout of [300,null]) {
+    await assert.rejects(f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect',timeout},f.ctx),/timeout/);
+  }
+  assert.deepEqual(f.calls,[]);
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
+  f.setPacket({task:{id:'task-a',state:'cancelling'},events:[]});
+  await f.adapter.execute({action:'intervene',task_id:'task-a',command_id:'clear',prompt:'revise',clear_timeout:true},f.ctx);
+  assert.equal(f.timers.length,1);
+  f.adapter.detach();
+});
+
 test('stage and question wake correct session once and never expose capability',async()=>{
   const f=fixture();
   await f.adapter.execute({action:'start',agent:'agy',model:'gemini-4-argon',cwd:'/work',prompt:'inspect'},f.ctx);
@@ -36,18 +49,19 @@ test('stage and question wake correct session once and never expose capability',
   assert.equal(f.calls.at(-1).args.after,7);
 });
 
-test('quiet reminders survive stage coalescing and identical later episodes', async () => {
+test('quiet and active review requests survive stage coalescing without automatic control', async () => {
   const f=fixture();
   await f.adapter.execute({action:'start',cwd:'/work',prompt:'inspect'},f.ctx);
-  for (const seq of [1,3]) {
+  for (const [seq,notice_kind] of [[1,'quiet'],[3,'checkpoint']]) {
     f.setPacket({task:{id:'task-a',state:'running'},events:[
-      {seq,kind:'stage',text:'No visible public events',quiet_notice:true},
+      {seq,kind:'stage',text:'Coordinator review requested',quiet_notice:true,notice_kind,elapsed:seq===1?600:1200,turn:1},
       {seq:seq+1,kind:'stage',text:'same status'}],after:seq+1});
     await f.timers.shift()();
   }
   const events=f.sent.flatMap(item=>JSON.parse(item.message.content).events);
-  assert.equal(events.filter(event=>event.quiet_notice).length,2);
-  assert.ok(!f.calls.some(call=>call.args?.action==='cancel'));
+  assert.deepEqual(events.filter(event=>event.quiet_notice).map(event=>event.notice_kind),['quiet','checkpoint']);
+  assert.ok(!f.calls.some(call=>['cancel','close','intervene'].includes(call.args?.action)));
+  assert.ok(f.sent.every(item=>item.options.triggerTurn===true));
 });
 
 test('session switch discards in-flight notification without canceling business',async()=>{

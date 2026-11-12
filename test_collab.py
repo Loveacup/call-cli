@@ -34,6 +34,29 @@ class CollaborationTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.c.start(client, prompt='inspect', cwd='/project', timeout=invalid)
 
+    def test_cli_clear_preserves_question_contract_and_next_turn_budget(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        client = self.c.connect('omp')['client_id']
+        task = self.c.start(client, prompt='inspect', cwd='/project', timeout=420)
+        tid = task['id']
+        self.c.store.event(tid, 'q1', 'question', 'Q1 format?')
+        self.c.store.event(tid, 'q2', 'question', 'Q2 language?')
+        output = StringIO()
+        with patch.object(collab, 'Collaboration', return_value=self.c), redirect_stdout(output):
+            rc = collab.main(['--db', str(self.db), '--client', client, 'reply',
+                              '--task', tid, '--question-id', 'q1', '--prompt', 'JSON', '--clear-timeout'])
+        self.assertEqual(rc, 0, output.getvalue())
+        self.assertEqual(json.loads(output.getvalue())['timeout'], 420)
+        resumed = self.c.reply(client, tid, 'q2', 'English')
+        self.assertEqual((resumed['turn'], resumed['timeout']), (2, None))
+        self.c.store.update(tid, state='completed')
+        with self.assertRaises(ValueError):
+            self.c.reply(client, tid, '', 'unprompted', clear_timeout=True)
+        revised = self.c.intervene(client, tid, 'new work', command_id='revision', clear_timeout=True)
+        self.assertEqual((revised['turn'], revised['timeout']), (3, None))
+
     def test_start_status_events_and_owner_isolation(self):
         a = self.c.connect('omp')['client_id']
         b = self.c.connect('pi')['client_id']
