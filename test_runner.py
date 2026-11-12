@@ -38,6 +38,17 @@ class RunnerBehaviorTests(unittest.TestCase):
 import sys,json,os,time,pathlib
 shared=pathlib.Path(sys.argv[0]).name=='node'
 payload=json.loads(sys.stdin.read()) if shared else None
+if shared and pathlib.Path(sys.argv[1]).name=='release-backend.cjs':
+    root=pathlib.Path(os.environ['ACPX_FAKE_ROOT'])
+    operation=sys.argv[2]
+    with (root/'calls.jsonl').open('a') as f:f.write(json.dumps([operation,'-s',payload['session']])+'\n')
+    if operation=='resolve':print(json.dumps({'acp':'fixture-acp'}));raise SystemExit(0)
+    if operation=='close':print(json.dumps({'verified':True}));raise SystemExit(0)
+    mode=os.environ.get('ACPX_STATUS_MODE','no-session')
+    if mode=='transport':raise SystemExit(255)
+    if mode=='malformed':print('not JSON no-session');raise SystemExit(0)
+    binding=dict(acpxRecordId=payload['record'],acpxSessionId=payload['acp'],session=payload['session'],agent=payload['agent'],cwd=payload['cwd'])
+    print(json.dumps(dict(verified=mode=='no-session',binding=binding,record=dict(closed=mode=='no-session',lastRequestId=payload.get('request_id',payload['task']+':'+str(payload['turn']))),status=mode,source='shared-runtime-exact-record-probe',arbitraryDetachedDescendantsProven=False)));raise SystemExit(0)
 args=['prompt','-s',payload['options']['sessionName']] if shared else sys.argv[1:]
 root=pathlib.Path(os.environ['ACPX_FAKE_ROOT'])
 if shared:
@@ -146,7 +157,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 frame.update(extra)
                 output = io.StringIO()
                 with patch.dict(os.environ, {'ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), contextlib.redirect_stdout(output):
-                    run_task(self.store.path, task['id'])
+                    __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 result = self.store.get(task['id'])
                 self.assertEqual(result['state'], 'completed' if frame['status']=='completed' else 'unknown')
                 note = result.get('settlement_note') or ''
@@ -181,7 +192,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 frame = dict(status='failed', stopReason=None, errorCategory=category, errorSource=source, message='PRIVATE_MESSAGE')
                 output = io.StringIO()
                 with patch.dict(os.environ, {'ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), contextlib.redirect_stdout(output):
-                    run_task(self.store.path, task['id'])
+                    __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 result = self.store.get(task['id'])
                 self.assertEqual(result['state'], 'unknown')
                 note = result.get('settlement_note') or ''
@@ -234,7 +245,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch('acpx_backend.time', SimpleNamespace(monotonic=lambda: now[0])), \
                 patch.object(Store, 'event', cancel_before_notice), contextlib.redirect_stdout(output), \
                 ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(run_task, self.store.path, task['id'])
+            future = pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, task['id'])
             try:
                 until = time.monotonic()+5
                 while not (self.root/'shared-options.jsonl').exists() and time.monotonic()<until:
@@ -270,7 +281,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch('acpx_backend.json.loads',side_effect=parse), \
                 patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
                 contextlib.redirect_stdout(io.StringIO()):
-            rc=run_task(self.store.path,task['id'])
+            rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
         self.assertFalse(any(e.get('quiet_notice') for e in self.store.events(task['id'],self.origin)))
 
@@ -319,7 +330,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 patch('acpx_backend.time',SimpleNamespace(monotonic=lambda:now[0])), \
                 patch.object(backend,'control',side_effect=cancel_control), \
                 contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=1) as pool:
-            future=pool.submit(run_task,self.store.path,task['id'])
+            future=pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, task['id'])
             try:
                 until=time.monotonic()+3
                 while not marker.exists() and time.monotonic()<until:time.sleep(.01)
@@ -370,7 +381,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         if diagnostic:env['ACPX_FAKE_RESULT_FRAME']=json.dumps(dict(status='failed',stopReason=None,errorCategory=diagnostic[0],errorSource=diagnostic[1]))
         with patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), patch('acpx_backend.queue.Queue',ObservedQueue), \
                 patch.dict(os.environ,env),contextlib.redirect_stdout(io.StringIO()):
-            rc=run_task(self.store.path,task['id'])
+            rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         self.assertFalse((self.root/('cancel-'+task['session'])).exists(),'received fact lost to deadline decision')
         result=self.store.get(task['id']);note=result.get('settlement_note') or ''
         self.assertEqual((result['state'],rc),('unknown',1) if diagnostic else ('completed',0))
@@ -398,7 +409,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         frame=dict(status='failed',stopReason=None,errorCategory='connection_lost',errorSource='turn_result_detail')
         with patch('acpx_backend.time',SimpleNamespace(monotonic=clock)),patch.object(backend,'control',side_effect=cancel), \
                 patch.dict(os.environ,{'ACPX_FAKE_NO_START':'1','ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), \
-                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+                contextlib.redirect_stdout(io.StringIO()):rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         result=self.store.get(task['id'])
         self.assertEqual((result['state'],rc),('unknown',1))
         self.assertIn('runtime-reported agent connection loss',result['settlement_note'])
@@ -418,7 +429,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     return b'{}\n'
                 return super().get_nowait()
         with patch('acpx_backend.queue.Queue',BackloggedQueue),contextlib.redirect_stdout(io.StringIO()):
-            run_task(self.store.path,task['id'])
+            __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         self.assertTrue((self.root/('cancel-'+task['session'])).exists())
         self.assertLess(drains[0],10000,'unbounded output drain postponed supervision until producer stopped')
 
@@ -441,7 +452,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 threading.Timer(.1,release.set).start()
             return 121
         with patch('acpx_backend.json.loads',side_effect=parse),patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
-                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+                contextlib.redirect_stdout(io.StringIO()):rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
         self.assertFalse((self.root/('cancel-'+task['session'])).exists())
 
@@ -484,7 +495,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch('acpx_backend.threading',transport_threads),patch('acpx_backend.time',SimpleNamespace(monotonic=clock)), \
                 patch('acpx_backend.queue.Queue',ObservedQueue),patch.object(backend,'control',side_effect=cancel), \
                 patch.dict(os.environ,{'ACPX_FAKE_NO_START':'1','ACPX_FAKE_RESULT_FRAME':json.dumps(frame)}), \
-                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+                contextlib.redirect_stdout(io.StringIO()):rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         result=self.store.get(task['id'])
         self.assertEqual((result['state'],rc),('unknown',1))
         self.assertIn('runtime-reported agent connection loss',result['settlement_note'])
@@ -508,7 +519,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             return 0 if ticks[0]==1 else 121
         with patch('acpx_backend.subprocess.Popen',side_effect=launch), \
                 patch('acpx_backend.time',SimpleNamespace(monotonic=clock)),contextlib.redirect_stdout(io.StringIO()):
-            rc=run_task(self.store.path,task['id'])
+            rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         self.assertEqual((self.store.get(task['id'])['state'],rc),('completed',0))
 
     def test_descendant_held_pipes_do_not_block_cancel_failure_cleanup(self):
@@ -550,7 +561,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch.object(backend,'control',side_effect=cancel), \
                 patch('acpx_backend.TRANSPORT_CLEANUP_TIMEOUT',.3,create=True), \
                 contextlib.redirect_stdout(io.StringIO()),ThreadPoolExecutor(max_workers=1) as pool:
-            future=pool.submit(run_task,self.store.path,task['id'])
+            future=pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, task['id'])
             try:
                 until=time.monotonic()+3
                 while not marker.exists() and time.monotonic()<until:time.sleep(.01)
@@ -588,7 +599,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch.object(Store,'event',slow),patch('acpx_backend.TRANSPORT_CLEANUP_TIMEOUT',.02), \
                 patch.dict(os.environ,{'ACPX_FAKE_RESULT_FRAME':json.dumps(frame),
                                      'ACPX_FAKE_CHUNKS':json.dumps(['CALLCLI_STAGE row'+str(n)+'\n' for n in range(400)])}), \
-                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+                contextlib.redirect_stdout(io.StringIO()):rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         result=self.store.get(task['id'])
         self.assertEqual((result['state'],rc),('unknown',1))
         self.assertIn('runtime-reported agent connection loss',result.get('settlement_note') or '')
@@ -613,7 +624,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         if questions:tail+=['CALLCLI_QUESTION Q1 First choice?\n','CALLCLI_QUESTION Q2 Second choice?\n']
         chunks=['CALLCLI_STAGE row'+str(n)+'\n' for n in range(400)]+tail
         with patch.object(Store,'event',slow),patch.dict(os.environ,{'ACPX_FAKE_CHUNKS':json.dumps(chunks)}), \
-                contextlib.redirect_stdout(io.StringIO()):rc=run_task(self.store.path,task['id'])
+                contextlib.redirect_stdout(io.StringIO()):rc=__import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         result=self.store.get(task['id']);events=self.store.events(task['id'],self.origin)
         self.assertEqual((result['state'],rc),('waiting_reply',0) if questions else ('completed',0))
         self.assertFalse(result.get('settlement_note'))
@@ -647,7 +658,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with patch('acpx_backend.time', SimpleNamespace(monotonic=lambda:now[0])), \
                 patch.dict(os.environ, {'ACPX_FAKE_NO_START':'1' if mode=='startup' else ''}), \
                 contextlib.redirect_stdout(output), ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(run_task, self.store.path, task['id'])
+            future = pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, task['id'])
             try:
                 wait_for(lambda:(self.root/'shared-options.jsonl').exists())
                 time.sleep(.35)
@@ -734,7 +745,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         output = io.StringIO()
         with patch.object(backend_for('omp'), 'run', cancelled), \
                 patch.object(Store, 'finish_turn', advance_after_commit), contextlib.redirect_stdout(output):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         self.assertEqual([(e['turn'], e['kind']) for e in observed], [(1, 'started'), (1, 'cancelled')])
         frames = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual([f['event'] for f in frames], ['cancelled'])
@@ -747,7 +758,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         with self.assertRaises(ValueError):
             self.store.reply(task['id'], self.origin, '', 'bypass')
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         resumed_events = self.store.events(task['id'], self.origin, terminal['seq'])
         self.assertTrue(all(e['turn'] == 2 for e in resumed_events))
         self.assertEqual([e['text'] for e in resumed_events if e['kind'] == 'answer'], ['FAKE_ANSWER'])
@@ -777,7 +788,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     return TurnResult(outcome, 0 if outcome == 'cancelled' else 1,
                                       'cancelled' if outcome == 'cancelled' else None)
                 with patch.object(backend_for('omp'), 'run', target), contextlib.redirect_stdout(io.StringIO()):
-                    run_task(self.store.path, task['id'])
+                    __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 final, launch = self.store.intervene(task['id'], self.origin, 'adjust', 'stable')
                 self.assertFalse(launch)
                 self.assertEqual(final['turn'], 1)
@@ -802,7 +813,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             self.assertFalse(self.store.intervene(task['id'], self.origin, 'first', 'one')[1])
             return TurnResult('cancelled', 0, 'cancelled')
         with patch.object(backend_for('omp'), 'run', revise_again), contextlib.redirect_stdout(io.StringIO()):
-            run_task(self.store.path, task['id'])
+            __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         final = self.store.get(task['id'])
         self.assertEqual(final['commands']['one']['status'], 'target_cancelled')
         self.assertEqual(final['commands']['two']['status'], 'pending')
@@ -810,7 +821,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         self.assertTrue(launch)
         self.assertEqual((resumed['turn'], resumed['session']), (2, task['session']))
         with patch.object(backend_for('omp'), 'run', revise_again), contextlib.redirect_stdout(io.StringIO()):
-            run_task(self.store.path, task['id'])
+            __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
         final = self.store.get(task['id'])
         self.assertEqual(final['commands']['one']['status'], 'target_cancelled')
         self.assertEqual(final['commands']['two']['status'], 'target_completed')
@@ -822,7 +833,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         task = self.task('initial')
         self.store.intervene(task['id'], self.origin, 'ASK', 'stable')
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         first = self.store.get(task['id'])
         self.assertEqual((first['state'], first['commands']['stable']['status']),
                          ('waiting_reply', 'target_completed'))
@@ -833,7 +844,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             self.assertFalse(launch)
             self.assertEqual((replay['turn'], replay['prompt']), (resumed['turn'], answer))
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(run_task(self.store.path, task['id']), 0)
+                self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         final = self.store.get(task['id'])
         self.assertEqual((final['turn'], final['state'], final['session']), (3, 'completed', task['session']))
         self.assertEqual((final['commands']['stable']['target_turn'], final['intervention']['status']),
@@ -857,7 +868,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     return TurnResult('cancelled', 0, 'cancelled')
                 output = io.StringIO()
                 with patch.object(backend_for('omp'), 'run', already_settled), contextlib.redirect_stdout(output):
-                    self.assertEqual(run_task(self.store.path, task['id']), 1 if raises else 0)
+                    self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 1 if raises else 0)
                 self.assertEqual(output.getvalue(), '')
                 self.assertEqual(self.store.get(task['id'])['state'], 'completed')
                 self.assertEqual([e['kind'] for e in self.store.events(task['id'], self.origin)],
@@ -876,7 +887,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             return settled
         output = io.StringIO()
         with patch.object(Store, 'finish_turn', close_after_settlement), contextlib.redirect_stdout(output):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         self.assertEqual(self.store.get(task['id'])['state'], 'closing')
         terminal = json.loads(output.getvalue().splitlines()[-1])
         self.assertEqual(terminal['event'], 'completed')
@@ -890,7 +901,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         tool = {'toolCallId':'read1','title':'read_file','kind':'read','status':'in_progress'}
         output = io.StringIO()
         with patch.dict(os.environ, {'ACPX_FAKE_TOOLS':json.dumps([tool, tool, dict(tool,status='completed')])}), contextlib.redirect_stdout(output):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         frames = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertTrue(any(f['event']=='tool' and 'read_file' in f['text'] for f in frames))
         for frame in frames:
@@ -904,7 +915,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         self.store.reply(task['id'], self.origin, question['event_id'], 'normal task')
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         resumed = self.store.events(task['id'], self.origin, cursor)
         self.assertTrue(all(e['turn']==2 for e in resumed))
         self.assertEqual([e['text'] for e in resumed if e['kind']=='answer'], ['FAKE_ANSWER'])
@@ -915,7 +926,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         import json
         from runner import run_task
         t = self.task('normal task')
-        self.assertEqual(run_task(self.store.path, t['id']), 0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']), 0)
         captured = self.root / 'shared-options.jsonl'
         self.assertTrue(captured.exists(), 'Prompt still used lossy raw CLI output')
         options = json.loads(captured.read_text().splitlines()[0])
@@ -931,11 +942,11 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         from runner import run_task
         t = self.task('ASK')
         self.store.update(t['id'], version_check={'installed': '0.20.0', 'latest': '0.20.0'})
-        self.assertEqual(run_task(self.store.path, t['id']), 0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']), 0)
         state = self.store.get(t['id'])
         self.store.reply(t['id'], self.origin, state['question_id'], 'JSON please')
         with patch.dict(os.environ, {'ACPX_FAKE_VERSION': '0.20.1'}):
-            self.assertEqual(run_task(self.store.path, t['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']), 0)
         frames = [json.loads(x) for x in (self.root / 'shared-options.jsonl').read_text().splitlines()]
         self.assertEqual(frames[1]['expectedVersion'], '0.20.1')
         self.assertEqual(frames[1]['sessionId'], frames[0]['sessionId'])
@@ -946,7 +957,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         from runner import run_task
         t=self.task('revised task')
         self.store.update(t['id'],turn=2,needs_session=True,acpx_created=False)
-        self.assertEqual(run_task(self.store.path,t['id']),0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']),0)
         calls=[__import__('json').loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
         self.assertEqual(sum('new' in c for c in calls),1)
         self.assertTrue(self.store.get(t['id'])['acpx_created'])
@@ -958,10 +969,10 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         t = self.task('ASK')
         self.store.update(t['id'], turn=2, needs_session=True, acpx_created=False)
         with patch('updates.ensure_current', return_value={'decision':'current'}) as check:
-            self.assertEqual(run_task(self.store.path, t['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']), 0)
             state = self.store.get(t['id'])
             self.store.reply(t['id'], self.origin, state['question_id'], 'continue')
-            self.assertEqual(run_task(self.store.path, t['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']), 0)
             self.assertEqual(check.call_count, 1)
 
     def test_stage_only_turn_is_unknown_for_every_supported_cli(self):
@@ -976,7 +987,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps([
                         'CALLCLI_STA', 'GE checking version and protocol support'])}), \
                         contextlib.redirect_stdout(io.StringIO()):
-                    rc = run_task(self.store.path, task['id'])
+                    rc = __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 result = self.store.get(task['id'], self.origin)
                 events = self.store.events(task['id'], self.origin)
                 self.assertEqual((result['state'], rc, result['exit_code'], result['stop_reason']),
@@ -990,7 +1001,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     self.store.create(self.origin, 'local', agent, str(self.root), 'conflict', True)
                 before = (self.root/'calls.jsonl').read_text()
                 with self.assertRaises(ValueError):
-                    run_task(self.store.path, task['id'])
+                    __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 self.assertEqual((self.root/'calls.jsonl').read_text(), before)
                 # Release only this synthetic reservation before the next case.
                 self.store.update(task['id'], write=False)
@@ -1024,7 +1035,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     self.store.update(task['id'], agent=agent)
                     with patch.dict(os.environ, dict(extra, ACPX_FAKE_CHUNKS=json.dumps(chunks))), \
                             contextlib.redirect_stdout(io.StringIO()):
-                        rc = run_task(self.store.path, task['id'])
+                        rc = __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                     result = self.store.get(task['id'], self.origin)
                     self.assertEqual((result['state'], rc), (expected, code))
                     events = self.store.events(task['id'], self.origin)
@@ -1041,19 +1052,19 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
     def test_real_runner_rejects_empty_exit_zero_and_does_not_replay(self):
         from runner import run_task
         t=self.task('EMPTY')
-        self.assertEqual(run_task(self.store.path,t['id']),1)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']),1)
         self.assertEqual(self.store.get(t['id'])['state'],'unknown')
         before=(self.root/'calls.jsonl').read_text()
-        with self.assertRaises(ValueError):run_task(self.store.path,t['id'])
+        with self.assertRaises(ValueError):__import__('test_dispatch').run_dispatched(self.store.path, t['id'])
         self.assertEqual((self.root/'calls.jsonl').read_text(),before)
 
     def test_question_then_answer_runs_same_session_in_distinct_turns(self):
         from runner import run_task
         t=self.task('ASK')
-        self.assertEqual(run_task(self.store.path,t['id']),0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']),0)
         state=self.store.get(t['id']);self.assertEqual(state['state'],'waiting_reply')
         reply=self.store.reply(t['id'],self.origin,state['question_id'],'JSON please')
-        self.assertEqual(run_task(self.store.path,t['id']),0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, t['id']),0)
         self.assertEqual(self.store.get(t['id'])['state'],'completed')
         self.assertEqual(reply['session'],t['session'])
         calls=[__import__('json').loads(l) for l in (self.root/'calls.jsonl').read_text().splitlines()]
@@ -1068,7 +1079,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         chunk = ('EARLY_RESULT\nCALLCLI_QUESTION Q1 Format?\n'
                  'CALLCLI_QUESTION Q1 Format, JSON or CSV?\nLATE_RESULT\n')
         with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps([chunk])}), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         result = self.store.get(task['id'])
         events = self.store.events(task['id'], self.origin)
         self.assertEqual([e['text'] for e in events if e['kind']=='answer'], ['EARLY_RESULT', 'LATE_RESULT'])
@@ -1080,7 +1091,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         self.assertEqual((first['turn'], first['state']), (1, 'waiting_reply'))
         self.store.reply(task['id'], self.origin, questions[1]['token'], 'CSV')
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         final = self.store.get(task['id'])
         self.assertEqual((final['state'], final['session'], final['acpx_record_id']),
                          ('completed', task['session'], result['acpx_record_id']))
@@ -1095,7 +1106,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 lines = ['CALLCLI_QUESTION Q1 '+'x'*7997+suffix+'\n' for suffix in suffixes]
                 output = io.StringIO()
                 with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps(lines)}), contextlib.redirect_stdout(output):
-                    self.assertEqual(run_task(self.store.path, task['id']), 0)
+                    self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
                 questions = [e for e in self.store.events(task['id'], self.origin) if e['kind']=='question']
                 self.assertEqual(len(questions), expected)
                 self.assertTrue(all(len(e['text']) == 8000 for e in questions))
@@ -1111,7 +1122,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         task = self.task('normal task')
         chunks = ['CALLCLI_QUESTION Q1 ', 'x'*40000, 'x'*40000, 'A\n']*2+['LATE_RESULT\n']
         with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps(chunks)}), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(run_task(self.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, task['id']), 0)
         events = self.store.events(task['id'], self.origin)
         questions = [e for e in events if e['kind']=='question']
         self.assertEqual(len(questions), 2)
@@ -1128,7 +1139,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         t = self.store.create(self.origin, 'local', agent, str(self.root), 'normal task', False)
         t = self.store.update(t['id'], shell='posix', timeout=30)
         with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS': json.dumps(chunks)}):
-            rc = run_task(self.store.path, t['id'])
+            rc = __import__('test_dispatch').run_dispatched(self.store.path, t['id'])
         return rc, self.store.get(t['id']), self.store.events(t['id'], self.origin)
 
     def assert_agy_fatal_not_completed(self, chunks):
@@ -1148,7 +1159,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         # Not replayable: the settled turn cannot be claimed again.
         before = (self.root / 'calls.jsonl').read_text()
         with self.assertRaises(ValueError):
-            run_task(self.store.path, state['id'])
+            __import__('test_dispatch').run_dispatched(self.store.path, state['id'])
         self.assertEqual((self.root / 'calls.jsonl').read_text(), before)
         # Unknown fate refuses same-session continuation but still allows owned close.
         with self.assertRaises(ValueError):
@@ -1205,7 +1216,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 self.assertTrue(any('run_command' in text and 'execute' in text and 'failed' in text for text in tools))
                 self.assertNotIn('PRIVATE', json.dumps(events))
                 with self.assertRaises(ValueError):
-                    run_task(self.store.path, state['id'])
+                    __import__('test_dispatch').run_dispatched(self.store.path, state['id'])
 
     def test_agy_transport_failure_keeps_direct_failure_explanation(self):
         import os, json
@@ -1257,7 +1268,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             rc, state, _ = self.run_agy(['CALLCLI_QUESTION Which file should I read?\n'])
         self.assertEqual((rc, state['state']), (0, 'waiting_reply'))
         self.store.reply(state['id'], self.origin, state['question_id'], 'Use the supplied answer instead')
-        self.assertEqual(run_task(self.store.path, state['id']), 0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(self.store.path, state['id']), 0)
         self.assertEqual(self.store.get(state['id'])['state'], 'completed')
 
 
@@ -1266,7 +1277,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
         from runner import run_task
         a=self.task('BLOCK');b=self.task('BLOCK')
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            fa=pool.submit(run_task,self.store.path,a['id']);fb=pool.submit(run_task,self.store.path,b['id'])
+            fa=pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, a['id']);fb=pool.submit(__import__('test_dispatch').run_dispatched, self.store.path, b['id'])
             deadline=time.monotonic()+5
             while time.monotonic()<deadline:
                 if (self.root/'calls.jsonl').exists() and (self.root/'calls.jsonl').read_text().count('prompt')>=2:break

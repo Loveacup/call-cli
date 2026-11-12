@@ -182,6 +182,9 @@ class AcpxBackend:
             self.pre_prompt(store, task, emit)
             task = stage(store, task, emit)
             argv, payload, request_id = self.transport(task)
+            # Preserve the last attempted provider request across admitted but
+            # pre-provider-cancelled successor turns. Uncertain submission stays HOLD.
+            store.update(task_id, backend_request_id=request_id)
             started_at = time.monotonic()
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             output = queue.Queue()

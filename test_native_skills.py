@@ -40,7 +40,7 @@ class NativeSkillTests(unittest.TestCase):
             with patch.dict(os.environ, {'HOME': str(home)}), patch('acpx_backend.AcpxBackend.control', side_effect=control), patch('updates.ensure_current', return_value={'decision': 'existing-integration-install'}):
                 try:
                     with contextlib.redirect_stdout(io.StringIO()):
-                        rc = run_task(c.store.path, task['id'])
+                        rc = __import__('test_dispatch').run_dispatched(c.store.path, task['id'])
                     if rc:
                         evidence = evidence_root
                         evidence.mkdir(exist_ok=True)
@@ -52,7 +52,7 @@ class NativeSkillTests(unittest.TestCase):
                     (skill/'references/value.txt').write_text('MUST_NOT_REACH_CONTINUATION')
                     c.intervene(client, task['id'], 'Read the same resources again', command_id='continuation')
                     with contextlib.redirect_stdout(io.StringIO()):
-                        self.assertEqual(run_task(c.store.path, task['id']), 0)
+                        self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']), 0)
                     final = c.status(client, task['id'])
                     self.assertEqual(final['acpx_record_id'], first['acpx_record_id'])
                     for turn in ['1', '2']:

@@ -45,12 +45,15 @@ class Collaboration:
         import subprocess
         import sys
         return subprocess.Popen([sys.executable, str(Path(__file__).with_name('runner.py')),
-                                 '--db', str(self.store.path), '--task', task['id']],
+                                 '--db', str(self.store.path), '--task', task['id'],
+                                 '--turn', str(task['turn']), '--launch-id', task['launch_id'],
+                                 '--epoch', str(task.get('control_epoch', 1))],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, close_fds=True,
                                 start_new_session=True)
 
     def _dispatch(self, task):
+        task = self.store.claim_launch(task['id'], task['turn'], task.get('control_epoch', 1))
         try:
             self.launch(task)
         except Exception as exc:
@@ -86,14 +89,19 @@ class Collaboration:
         if not path_type(cwd).is_absolute():
             raise ValueError('cwd must be absolute on the execution device; disable shell path conversion')
         task = self.store.create(origin, device, agent, cwd, prompt, write, resource,
-                                 device_key=device_identity(device), skills=skills)
+                                 device_key=device_identity(device), skills=skills,
+                                 initiating_surface='omp-extension' if origin.profile == 'omp-extension' else 'standalone')
         task = self.store.update(task['id'], shell=remote_shell, timeout=timeout,
                                  needs_session=True, acpx_created=False, session_creation_attempted=False, **fields)
         self._dispatch(task)
         return self.status(client, task['id'])
 
     def status(self, client, task_id):
-        return self.store.get(task_id, self.origin(client))
+        origin = self.origin(client)
+        task = self.store.get(task_id, origin)
+        from recovery import recovery_card
+        host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
+        return dict(task, recovery=recovery_card(task, self.store.path, host=host))
 
     def events(self, client, task_id, after=0):
         return self.store.events(task_id, self.origin(client), after)
@@ -101,17 +109,20 @@ class Collaboration:
     def list(self, client):
         return self.store.list(self.origin(client))
 
-    def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False):
+    def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False, expected_turn=None):
         task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id,
-                                           clear_timeout=clear_timeout)
+                                           clear_timeout=clear_timeout, expected_turn=expected_turn)
         if launch:
             self._dispatch(task)
         return self.status(client, task_id)
 
     def _advance(self, client, task_id):
         task, launch = self.store.advance_intervention(task_id, self.origin(client))
-        if launch:
-            self._dispatch(task)
+        if launch or (task['state'] == 'queued' and task.get('launch_turn') != task['turn']):
+            try:
+                self._dispatch(task)
+            except ValueError:
+                pass  # Another bounded poll may have claimed this exact turn.
         return self.status(client, task_id)
 
     def wait(self, client, task_id, *, after=0, timeout=5):
@@ -146,10 +157,11 @@ class Collaboration:
         finally:
             _polling.reset(token)
 
-    def reply(self, client, task_id, question_id, prompt, *, clear_timeout=False):
+    def reply(self, client, task_id, question_id, prompt, *, clear_timeout=False, expected_turn=None, command_id=None):
         task = self.store.reply(task_id, self.origin(client), question_id, prompt,
-                                clear_timeout=clear_timeout, require_question=True)
-        if task['state'] == 'queued':
+                                clear_timeout=clear_timeout, require_question=True,
+                                expected_turn=expected_turn, command_id=command_id)
+        if task['state'] == 'queued' and task.get('launch_turn') != task['turn']:
             self._dispatch(task)
         return self.status(client, task_id)
 
@@ -158,35 +170,14 @@ class Collaboration:
         return self.status(client, task_id)
 
     def close(self, client, task_id):
+        from release import close_task
         origin = self.origin(client)
-        before = self.store.get(task_id, origin)
-        task = self.store.begin_close(task_id, origin)
-        success = False
-        try:
-            with self.lock(task, exclusive=False) as acquired:
-                if acquired:
-                    never_claimed = (task.get('acpx_created') is False
-                                     and task.get('session_creation_attempted') is False
-                                     and task['turn'] == before['turn']
-                                     and before['state'] == 'cancelled')
-                    if never_claimed:
-                        success = True
-                    elif self.control(task, 'close', timeout=20).returncode == 0:
-                        result = self.control(task, 'status', timeout=20)
-                        if result.returncode == 0:
-                            try:
-                                snapshot = json.loads(result.stdout)
-                            except (ValueError, TypeError, UnicodeError):
-                                snapshot = None
-                            success = (isinstance(snapshot, dict)
-                                       and snapshot.get('action') == 'status_snapshot'
-                                       and snapshot.get('status') == 'no-session')
-        finally:
-            self.store.finish_close(task_id, task['turn'], success)
-            if success:
-                from skills import cleanup
-                cleanup(self.store, task)
-        return self.status(client, task_id)
+        receipt = close_task(self.store, origin, task_id)
+        if receipt['state'] == 'released':
+            from skills import cleanup
+            cleanup(self.store, self.store.get(task_id, origin))
+        from recovery import public_close_receipt
+        return dict(self.status(client, task_id), close_receipt=public_close_receipt(receipt))
 
     def origin(self, client):
         with self.store.connect() as conn:
@@ -234,10 +225,10 @@ def main(argv=None):
             p.add_argument('--prompt', required=True)
             p.add_argument('--clear-timeout', action='store_true',
                            help='Clear inherited execution limit on the next settled continuation')
+            p.add_argument('--expected-turn', type=int, help='Observed turn being answered; rejects stale intent when supplied')
+            p.add_argument('--command-id', help='Stable intent ID; reuse unchanged for retry-safe submission')
         if action == 'reply':
             p.add_argument('--question-id', required=True)
-        if action == 'intervene':
-            p.add_argument('--command-id', help='Stable ID for retry-safe submission')
     opts = vars(parser.parse_args(argv))
     action, db, client = opts.pop('action'), opts.pop('db'), opts.pop('client')
     polling_token = _polling.set(action == 'wait')

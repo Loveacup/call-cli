@@ -50,6 +50,8 @@ class HostBridgeTests(unittest.TestCase):
         self.assertEqual(task['host_binding'], 'omp-extension')
         self.assertNotIn('origin', task)
         self.assertNotIn(self.key, str(task))
+        self.assertNotIn(self.a['session_id'], json.dumps(task))
+        self.assertNotIn(self.a['agent_id'], json.dumps(task))
         with self.assertRaises(PermissionError):
             self.bridge.handle(self.b, self.key, dict(action='status', task_id=task['id']))
         with self.assertRaises(ValueError):
@@ -98,6 +100,52 @@ class HostBridgeTests(unittest.TestCase):
         packet = self.call('wait', task_id=task['id'], after=17, timeout=0)
         self.assertFalse(packet['busy'])
         self.assertEqual(packet['task']['state'], 'queued')
+
+
+class CloseReceiptPrivacyTests(unittest.TestCase):
+    def test_cli_and_omp_receipts_hide_nested_identity_on_success_failure_and_retry(self):
+        from unittest.mock import patch
+        from fixtures.close_backend import CloseBackend
+        from collab import Collaboration
+        for surface in ('cli','omp'):
+            with self.subTest(surface=surface), tempfile.TemporaryDirectory() as td:
+                bridge = (HostBridge if surface=='omp' else Collaboration)(Path(td)/'tasks.db',launch=lambda task:None)
+                host = dict(session_id='PRIVATE_SESSION',agent_id='PRIVATE_AGENT')
+                if surface=='omp':
+                    client=bridge.bind(host)
+                    task=bridge.handle(host,client,dict(action='start',cwd=td,prompt='private prompt'))['task']
+                    close=lambda:bridge.handle(host,client,dict(action='close',task_id=task['id']))
+                else:
+                    client=bridge.connect('pi')['client_id']
+                    task=bridge.start(client,cwd=td,prompt='private prompt')
+                    close=lambda:bridge.close(client,task['id'])
+                bridge.store.update(task['id'],state='completed',acpx_record_id='fixture-record')
+                backend=CloseBackend(verified=False)
+                with patch('release.NativeBackend',return_value=backend):
+                    packets=[close(),close()]
+                    backend.verified=True
+                    packets.extend([close(),close()])
+                self.assertEqual(backend.closes,1)
+                for packet in packets:
+                    projected=packet['task']['close_receipt'] if surface=='omp' else packet['close_receipt']
+                    self.assertLessEqual(set(projected),{'state','phase','stage','reason_code','external_close_attempted'})
+                self.assertEqual([p['task']['state'] if surface=='omp' else p['state'] for p in packets],
+                                 ['unknown','unknown','closed','closed'])
+                card=packets[0]['task']['recovery'] if surface=='omp' else packets[0]['recovery']
+                self.assertTrue(card['capabilities']['exact_record_reconcile'])
+                self.assertIn('close (probe-only)',card['next_action'])
+                if surface=='omp':
+                    for packet in packets:
+                        raw=json.dumps(packet)
+                        for private in (*host.values(),client): self.assertNotIn(private,raw)
+                with bridge.store.connect() as db:
+                    receipt=json.loads(db.execute('SELECT receipt FROM release_fences WHERE task=?',(task['id'],)).fetchone()[0])
+                self.assertEqual(receipt['target']['owner'],bridge.store.get(task['id'])['origin'])
+                self.assertGreaterEqual(len(receipt['attempts']),3)
+                nested=HostBridge.public({'events':[{'close_receipt':receipt}],'task':{'close_receipt':receipt}})
+                self.assertLessEqual(set(nested['events'][0]['close_receipt']),
+                                     {'state','phase','stage','reason_code','external_close_attempted'})
+                self.assertNotIn('target',json.dumps(nested))
 
 
 if __name__ == '__main__':

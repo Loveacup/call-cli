@@ -24,6 +24,22 @@ Hermes/OMP 模型工具均拒绝 timeout（含旧缓存字段），新任务的�
 
 当前兼容范围还要求链内 source 一致、无继承 fork 标记且总链到 root 不超过 32 边；source 一致是插件保守约束，不是 Hermes publisher 保证。CLI 未提供独立 session_key 时该字段随 SID 变化，严格五字段匹配会拒绝 fallback；不能静默归一化放宽权限。metadata Store scope 使用宿主无参 root，task DB 仍使用原有 plugin-data root；profile resolver 不可用只禁用 fallback，不影响 exact-origin。
 
+## 已结束 owner 的旧任务
+
+源码 native `call_cli` 按动作开放：同可信 profile、platform/chat/thread 和原 route 的当前会话，可 list/status/events 查看旧 owner 已结束的任务。沿用 schema 32 的只读 metadata 校验；只接受有限正 ended_at 与 `agent_close`、`cli_close`、`tui_close`，当前调用 session 必须仍开放且 source 受支持。compression/reset、丢连接、idle、无 PID、任务 completed 都不是此证明。CLI 两端均以 SID 回退为 key 且无 chat/thread 时可跨 SID；其他 route key 仍须逐字相同。不是按父子关系继承。
+
+非当前 controller 的 status/events 不推进 pending 介入。跨 controller 的 settled reply/intervene 必须带 observed `expected_turn` 与稳定 `command_id`，同事务绑定 `controller/control_epoch`；旧任务缺字段按 Origin/epoch 1 解释。新 controller 可管理与取消已准入轮，原 owner reopen 不夺权；旧 owner 只能查看，不能对活跃新轮 reply/intervene/cancel。当前 controller 已变更后的无问题 reply 也必须带 turn/command 防迟到续轮，重复同 command 不重派。原始 controller 的旧 API 与问题回答保持兼容；可选 expected_turn 在原有入口同样严格校验。
+
+native 新增 `reconcile`；跨 owner `close` 与 `reconcile` 要显式 `expected_turn`，仅本地且精确 ACPX record 可恢复。先复用 P2 持久 fence 固定 snapshot、保留 unknown 占用，再只读查原 record 的 backend session/last attempted request 和同作用域 no-session；证据充分才事务结算 closed。unknown 的 close 只转对账，不重发外部 close；失败保存 attempt 与脱敏 stage/reason_code。active 任务先正常结算，不拿 owner 结束当停写证明。远程恢复仍不支持；不宣称任意 detached descendants 已停止。
+
+native/standalone/OMP 回执提供 recovery card 与 uncovered 提示；没有已核实的 pre-exit hook 或交接就明确 false，不拦禁短命发起。runner argv 固定 turn/launch-id/epoch；仅未 claim 的首轮支持旧缺参 argv，后续旧 argv 拒绝而不执行最新轮。源码合成验证不代表安装或宿主已加载。
+
+新增 ended-controller recovery/reconcile 仅 Hermes native plugin 提供，standalone/OMP 未增加该权限。健康任务 reconcile 不加 fence；unknown/HOLD 或已 released 回执才可对账，pending questions 拒绝 recovery close。native receipt 标 `binding_source=record-resolved`，不冒充 dashboard 的 policy-pinned backend session。恢复卡不含私有 DB 路径或 command prompt；creating surface 由宿主记录，notification routing configured 不代表用户已收到，退出拦截和接方交接仍 uncovered。
+
+全部公开 close（Hermes、CLI、OMP）复用同一 proof/fence，不再按 same-controller 选择文本 no-session 分支。本地 exact record 先持久 fence/attempt，unknown 一律只 probe；错 record/backend session/request、非结构化文本、缺 closed/no-session 证据均保 HOLD。未创建会话只在 cancelled 且明确 acpx_created=false、session_creation_attempted=false、无 record 的不变快照上无后端调用结算；缺 record/remote/无受支持精确证明的后端返回 unknown 与 exact_record_unavailable，不盲目重关。
+
+无问题 reply 迁移：本版本新 native task 持久 continuation_version=2，必须由调用方先读 status.turn，再显式提交同一 expected_turn 和稳定 command_id；重试复用原字段，不能临时读取最新 turn 当旧意图。旧持久任务缺字段/version1 仍兼容旧同 controller 请求，但不声称具备同等 stale-intent 防护。question_id 绑定的问题回复保持兼容；跨 controller 接续始终要求 turn/command。无需手改数据库或迁移旧记录。
+
 ## 通知轮缺少身份
 
 若通知轮调用 status/events/reply/cancel/close 报 `No host session identity`，用 start 返回的精确 process session_id，经当前 `process_manage` schema 的 poll/log/wait 观察状态与输出。它是观察兜底，不授予任务所有权，也不证明 reply／介入续办已完成。需要继续控制时核验既有来源匹配的支持路径；无此路径就报告精确缺口，不把 process ID 伪装成身份或用另一来源重派。

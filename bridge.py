@@ -57,11 +57,12 @@ class Store:
         finally:
             db.close()
 
-    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None, skills=None):
+    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None, skills=None, *, initiating_surface=None):
         task_id = uuid.uuid4().hex[:16]
         data = dict(id=task_id, session='call-'+task_id, origin=dataclasses.asdict(origin),
                     device=device, device_key=device_key or device, agent=agent, cwd=cwd, prompt=prompt, write=write,
-                    resource=resource, state='queued', turn=1, process_id='', question_id='', questions=[], answers={})
+                    resource=resource, state='queued', turn=1, process_id='', question_id='', questions=[], answers={},
+                    controller=dataclasses.asdict(origin), control_epoch=1, initiating_surface=initiating_surface or 'unknown')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             self._check_writers(db, data)
@@ -102,6 +103,9 @@ class Store:
 
     @staticmethod
     def _save(db, task):
+        current = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task['id'],)).fetchone()[0])
+        if current['state'] == 'closed' or current.get('release_epoch'):
+            raise ValueError('Task is permanently fenced')
         db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(task), task['id']))
 
     def update(self, task_id, **changes):
@@ -112,11 +116,12 @@ class Store:
             self._save(db, task)
         return task
 
-    def claim_launch(self, task_id, turn):
+    def claim_launch(self, task_id, turn, epoch=None):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
             if (task['turn'] != turn or task['state'] != 'queued'
+                    or (epoch is not None and task.get('control_epoch', 1) != epoch)
                     or task.get('launch_turn') == turn):
                 raise ValueError('Turn already launched or not queued')
             task.update(launch_turn=turn, launch_id=uuid.uuid4().hex)
@@ -127,7 +132,8 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
-            if task['turn'] == turn and task.get('launch_id') == launch_id:
+            if (task['state'] != 'closed' and not task.get('release_epoch')
+                    and task['turn'] == turn and task.get('launch_id') == launch_id):
                 if process_id is not None:
                     task['process_id'] = process_id
                 elif task['state'] in {'queued', 'running', 'cancelling'}:
@@ -142,6 +148,8 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()
             task = json.loads(row[0])
+            if task['state'] == 'closed' or task.get('release_epoch'):
+                return False
             if metadata.get('turn',task['turn']) != task['turn']:
                 return False
             if metadata.get('quiet_notice') and task['state'] != 'running':
@@ -188,19 +196,30 @@ class Store:
                 self._save(db, task)
         return inserted.lastrowid
 
-    def reply(self, task_id, origin, question_id, prompt, *, clear_timeout=False, require_question=False):
+    def reply(self, task_id, origin, question_id, prompt, *, clear_timeout=False, require_question=False,
+              expected_turn=None, command_id=None):
         if type(clear_timeout) is not bool:
             raise ValueError('clear_timeout must be boolean')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
-            if not row or not self._allows(row['owner'], origin):
-                raise PermissionError('Task belongs to another Hermes session/topic')
-            task = json.loads(row['data'])
+            task = self._owned(db, task_id, origin)
+            replay = task.get('reply_commands', {}).get(command_id) if command_id else None
+            intent = dict(prompt=prompt, question_id=question_id, expected_turn=expected_turn,
+                          clear_timeout=clear_timeout)
+            if replay is not None:
+                if replay != intent:
+                    raise ValueError('command_id already used with different parameters')
+                return task
+            self._check_intent(task, expected_turn)
+            self._admit_controller(task, origin, expected_turn, command_id)
+            if command_id:
+                task.setdefault('reply_commands', {})[command_id] = intent
             if (task['state'] not in {'waiting_reply','completed'}
                     or task.get('intervention', {}).get('status') == 'pending'):
                 raise ValueError('Previous turn is not settled or intervention is pending')
             questions = task.get('questions', [])
+            if not questions and (task.get('control_epoch', 1) > 1 or task.get('continuation_version', 1) >= 2) and (expected_turn is None or not command_id):
+                raise ValueError('Versioned continuation requires expected_turn and command_id')
             if require_question and (not question_id or question_id not in questions or not prompt.strip()):
                 raise ValueError('Reply requires an unanswered question_id in a settled turn')
             if questions and question_id not in questions:
@@ -227,11 +246,23 @@ class Store:
     def _allows(self, owner, origin):
         return owner == origin.key()
 
+    @staticmethod
+    def _check_intent(task, expected_turn):
+        if expected_turn is not None and (type(expected_turn) is not int or expected_turn != task['turn']):
+            raise ValueError('Observed turn is stale')
+
+    def _admit_controller(self, task, origin, expected_turn, command_id):
+        if not self._allows(Origin(**task.get('controller', task['origin'])).key(), origin):
+            raise PermissionError('Task belongs to another controller')
+
     def _owned(self,db,task_id,origin):
         row=db.execute('SELECT * FROM tasks WHERE id=?',(task_id,)).fetchone()
-        if not row or not self._allows(row['owner'], origin):
+        if not row:
             raise PermissionError('Task belongs to another Hermes session/topic')
-        return json.loads(row['data'])
+        task = json.loads(row['data'])
+        if not self._allows(Origin(**task.get('controller', task['origin'])).key(), origin):
+            raise PermissionError('Task belongs to another controller')
+        return task
 
     @staticmethod
     def _prepare_legacy_hermes_session(db, task):
@@ -252,7 +283,8 @@ class Store:
             raise ValueError('Legacy session creation is unverified; intervention refused. Use a new start after reconciling the old task.')
         task.update(needs_session=True, acpx_created=False, session_creation_attempted=False)
 
-    def intervene(self, task_id, origin, prompt, command_id=None, *, legacy_hermes=False, clear_timeout=False):
+    def intervene(self, task_id, origin, prompt, command_id=None, *, legacy_hermes=False, clear_timeout=False,
+                  expected_turn=None):
         if type(clear_timeout) is not bool:
             raise ValueError('clear_timeout must be boolean')
         if not prompt.strip():
@@ -265,9 +297,12 @@ class Store:
             commands = task.setdefault('commands', {})
             if command_id in commands:
                 if (commands[command_id]['prompt'] != prompt or
-                        commands[command_id].get('clear_timeout', False) != clear_timeout):
+                        commands[command_id].get('clear_timeout', False) != clear_timeout
+                        or commands[command_id].get('expected_turn') != expected_turn):
                     raise ValueError('command_id already used with different parameters')
                 return task, False
+            self._check_intent(task, expected_turn)
+            self._admit_controller(task, origin, expected_turn, command_id)
             if task.get('intervention', {}).get('status') == 'pending':
                 raise ValueError('Another intervention is pending; wait or cancel it first')
             if task['state'] not in {'queued', 'running', 'cancelling', 'cancelled', 'completed', 'waiting_reply'}:
@@ -280,7 +315,7 @@ class Store:
             if task['state'] == 'queued':
                 self._target_commands(task, 'superseded')
             entry = dict(command_id=command_id, prompt=prompt, source_turn=task['turn'],
-                         status='pending', clear_timeout=clear_timeout)
+                         status='pending', clear_timeout=clear_timeout, expected_turn=expected_turn)
             commands[command_id] = entry
             task['intervention'] = entry
             if task['state'] == 'queued':
@@ -381,11 +416,17 @@ class Store:
             event = dict(token=str(turn)+':settled', kind=state,
                          text=(text if text is not None else note or 'Prompt exited '+str(rc))[:8000],
                          turn=turn, question_ids=task.get('questions', []), answer_tail=answer_tail)
+            try:
+                from .recovery import recovery_card
+            except ImportError:
+                from recovery import recovery_card
+            event['recovery'] = recovery_card(task, self.path)
             if task.get('intervention', {}).get('status') == 'pending':
                 event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
             inserted = db.execute('INSERT INTO events VALUES (?,?,?)',
                                   (task_id, event['token'], json.dumps(event)))
             event['seq'] = inserted.lastrowid
+            event['recovery']['seq'] = inserted.lastrowid
             self._save(db,task)
         return event
 

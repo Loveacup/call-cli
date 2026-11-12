@@ -73,5 +73,5 @@ exit $LASTEXITCODE
 
 当前证据：Windows 六项假 SSH 用例通过（完整回复提前返回、错误、部分回复超时且只启动一次、参数引号、空白前缀后完整 JSON、仅空白直到超时）；父方另行精确断言中文回复和 POSIX argv 保真。第一独审发现纯空白可被 PowerShell 误当解析成功，已先用两个新增用例复现真实 RED，再加最小非空白守卫得到同测试哈希的六项 GREEN。修复版已安装、哈希读回一致，真实 connect 和既有 closed 任务 status 查询均通过。
 
-真实业务 `30f76ce63b5145a1`：PC Codex 经此客户端派发 MacBook OMP，读取真实 question_id 并自行回复，同会话续至 turn 2，生成 `csv_audit.py`、`test_csv_audit.py`、`README.md` 并关闭。父方复跑六项测试和八组 golden cases 全部通过；Windows 收尾读回无 `CodexSsh-*` Task、desktop worker 或 Codex stdio app-server。此次未在运行前捕获完整 PID 树，不能把收尾快照宣传成逐 PID 的前后跟踪（此前独立生命周期测试已做精确捕获）。源码与 PC 运行副本哈希一致。证据目录：`evidence/real-task-91cc1038c0/`。完整业务运行使用空白守卫修复前客户端 `49605ef5…`；修复版 `88f576fa…` 的验证为六项 Windows 回归与真实 connect/status，并未重跑整套模型代码任务。定点独立复核已 PASS（`evidence/native-client-review-final.json`），源码、RED/GREEN 与测试哈希已核对；其范围仅上一 finding，不外推全面 Windows 审计。
+一次真实业务验收：PC Codex 经此客户端派发 MacBook OMP，读取真实 question_id 并自行回复，同会话续至 turn 2，生成 `csv_audit.py`、`test_csv_audit.py`、`README.md` 并关闭。父方复跑六项测试和八组 golden cases 全部通过；Windows 收尾读回无 `CodexSsh-*` Task、desktop worker 或 Codex stdio app-server。此次未在运行前捕获完整 PID 树，不能把收尾快照宣传成逐 PID 的前后跟踪（此前独立生命周期测试已做精确捕获）。源码与 PC 运行副本哈希一致。原始业务证据保留在私有验收记录中，不随公开文档发布。完整业务运行使用空白守卫修复前客户端 `49605ef5…`；修复版 `88f576fa…` 的验证为六项 Windows 回归与真实 connect/status，并未重跑整套模型代码任务。定点独立复核已 PASS（`evidence/native-client-review-final.json`），源码、RED/GREEN 与测试哈希已核对；其范围仅上一 finding，不外推全面 Windows 审计。
 

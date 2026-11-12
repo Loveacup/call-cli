@@ -71,10 +71,10 @@ class NativeContinuityTests(unittest.TestCase):
         self.assertEqual(self.action('events', task)['events'][0]['token'], 'q')
         resumed = self.action('reply', task, question_id='q', prompt='answer')['task']
         self.assertEqual((resumed['turn'], resumed['origin']), (2, task['origin']))
-        store.update(task['id'], state='completed')
-        result = SimpleNamespace(returncode=0, stdout=b'{"status":"no-session"}')
-        with patch.object(self.mod, 'control', return_value=result), \
-                patch('callcli_plugin.updates.device_lock', return_value=__import__('contextlib').nullcontext(True)):
+        store.update(task['id'], state='completed',acpx_record_id='fixture-record')
+        from fixtures.close_backend import CloseBackend
+        import importlib
+        with patch.object(importlib.import_module('callcli_plugin.release'),'NativeBackend',return_value=CloseBackend()):
             self.assertEqual(self.action('close', task)['task']['state'], 'closed')
 
     def test_unknown_and_pending_intervention_keep_existing_guards(self):

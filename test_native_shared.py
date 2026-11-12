@@ -34,7 +34,7 @@ class NativeSharedTests(unittest.TestCase):
                                 patch('acpx_backend.AcpxBackend.control',side_effect=control), \
                                 patch('updates.ensure_current',return_value={'decision':'existing-runtime'}):
                             try:
-                                with contextlib.redirect_stdout(io.StringIO()):rc = run_task(c.store.path,task['id'])
+                                with contextlib.redirect_stdout(io.StringIO()):rc = __import__('test_dispatch').run_dispatched(c.store.path, task['id'])
                                 result = c.store.get(task['id'],origin)
                                 events = c.events(client,task['id'])
                                 self.assertEqual((result['state'],rc,result['exit_code'],result['stop_reason']),
@@ -80,7 +80,7 @@ class NativeSharedTests(unittest.TestCase):
                     with patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'integration-uses-existing'}),contextlib.redirect_stdout(io.StringIO()):
                         if mode in ['block','unbounded']:
                             with concurrent.futures.ThreadPoolExecutor(max_workers=1)as pool:
-                                future=pool.submit(run_task,c.store.path,t['id']);deadline=time.monotonic()+25
+                                future=pool.submit(__import__('test_dispatch').run_dispatched, c.store.path, t['id']);deadline=time.monotonic()+25
                                 while time.monotonic()<deadline:
                                     if any(x['kind']=='stage'for x in c.store.events(t['id'],origin)):break
                                     time.sleep(.05)
@@ -90,7 +90,7 @@ class NativeSharedTests(unittest.TestCase):
                                     self.assertFalse(future.done(), 'Unbudgeted prompt ended before explicit cancellation')
                                     self.assertEqual(c.store.get(t['id'])['state'],'running')
                                 c.store.request_cancel(t['id'],origin);rc=future.result(timeout=35)
-                        else:rc=run_task(c.store.path,t['id'])
+                        else:rc=__import__('test_dispatch').run_dispatched(c.store.path, t['id'])
                     outcome=c.store.get(t['id'],origin);self.assertEqual(outcome['state'],expected)
                     self.assertEqual(rc,1 if mode in ['fail','timeout','drop'] else 0)
                     note=outcome.get('settlement_note') or ''
@@ -141,7 +141,7 @@ class NativeSharedTests(unittest.TestCase):
             with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}):
                 try:
                     output=io.StringIO()
-                    with contextlib.redirect_stdout(output):rc=run_task(c.store.path,task['id'])
+                    with contextlib.redirect_stdout(output):rc=__import__('test_dispatch').run_dispatched(c.store.path, task['id'])
                     result=c.store.get(task['id']);events=c.store.events(task['id'],origin)
                     self.assertEqual((result['state'],rc),('unknown',1))
                     self.assertIn('watchSession prompt error.code=-32000/data.authRequired=true',result['settlement_note'])
@@ -174,7 +174,7 @@ class NativeSharedTests(unittest.TestCase):
                 class SyntheticHost(Ctx):
                     def dispatch_tool(self,name,args,**kwargs):
                         argv=shlex.split(args['command'])
-                        futures.append(pool.submit(run_task,argv[argv.index('--db')+1],argv[argv.index('--task')+1]))
+                        futures.append(pool.submit(__import__('test_dispatch').run_dispatched, argv[argv.index('--db')+1], argv[argv.index('--task')+1]))
                         return json.dumps({'session_id':'synthetic-process-'+str(len(futures))})
                 env={'HERMES_SESSION_ID':'synthetic-origin','HERMES_SESSION_KEY':'synthetic-key'}
                 c=mod.Coordinator(SyntheticHost(),work,lambda k,d='':env.get(k,d))
@@ -254,7 +254,7 @@ class NativeSharedTests(unittest.TestCase):
                 offset=[0];clock=SimpleNamespace(monotonic=lambda:time.monotonic()+offset[0])
                 futures=[]
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    def launch(task):futures.append(pool.submit(run_task,work/'tasks.db',task['id']))
+                    def launch(task):futures.append(pool.submit(__import__('test_dispatch').run_dispatched, work/'tasks.db', task['id']))
                     c=(HostBridge if surface=='omp' else Collaboration)(work/'tasks.db',launch=launch,control=control)
                     host=dict(session_id='synthetic-session',agent_id='synthetic-agent')
                     client=c.bind(host) if surface=='omp' else c.connect('pi')['client_id']
@@ -320,7 +320,7 @@ class NativeSharedTests(unittest.TestCase):
             c.store.update(task['id'],shell='posix',timeout=35)
             with patch.dict(os.environ,{'HOME':str(home)}),patch('acpx_backend.AcpxBackend.control',side_effect=control),patch('updates.ensure_current',return_value={'decision':'existing-runtime'}):
                 try:
-                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(run_task(c.store.path,task['id']),0)
+                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']),0)
                     initial=c.status(client,task['id']);record=initial['acpx_record_id']
                     first=c.events(client,task['id']);questions=[e for e in first if e['kind']=='question']
                     self.assertEqual([e['text'] for e in questions],['Q1 Which format?'])
@@ -330,12 +330,12 @@ class NativeSharedTests(unittest.TestCase):
                     self.assertEqual([e['text'] for e in first if e['kind']=='tool'],['question-tool other pending','question-tool other completed'])
                     cursor=first[-1]['seq']
                     self.assertEqual(c.reply(client,task['id'],questions[0]['token'],'REASK_QUESTION')['turn'],2)
-                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(run_task(c.store.path,task['id']),0)
+                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']),0)
                     second=c.events(client,task['id'],cursor);q2=[e for e in second if e['kind']=='question']
                     self.assertEqual([e['text'] for e in q2],['Q1 Which format?'])
                     self.assertNotEqual(q2[0]['token'],questions[0]['token'])
                     c.reply(client,task['id'],q2[0]['token'],'INDEPENDENT_QUESTIONS')
-                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(run_task(c.store.path,task['id']),0)
+                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']),0)
                     current=c.status(client,task['id']);self.assertEqual(len(current['questions']),5)
                     third=[e for e in c.events(client,task['id']) if e['turn']==3]
                     self.assertEqual([e['text'] for e in third if e['kind']=='answer'],['EARLY_RESULT','LATE_RESULT'])
@@ -347,7 +347,7 @@ class NativeSharedTests(unittest.TestCase):
                     for n,token in enumerate(current['questions']):
                         reply=c.reply(client,task['id'],token,'SYNTHETIC_REPLY_'+str(n))
                         self.assertEqual(reply['turn'],4 if n==4 else 3)
-                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(run_task(c.store.path,task['id']),0)
+                    with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']),0)
                     final=c.status(client,task['id'])
                     self.assertEqual((final['state'],final['turn'],final['acpx_record_id'],final['session']),('completed',4,record,task['session']))
                     applied='\n'.join(e['text'] for e in c.events(client,task['id']) if e['kind']=='answer' and e['turn']==4)

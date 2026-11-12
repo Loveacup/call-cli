@@ -99,7 +99,9 @@ class CollaborationTests(unittest.TestCase):
         with patch('subprocess.Popen') as popen:
             task = c.start(client, prompt='inspect', cwd='/project', timeout=15)
         args, kw = popen.call_args
-        self.assertEqual(args[0], [sys.executable, str(Path(collab.__file__).with_name('runner.py')), '--db', str(self.db), '--task', task['id']])
+        self.assertEqual(args[0], [sys.executable, str(Path(collab.__file__).with_name('runner.py')),
+            '--db', str(self.db), '--task', task['id'], '--turn', str(task['turn']),
+            '--launch-id', task['launch_id'], '--epoch', str(task['control_epoch'])])
         self.assertEqual(kw['stdout'], subprocess.DEVNULL)
         self.assertEqual(kw['stderr'], subprocess.DEVNULL)
         self.assertEqual(kw['stdin'], subprocess.DEVNULL)
@@ -182,23 +184,17 @@ class CollaborationTests(unittest.TestCase):
         self.c.store.finish_turn(tid, 1, 'cancelled', 0, 'cancelled')
         self.c.wait(client, tid, timeout=0)
         self.assertEqual(len(self.launches), 1)
-        locked = []
-        @contextmanager
-        def lock(task, **kw):
-            self.assertFalse(kw.get('exclusive', False))
-            locked.append(True)
-            yield True
-            locked.pop()
-        def control(task, action, **kw):
-            self.assertTrue(locked)
-            self.assertEqual(self.c.status(client, tid)['state'], 'closing')
-            self.assertIn(action, {'close', 'status'})
-            self.controls.append(action)
-            return SimpleNamespace(returncode=0, stdout=b'{"action":"status_snapshot","status":"no-session","summary":"no active session"}')
-        self.c.lock, self.c.control = lock, control
-        with self.assertRaises(PermissionError): self.c.close(stranger, tid)
-        self.assertEqual(self.c.close(client, tid)['state'], 'closed')
-        self.assertEqual(self.controls, ['close', 'status'])
+        from unittest.mock import patch
+        from fixtures.close_backend import CloseBackend
+        self.c.store.update(tid,acpx_record_id='fixture-record')
+        def close(policy):
+            self.assertEqual(self.c.status(client,tid)['state'],'unknown')
+            self.assertTrue(self.c.status(client,tid)['release_epoch'])
+        backend = CloseBackend(on_close=close)
+        with self.assertRaises(PermissionError): self.c.close(stranger,tid)
+        with patch('release.NativeBackend',return_value=backend):
+            self.assertEqual(self.c.close(client,tid)['state'],'closed')
+        self.assertEqual((backend.closes,backend.probes),(1,1))
 
     def test_close_without_created_session_skips_control_and_failed_close_is_unknown(self):
         client = self.c.connect('pi')['client_id']
@@ -344,12 +340,12 @@ class CollaborationTests(unittest.TestCase):
         client = c.connect('omp')['client_id']
         task = c.start(client, prompt='ASK', cwd=str(fixture.root), agent='omp', timeout=10)
         tid = task['id']
-        self.assertEqual(run_task(c.store.path, tid), 0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, tid), 0)
         observation = c.wait(client, tid, timeout=0)
         q = [e for e in observation['events'] if e['kind']=='question'][0]
         c.reply(client, tid, q['token'], 'BLOCK')
         with ThreadPoolExecutor(max_workers=1) as pool:
-            running = pool.submit(run_task, c.store.path, tid)
+            running = pool.submit(__import__('test_dispatch').run_dispatched, c.store.path, tid)
             deadline = time.monotonic()+3
             while c.status(client, tid)['state'] != 'running' and time.monotonic()<deadline:
                 time.sleep(.01)
@@ -357,7 +353,7 @@ class CollaborationTests(unittest.TestCase):
             self.assertEqual(pending['intervention']['status'], 'pending')
             self.assertEqual(running.result(timeout=5), 0)
         c.wait(client, tid, after=observation['after'], timeout=0)
-        self.assertEqual(run_task(c.store.path, tid), 0)
+        self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, tid), 0)
         result = c.wait(client, tid, timeout=0)
         self.assertEqual(result['task']['state'], 'completed')
         self.assertTrue(any(e['kind']=='stage' for e in result['events']))
@@ -371,13 +367,9 @@ class CollaborationTests(unittest.TestCase):
         client = self.c.connect('pi')['client_id']
         task = self.c.start(client, prompt='x', cwd='/project')
         self.c.store.update(task['id'], state='completed', acpx_created=False, runner_pid=0)
-        original = self.c.store.begin_close
-        def changed(task_id, origin):
-            self.c.store.update(task_id, state='unknown')
-            return original(task_id, origin)
-        self.c.store.begin_close = changed
         self.c.close(client, task['id'])
-        self.assertEqual(self.controls, ['close', 'status'])
+        self.assertEqual(self.c.status(client,task['id'])['state'],'unknown')
+        self.assertEqual(self.controls, [])
 
     def test_connect_persists_declared_identity_in_same_database(self):
         a = self.c.connect('omp')

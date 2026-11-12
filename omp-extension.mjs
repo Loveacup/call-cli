@@ -2,7 +2,7 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
 const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'intervene', 'cancel', 'close']);
-const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'remote_shell', 'skills', 'question_id', 'command_id', 'after']);
+const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
 const visible = new Set(['stage', 'question', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
 
@@ -157,7 +157,7 @@ export default function register(pi) {
       clear_timeout: z.boolean().optional().describe('reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'),
       model: z.string().optional(), effort: z.string().optional(), agy_approval: z.enum(['approve-all', 'approve-reads']).optional(), remote_shell: z.enum(['posix', 'powershell']).optional(),
       skills: z.array(z.object({path: z.string(), mode: z.enum(['required', 'optional', 'reference']), location: z.enum(['origin', 'target']).optional()})).optional(),
-      question_id: z.string().optional(), command_id: z.string().optional(), after: z.number().optional()}).strict(),
+      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; reuse on reply/intervene retry'), expected_turn: z.number().int().positive().optional().describe('Observed turn being answered; rejects stale intent when supplied'), after: z.number().optional()}).strict(),
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await adapter.execute(args, ctx);
       return {content: [{type: 'text', text: JSON.stringify(result)}]};

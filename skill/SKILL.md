@@ -58,6 +58,8 @@ Hermes native task 在旋转式 compaction 后仅可沿同一已验证 profile �
 
 只负责派工、短 wait 和转述的中继使用 `write:false`；在同一 cwd 发起内层 writer 时，中继不占用写锁。只有实际修改该写面的执行任务声明 `write:true`。scratch cwd 可用于职责隔离，但不是同 cwd 中继的必要条件；不要通过另一个 DB 或放宽锁绕过占用。
 
+已结束 owner 的旧任务可沿[分动作恢复](references/hermes-host.md#已结束-owner-的旧任务)处理：只读查看不续跑；显式接续绑定 expected_turn/command_id 与当前 controller，关闭/对账须 exact-record fence。保留回执 recovery card；coverage 为 uncovered 或 pre_exit_hook=false 时，不宣称已交接或退出前会自动拦截。
+
 ## 验收与收尾
 
 发起端读真实回答与产物、检查范围并运行必要验证，再报告整体完成／部署状态。`completed`、exit 0 和执行者自报都不代替验收；协议 unknown 与产物通过分别记录。取消回执不等于停写，确认结算后才续作；未知结果保持资源占用并对账。结束后关闭自有会话，读回当前实现要求的 no-session，清理自有 watcher／临时材料；不能为清理成功改写失败历史。

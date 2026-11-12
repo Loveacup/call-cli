@@ -3,7 +3,8 @@
 Schema 32 is the inspected contract. Parent end_reason, not child end_reason,
 records compression publication. No SessionDB import (it probes broader state).
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
+import dataclasses
 import json
 import math
 import re
@@ -22,12 +23,13 @@ _NATIVE_SOURCES = frozenset({'cli', 'tui', 'desktop', 'acp', 'oneshot', 'local',
 
 
 class NativeStore(Store):
-    def __init__(self, path, hermes_home=None, hermes_root=None):
+    def __init__(self, path, hermes_home=None, hermes_root=None, *, action=None):
         self.hermes_home = Path(hermes_home) if hermes_home is not None else None
         self.hermes_root = Path(hermes_root) if hermes_root is not None else None
+        self.action = action
         super().__init__(path)
 
-    def _allows(self, owner, origin):
+    def _same_principal(self, owner, origin):
         if super()._allows(owner, origin):
             return True
         if self.hermes_home is None:
@@ -41,33 +43,106 @@ class NativeStore(Store):
             return False
         return self._compression_ancestor(previous.session_id, origin.session_id, origin.profile)
 
+    def _allows(self, owner, origin):
+        if self._same_principal(owner, origin):
+            return True
+        if self.action not in {'list', 'status', 'events', 'reply', 'intervene', 'cancel', 'close', 'reconcile'}:
+            return False
+        try:
+            previous = Origin(**json.loads(owner))
+        except (TypeError, ValueError):
+            return False
+        if any(getattr(previous, key) != getattr(origin, key) for key in
+               ('profile', 'platform', 'chat_id', 'thread_id')):
+            return False
+        sid_route = (previous.platform == 'cli' and not previous.chat_id and not previous.thread_id
+            and previous.session_key == previous.session_id and origin.session_key == origin.session_id)
+        if previous.session_key != origin.session_key and not sid_route:
+            return False
+        try:
+            with self._metadata(origin.profile) as db:
+                rows = db.execute('''SELECT id, end_reason, ended_at, source FROM sessions
+                    WHERE id IN (?, ?) AND COALESCE(profile_name, ?) = ?''',
+                    (previous.session_id, origin.session_id, origin.profile, origin.profile)).fetchall()
+                sessions = {row[0]: row[1:] for row in rows}
+                old, current = sessions.get(previous.session_id), sessions.get(origin.session_id)
+                return bool(old and current and previous.session_id != origin.session_id
+                    and old[0] in {'agent_close', 'cli_close', 'tui_close'}
+                    and old[2] in _NATIVE_SOURCES | {'subagent'}
+                    and isinstance(old[1], (int, float)) and math.isfinite(old[1]) and old[1] > 0
+                    and current[0] is None and current[1] is None
+                    and current[2] in _NATIVE_SOURCES)
+        except (sqlite3.Error, OSError, ValueError):
+            return False
+
+    def _owned(self, db, task_id, origin):
+        task = super()._owned(db, task_id, origin)
+        controller = Origin(**task.get('controller', task['origin'])).key()
+        if not self._same_principal(controller, origin):
+            if self.action == 'close':
+                raise ValueError('Ended-owner close requires execution reconciliation and release fencing')
+            if task['state'] not in {'completed', 'waiting_reply', 'cancelled'}:
+                raise ValueError('Ended-controller task is read-only until reconciled; reservation retained')
+        return task
+
+    def _admit_controller(self, task, origin, expected_turn, command_id):
+        controller = Origin(**task.get('controller', task['origin'])).key()
+        if self._same_principal(controller, origin):
+            return
+        if expected_turn is None or not command_id:
+            raise ValueError('Cross-controller continuation requires expected_turn and command_id')
+        if task['state'] not in {'completed', 'waiting_reply', 'cancelled'} or task.get('release_epoch'):
+            raise ValueError('Controller transfer requires a settled unfenced task')
+        if task.get('answers') and self.action == 'reply':
+            raise ValueError('Partial answers belong to previous controller; explicit intervention required')
+        task.update(controller=dataclasses.asdict(origin),
+                    control_epoch=task.get('control_epoch', 1)+1)
+
+    def get(self, task_id, origin=None):
+        task = super().get(task_id)
+        if origin is not None and not (self._same_principal(Origin(**task['origin']).key(), origin)
+                or self._allows(Origin(**task.get('controller', task['origin'])).key(), origin)):
+            raise PermissionError('Task belongs to another Hermes controller/route')
+        return task
+
+    def advance_intervention(self, task_id, origin):
+        task = self.get(task_id, origin)
+        if not self._same_principal(Origin(**task.get('controller', task['origin'])).key(), origin):
+            return task, False  # Inspection is never authority to resume old business.
+        return super().advance_intervention(task_id, origin)
+
+    @contextmanager
+    def _metadata(self, profile):
+        if self.hermes_home is None or self.hermes_root is None:
+            raise ValueError('Trusted metadata home unavailable')
+        home, root = self.hermes_home.resolve(), self.hermes_root.resolve()
+        store_profile = ('default' if home == root else home.name
+            if home.parent == root/'profiles' and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', home.name) else None)
+        if store_profile is None or store_profile != profile:
+            raise ValueError('Metadata profile mismatch')
+        path = home/'state.db'
+        if path.is_symlink() or path.resolve().parent != home:
+            raise ValueError('Metadata database must be local to trusted home')
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=.1, isolation_level=None)) as db:
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')
+            if db.execute('SELECT version FROM schema_version').fetchall() != [(32,)]:
+                raise ValueError('Unsupported metadata schema')
+            if db.execute("SELECT type FROM sqlite_master WHERE name='sessions'").fetchall() != [('table',)]:
+                raise ValueError('Invalid sessions table')
+            columns = {row[1]: row for row in db.execute('PRAGMA table_info(sessions)')}
+            expected = {'id': 'TEXT', 'parent_session_id': 'TEXT', 'end_reason': 'TEXT',
+                'ended_at': 'REAL', 'model_config': 'TEXT', 'source': 'TEXT', 'profile_name': 'TEXT'}
+            if (any(name not in columns or columns[name][2] != kind for name, kind in expected.items())
+                    or [name for name, row in columns.items() if row[5]] != ['id']):
+                raise ValueError('Unsupported sessions schema')
+            yield db
+
     def _compression_ancestor(self, ancestor, current, profile):
         if not ancestor or not current or self.hermes_root is None:
             return False
         try:
-            home, root = self.hermes_home.resolve(), self.hermes_root.resolve()
-            store_profile = ('default' if home == root else home.name
-                if home.parent == root/'profiles' and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', home.name) else None)
-            if store_profile is None or store_profile != profile:
-                return False
-            path = home/'state.db'
-            if path.is_symlink() or path.resolve().parent != home:
-                return False
-            uri = path.as_uri() + '?mode=ro'
-            with closing(sqlite3.connect(uri, uri=True, timeout=.1, isolation_level=None)) as db:
-                db.execute('PRAGMA query_only=ON')
-                db.execute('BEGIN')  # All hops observe one committed metadata snapshot.
-                if db.execute('SELECT version FROM schema_version').fetchall() != [(32,)]:
-                    return False
-                if db.execute("SELECT type FROM sqlite_master WHERE name='sessions'").fetchall() != [('table',)]:
-                    return False
-                columns = {row[1]: row for row in db.execute('PRAGMA table_info(sessions)')}
-                expected = {'id': 'TEXT', 'parent_session_id': 'TEXT', 'end_reason': 'TEXT',
-                    'ended_at': 'REAL', 'model_config': 'TEXT', 'source': 'TEXT', 'profile_name': 'TEXT'}
-                if any(name not in columns or columns[name][2] != kind for name, kind in expected.items()):
-                    return False
-                if [name for name, row in columns.items() if row[5]] != ['id']:
-                    return False
+            with self._metadata(profile) as db:
                 seen = set()
                 child = None
                 found = False
@@ -87,7 +162,7 @@ class NativeStore(Store):
                                  ELSE 0 END,
                             source
                         FROM sessions WHERE id = ? AND COALESCE(profile_name, ?) = ?
-                    ''', (current, store_profile, profile)).fetchone()
+                    ''', (current, profile, profile)).fetchone()
                     if row is None:
                         return False
                     parent, reason, ended, clean, source = row
@@ -116,10 +191,7 @@ class NativeStore(Store):
         with self.connect() as db:
             rows = db.execute('''SELECT owner, data FROM tasks
                 WHERE CASE WHEN json_valid(owner) THEN
-                  json_extract(owner, '$.profile') = ?
-                  AND json_extract(owner, '$.session_key') = ?
-                  AND json_extract(owner, '$.platform') = ?
-                  AND json_extract(owner, '$.chat_id') = ?
-                  AND json_extract(owner, '$.thread_id') = ? ELSE 0 END''',
-                (origin.profile, origin.session_key, origin.platform, origin.chat_id, origin.thread_id)).fetchall()
-        return [json.loads(row['data']) for row in rows if self._allows(row['owner'], origin)]
+                  json_extract(owner, '$.profile') = ? ELSE 0 END''', (origin.profile,)).fetchall()
+        return [json.loads(row['data']) for row in rows if
+                self._same_principal(row['owner'], origin) or self._allows(
+                    Origin(**json.loads(row['data']).get('controller', json.loads(row['data'])['origin'])).key(), origin)]

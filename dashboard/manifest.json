@@ -1,0 +1,8 @@
+{
+  "name": "call-cli",
+  "label": "Call CLI Release",
+  "description": "Host-authenticated, private fixed-policy release-only interface.",
+  "version": "0.2.3",
+  "tab": {"hidden": true},
+  "api": "plugin_api.py"
+}

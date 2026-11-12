@@ -16,3 +16,5 @@ evidence/
 runtime/
 # Project ACPX config can contain credentials and local execution commands.
 /.acpxrc.json
+# One-time private operator target binding; never a public fixture.
+release-policy.json

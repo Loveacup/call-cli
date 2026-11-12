@@ -38,8 +38,20 @@ class HostBridge(Collaboration):
         return Origin('omp-extension', host['session_id'], row[0], 'omp')
 
     @staticmethod
-    def public(task):
-        return dict({k: v for k, v in task.items() if k not in {'origin', 'prompt'}}, host_binding='omp-extension')
+    def public(value):
+        if isinstance(value, list):
+            return [HostBridge.public(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        from recovery import public_close_receipt
+        result = {key:(public_close_receipt(item) if key == 'close_receipt' else HostBridge.public(item))
+                  for key,item in value.items()
+                  if key not in {'origin','prompt','reply_commands','controller'}}
+        if 'id' in value:
+            result['host_binding'] = 'omp-extension'
+        if 'controller' in value:
+            result['controller'] = {'host_binding':'omp-extension'}
+        return result
 
     def handle(self, host, capability, args):
         self.binding = self.identity(host)
@@ -47,8 +59,8 @@ class HostBridge(Collaboration):
         allowed = {
             'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'skills'},
             'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
-            'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout'},
-            'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout'}, 'cancel': {'task_id'}, 'close': {'task_id'},
+            'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout', 'expected_turn', 'command_id'},
+            'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},
         }
         args = dict(args)
         action = args.pop('action', '')
@@ -62,9 +74,9 @@ class HostBridge(Collaboration):
         if action == 'list':
             return {'tasks': [self.public(t) for t in result]}
         if action in {'events'}:
-            return {'events': result}
+            return {'events': self.public(result)}
         if action == 'wait':
-            return dict(result, task=self.public(result['task']) if result['task'] else None)
+            return self.public(result)
         return {'task': self.public(result)}
 
 

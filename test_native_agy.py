@@ -38,12 +38,12 @@ class NativeAgyTests(unittest.TestCase):
             task = c.start(client, agent='agy', cwd=root, model=model, effort=effort,
                            prompt='Do not use tools. Reply exactly CALLCLI_AGY_READY.', timeout=90)
             try:
-                self.assertEqual(run_task(c.store.path, task['id']), 0)
+                self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']), 0)
                 first = c.status(client, task['id'])
                 first_answers = '\n'.join(e['text'] for e in c.events(client, task['id']) if e['kind']=='answer')
                 self.assertIn('CALLCLI_AGY_READY', first_answers)
                 c.intervene(client, task['id'], 'Do not use tools. Reply exactly CALLCLI_AGY_CONTINUED.')
-                self.assertEqual(run_task(c.store.path, task['id']), 0)
+                self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']), 0)
                 last = c.status(client, task['id'])
                 self.assertEqual(first['acpx_record_id'], last['acpx_record_id'])
                 events = c.events(client, task['id'])

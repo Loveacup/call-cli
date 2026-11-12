@@ -42,14 +42,14 @@ class HostTimeoutTests(unittest.TestCase):
             self.assertNotIn('timeout', ctx.called[1])
             store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
             store.update(task['id'], state='completed', timeout=300)
-            bounded = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue'})['task']
+            bounded = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue','expected_turn':1,'command_id':'bounded'})['task']
             self.assertEqual((bounded['turn'], bounded['timeout'], ctx.called[1]['timeout']), (2, 300, 480))
             with self.assertRaises(ValueError):
                 c.handle({'action':'intervene','task_id':task['id'],'prompt':'revise',
                           'command_id':'unsafe','clear_timeout':True})
             self.assertEqual(store.get(task['id'])['timeout'], 300)
             store.update(task['id'], state='completed')
-            cleared = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue','clear_timeout':True})['task']
+            cleared = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue','clear_timeout':True,'expected_turn':2,'command_id':'clear'})['task']
             self.assertEqual((cleared['turn'], cleared['timeout']), (3, None))
             self.assertNotIn('timeout', ctx.called[1])
 
@@ -84,7 +84,7 @@ class PluginTests(unittest.TestCase):
                              'agy_approval':'approve-reads'})['task']
             store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
             store.update(task['id'], state='completed')
-            resumed = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue'})['task']
+            resumed = c.handle({'action':'reply','task_id':task['id'],'prompt':'continue','expected_turn':1,'command_id':'continue'})['task']
             self.assertEqual(resumed['model'], 'live-family')
             self.assertEqual(resumed['effort'], 'low')
             self.assertEqual(resumed['session'], task['session'])
@@ -174,7 +174,7 @@ class PluginTests(unittest.TestCase):
             store.finish_turn(task['id'],1,'cancelled',0,'cancelled')
             c.handle({'action':'status','task_id':task['id']})
             self.assertEqual(store.get(task['id'])['turn'],2)
-            self.assertEqual(__import__('runner').run_task(store.path,task['id']),0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             final=store.get(task['id'])
             self.assertEqual(final['state'],'completed')
             self.assertTrue(final['acpx_created'])
@@ -232,10 +232,10 @@ class PluginTests(unittest.TestCase):
                 c.handle({'action':'cancel','task_id':task['id']})
                 return {'decision':'current'}
             with patch('updates.ensure_current',side_effect=cancel_before_provider):
-                self.assertEqual(runner.run_task(store.path,task['id']),0)
+                self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             self.assertNotIn('session_creation_attempted',store.get(task['id']))
             c.handle({'action':'intervene','task_id':task['id'],'prompt':'new','command_id':'legacy'})
-            self.assertEqual(runner.run_task(store.path,task['id']),0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             final=store.get(task['id'])
             self.assertEqual((final['turn'],final['state']),(2,'completed'))
             self.assertTrue(final['acpx_created'])
@@ -292,14 +292,14 @@ class PluginTests(unittest.TestCase):
             task=c.handle({'action':'start','agent':'omp',
                            'cwd':str(fixture.root),'prompt':'first'})['task']
             store=mod.Store(fixture.root/'call-cli/tasks.sqlite3')
-            self.assertEqual(runner.run_task(store.path,task['id']),0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             with store.connect() as db:
                 current=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task['id'],)).fetchone()[0])
                 for key in ('needs_session','acpx_created','session_creation_attempted'):current.pop(key)
                 store._save(db,current)
             record=current['acpx_record_id']
             c.handle({'action':'intervene','task_id':task['id'],'prompt':'next','command_id':'existing'})
-            self.assertEqual(runner.run_task(store.path,task['id']),0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             self.assertEqual(store.get(task['id'])['acpx_record_id'],record)
             calls=[json.loads(line) for line in (fixture.root/'calls.jsonl').read_text().splitlines()]
             self.assertEqual(sum('new' in call for call in calls),1)

@@ -35,7 +35,7 @@ class ReviewRegressions(unittest.TestCase):
                     errorCategory='timeout', errorSource='turn_result_code')
                 with patch.dict(os.environ, ACPX_FAKE_RESULT_FRAME=json.dumps(frame)), \
                         redirect_stdout(StringIO()):
-                    self.assertEqual(runner.run_task(self.c.store.path, task['id']), 1)
+                    self.assertEqual(__import__('test_dispatch').run_dispatched(self.c.store.path, task['id']), 1)
                 result = self.c.status(self.client, task['id'])
                 self.assertEqual((result['state'], result['timeout']), ('unknown', budget))
                 options = [json.loads(line) for line in
@@ -83,19 +83,19 @@ class ReviewRegressions(unittest.TestCase):
         calls = []
         self.c.control = lambda t, a, **kw: calls.append(a) or SimpleNamespace(returncode=1)
         self.assertEqual(self.c.close(self.client, task['id'])['state'], 'unknown')
-        self.assertEqual(calls, ['close'])
+        self.assertEqual(calls, [])
 
     def test_close_requires_status_readback_no_session(self):
         for mode in ('running', 'transport', 'malformed', 'no-session'):
             with self.subTest(mode=mode), patch.dict(os.environ, ACPX_STATUS_MODE=mode):
                 task = self.c.start(self.client, prompt='done', cwd=str(self.fixture.root/mode), timeout=10)
-                self.assertEqual(runner.run_task(self.c.store.path, task['id']), 0)
+                self.assertEqual(__import__('test_dispatch').run_dispatched(self.c.store.path, task['id']), 0)
                 result = self.c.close(self.client, task['id'])
                 self.assertEqual(result['state'], 'closed' if mode == 'no-session' else 'unknown')
                 calls = list(map(json.loads, (self.fixture.root/'calls.jsonl').read_text().splitlines()))
                 owned = [c for c in calls if task['session'] in c]
                 self.assertIn('close', owned[-2])
-                self.assertIn('status', owned[-1])
+                self.assertIn('probe', owned[-1])
 
     def test_cancel_during_version_check_can_close_without_provider(self):
         task = self.start('x')
@@ -103,7 +103,7 @@ class ReviewRegressions(unittest.TestCase):
             self.c.cancel(self.client, task['id'])
             return {'decision': 'current'}
         with patch('updates.ensure_current', side_effect=version):
-            self.assertEqual(runner.run_task(self.c.store.path, task['id']), 0)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.c.store.path, task['id']), 0)
         result = self.c.close(self.client, task['id'])
         self.assertEqual(result['state'], 'closed')
         self.assertFalse((self.fixture.root/'calls.jsonl').exists())
@@ -116,14 +116,14 @@ class ReviewRegressions(unittest.TestCase):
             observed.append(self.c.status(self.client, task['id']).get('session_creation_attempted'))
             raise TimeoutError('creation result lost')
         with patch('acpx_backend.AcpxBackend.control', side_effect=uncertain):
-            self.assertEqual(runner.run_task(self.c.store.path, task['id']), 1)
+            self.assertEqual(__import__('test_dispatch').run_dispatched(self.c.store.path, task['id']), 1)
         self.assertEqual(observed, [True])
         self.assertEqual(self.c.status(self.client, task['id'])['state'], 'unknown')
         from types import SimpleNamespace
         calls = []
         self.c.control = lambda t, a, **kw: calls.append(a) or SimpleNamespace(returncode=1)
         self.assertEqual(self.c.close(self.client, task['id'])['state'], 'unknown')
-        self.assertEqual(calls, ['close'])
+        self.assertEqual(calls, [])
 
     def test_main_wait_exclusive_lock_is_nonblocking_from_initialization(self):
         import subprocess
@@ -159,7 +159,7 @@ class ReviewRegressions(unittest.TestCase):
                 task = self.c.start(self.client, prompt='BLOCK', cwd=str(self.fixture.root/mode), timeout=10, write=True)
                 tid = task['id']
                 with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(runner.run_task, self.c.store.path, tid)
+                    future = pool.submit(__import__('test_dispatch').run_dispatched, self.c.store.path, tid)
                     deadline = time.monotonic()+3
                     while time.monotonic()<deadline:
                         calls = self.fixture.root/'calls.jsonl'
