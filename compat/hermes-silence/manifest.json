@@ -5,7 +5,7 @@
       "before": "3030bcc12551de4fa1ac1a8ebb5e82426556a8ea2171341e29cab51305cf24c4"
     },
     "gateway/response_filters.py": {
-      "after": "4f107911f014916614245c619896a3c9a937011a6edfb56db0ee5f23a1ca14a1",
+      "after": "b2352dbf3a4279f35945e097ad529e8fe7db8f7086fe4dd5f6a1382feea60da3",
       "before": "9175b0d688617862d3b628fe74d47f6a0bfaf80800e6639bad2735bdc45edf90"
     },
     "gateway/run_busy.py": {
@@ -17,19 +17,19 @@
       "before": "0339d56b6565ab0faa61b26e150145f02cf6dc006d9f9505f52e63598f90a58c"
     },
     "gateway/run_turn.py": {
-      "after": "3964019452652cdda2ca7f9d65c794f17c0b182654d8e6c3d2491edda0e07321",
+      "after": "5b353bdde6d43d0c8fee902393e913f9e709d633d5012281ac8546c9d35bab35",
       "before": "851dea07d3177ca1a274a5b94e6d490a3b22aee46f5fb57d27fb8a363a03879a"
     },
     "gateway/run_turn_persistence.py": {
-      "after": "2ad9400407fba52c2b792c8a65056f353c9994bfc6923ef6dbf4d847959bd41e",
+      "after": "b6e534a437b4eb7173768629e64b2a524707da8e7c03aea2f0212d73fd3f10f4",
       "before": "93500872620e0dbc3eeed5f58206907cf689c7bf5315c940e3c2b120f828d6b6"
     },
     "gateway/run_turn_runner.py": {
-      "after": "6211201d655c02fb4d44915d6cfbbce4de47be565ae2de06d06e18462dd0f229",
+      "after": "85617ee9a4f2c9ea3137780fee8fc365659071ede6f454eb5c9f90ba15d996ff",
       "before": "c20474c99ae171882f5524646b60cf5d877e596b6f753051134ce1b8840edbb6"
     },
     "gateway/stream_consumer.py": {
-      "after": "dae0d11016ecf1a0aa74a0f49ab23a44899031f232bd02238607f32c3e72b01b",
+      "after": "99428598566228eb17f451e4831423f3c8a6b4f0912f948d3f1c9e0a3afd5174",
       "before": "06cbf630b755a1e136bcf5bc599506a4e33c677d994e8799fca94e79e5d143f4"
     },
     "gateway/turn_context.py": {
@@ -39,6 +39,10 @@
     "gateway/warning_notifications.py": {
       "after": "dbe85eff8926ef50d010b25c85eb697724b2da2bba83032f82fe960ef5912b87",
       "before": "8e835a2f316c85be623aca2b2b80ca1b2255ded9017869b3e259723275e1ee2c"
+    },
+    "tests/gateway/test_leading_silence.py": {
+      "after": "16135823e2711e3da79fda547758610539ab00c7007b91d76db82b4c04bafeca",
+      "before": null
     },
     "tests/gateway/test_mixed_turn_silence.py": {
       "after": "9e1d1a81b26aac4ad7737a7027850c00a7448e9dfc850a5983e6d7ec4741d0ab",
@@ -51,6 +55,6 @@
   },
   "head": "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
   "patch": "hermes-2bd378ed-silence.patch",
-  "patch_sha256": "b2d7b8a20da92d840ab7dd70de48e235417521ea4890e8737a7befb1c7840746",
+  "patch_sha256": "c01501db2741490b062447119f2c4b49ec152d382fbbef489a0b2a0e0928b509",
   "upstream": "https://github.com/NousResearch/hermes-agent"
 }

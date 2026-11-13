@@ -50,7 +50,7 @@ def main():
         for error in errors:
             print("STOP: " + error, file=sys.stderr)
         return 1
-    print("OK: exact HEAD, patch, and all 12 complete file states match " + args.state)
+    print(f"OK: exact HEAD, patch, and all {len(manifest['files'])} complete file states match " + args.state)
     return 0
 
 

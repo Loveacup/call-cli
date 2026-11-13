@@ -17,16 +17,16 @@ Whether either fix is present there remains unverified. This package makes no
 claim of compatibility with any existing live checkout.
 
 The patch was regenerated from a clean `git archive` of that public commit, with
-no local source overlay. It changes ten gateway files and includes a new mixed-turn
-regression file plus four stream regression cases. `manifest.json` pins the patch
+no local source overlay. It changes ten gateway files and includes mixed-turn and
+leading-control-line regression files plus four stream regression cases. `manifest.json` pins the patch
 and every complete affected file before/after using SHA256 (including required
-absence of the new test before application). `check.py` is a standard-library,
+absence of new tests before application). `check.py` is a standard-library,
 read-only gate: it imports no Hermes code and has no apply/install command. An
 archive alone is not an applicable checkout; the gate also requires exact Git HEAD.
 There is no private vault/provider, code-prompt scope, personal path, config,
 credential, dialogue or historical-log dependency in this package.
 
-The two fixes are:
+The compatibility behaviors are:
 
 - A successfully consumed human steer/redirect needing a reply (including unknown
   addressing) removes a machine/bot opener's silence exemption for that running
@@ -37,6 +37,12 @@ The two fixes are:
   next substantive answer. Normal answers, prose mentioning markers and visible
   silence warnings remain visible. Healthy explicit room `allow_silence`, bot-only
   and known-unaddressed behavior remain supported; failures are not globally hidden.
+- An exact, unquoted first control line before nonblank text is stripped, not used
+  to suppress that text. Final, queued-final, completed interim and stream display
+  use the same cleaner. Inline, blockquoted and fenced examples remain content.
+  A bare marker still uses the existing turn-aware silence/warning policy.
+- A commentary tick cannot flush a buffered bare marker before its progress text.
+
 
 ## Manual check, application and rollback
 
@@ -96,6 +102,30 @@ Rollback changes source bytes only, not code already loaded by a running process
 
 ## Observed verification, not deployment
 
+### Leading-control-line regression (2026-11-13)
+
+Against the previous compatibility patch on the pinned public archive: **9 failed,
+5 passed** before the fix; **138 passed** after, across the new 14 cases and four
+adjacent files (mixed-turn, consumer, filters and gateway tokens). The failed-turn
+assertion was corrected to preserve the existing failure notice in addition to the
+body. This does not authorize applying the public patch to dirty or live source.
+
+Re-run only this narrow suite on a disposable patched copy with existing dependencies:
+
+```sh
+"$PYTHON" -B "$COMPAT/run_tests.py" "$HERMES" /absolute/new/scratch-output
+```
+
+`run_tests.py` preserves the isolation guards described below. Its collector is a
+synthetic adapter, not Telegram delivery or a real-model test. No service was activated.
+
+
+### Previous-patch verification (historical)
+
+The measurements in this subsection predate the leading-control-line change. They
+are not acceptance evidence for the updated patch; the current five-file result
+is 138 passed, as recorded above.
+
 On macOS arm64 with existing Python **3.11.13**, pytest **9.1.1**, synthetic homes,
 an allowlisted environment, bootstrap disabled, blocked network connections/child
 processes and an outside-write audit:
@@ -120,14 +150,17 @@ the patch. A separate non-pytest busy-handler -> OOB user row -> response shapin
 opener. Packaged-patch application/reversal and deliberate version/hash mismatches
 were separately exercised in scratch.
 
-### Reproduce the nine-file check
+### Optional extended reproduction
 
 Use a disposable, already patched source checkout at the exact pinned revision,
 with no live service using it. Set `HERMES` as above and `PYTHON` to an **absolute**
 path to an existing environment containing Hermes' test/runtime dependencies,
 `pytest` and `pytest-asyncio`. No installation is performed here. The observed
 environment was Python 3.11.13 / pytest 9.1.1; this is not supported-runtime CI.
-The command below runs the nine public test files together (217 passed locally).
+The command below now includes ten files, including the new leading-control-line
+regression. The previous nine-file selection passed 217 tests on the previous
+patch; this expanded command has not been run on the updated patch. Use the
+five-file command above to reproduce this change's measured 138-pass check.
 It needs no private harness, profile, credentials, model, or platform access.
 
 Run from a shell with `mktemp`, `mkdir` and `env`. `RUN` is a new disposable scratch
@@ -176,7 +209,7 @@ def audit(event, args):
         raise PermissionError('TEST_CHILD_PROCESS_BLOCKED')
 sys.addaudithook(audit)
 import pytest
-targets = ['test_mixed_turn_silence.py', 'test_stream_consumer.py',
+targets = ['test_leading_silence.py', 'test_mixed_turn_silence.py', 'test_stream_consumer.py',
            'test_response_filters.py', 'test_room_allow_silence.py',
            'test_bot_peer_runtime_notices.py', 'test_gateway_silence_tokens.py',
            'test_busy_redirect_anchor.py', 'test_silence_after_reply_line.py',

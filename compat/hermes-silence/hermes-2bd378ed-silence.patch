@@ -11,7 +11,29 @@
          """One turn now answers *other* too: an addressed message wins, then an unknown one."""
 --- a/gateway/response_filters.py
 +++ b/gateway/response_filters.py
-@@ -178,6 +178,8 @@
+@@ -89,6 +89,21 @@
+     return head.rstrip(), tail
+ 
+ 
++def strip_leading_silence_marker(response: Any) -> Any:
++    """Strip only an unquoted, independent first control line before real text.
++
++    Keep bare markers for the turn-aware silence verdict; inline mentions and quoted
++    examples are content. No judgment about the remaining text's value is made.
++    """
++    if not isinstance(response, str):
++        return response
++    first, separator, body = response.partition("\n")
++    if (separator and body.strip()
++            and _canonical_silence_candidate(first) in LIVE_GATEWAY_SILENT_MARKERS):
++        return body.lstrip("\r\n")
++    return response
++
++
+ def strip_trailing_silence_marker(response: Any) -> Any:
+     """Drop a silence marker that closes a real reply on its own line.
+ 
+@@ -178,6 +193,8 @@
      by the gateway poller, never inferred from inbound text), but it deliberately stays
      non-internal so authorization and the emergency stop still apply to it.
      """
@@ -69,16 +91,19 @@
                  _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                  if _terminal_inbound:
                      event.ledger_message_id = str(_terminal_inbound)
-@@ -1613,6 +1617,8 @@
+@@ -1613,7 +1617,10 @@
                  logger.debug("Stream consumer wait before queued message failed: %s", e)
          # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
          _delivery_result = response if isinstance(response, dict) else (result or {})
+-        first_response = _delivery_result.get("final_response", "")
 +        if getattr(turn_ctx, "human_reply_expected", False):
 +            _delivery_result = {**_delivery_result, "_human_reply_expected": True}
-         first_response = _delivery_result.get("final_response", "")
++        from gateway.response_filters import strip_leading_silence_marker
++        first_response = strip_leading_silence_marker(_delivery_result.get("final_response", ""))
          _already_streamed = self._run_agent_stream_confirmed_final_delivery(
              _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
-@@ -2217,10 +2223,14 @@
+         )
+@@ -2217,10 +2224,14 @@
              response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
              if isinstance(response, dict):
                  response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
@@ -104,14 +129,24 @@
          if (not silent or not session_key or silence_allowed(kind, expected)
                  or not is_intentional_silence_response(agent_result.get("final_response"))):
              return
+@@ -114,6 +116,8 @@
+             _sanitize_gateway_final_response, _should_clear_resume_pending_after_turn,
+         )
+         response = agent_result.get("final_response") or ""
++        from gateway.response_filters import strip_leading_silence_marker
++        response = strip_leading_silence_marker(response)
+         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text doubles as final_response
+         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
+         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
 --- a/gateway/run_turn_runner.py
 +++ b/gateway/run_turn_runner.py
-@@ -321,6 +321,14 @@
+@@ -321,6 +321,15 @@
  
          def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
              if not ctx._run_still_current():
 +                return
-+            from gateway.response_filters import is_intentional_silence_response
++            from gateway.response_filters import is_intentional_silence_response, strip_leading_silence_marker
++            text = strip_leading_silence_marker(text)
 +            # A completed control marker is not commentary; final shaping still enforces replies.
 +            if is_intentional_silence_response(text):
 +                if stts is not None:
@@ -121,7 +156,7 @@
                  return
              unseen = False
              if local_viewer_route and not already_streamed and str(text or "").strip():
-@@ -1028,8 +1036,8 @@
+@@ -1028,8 +1037,8 @@
                  from gateway.response_filters import silence_allowed
                  # Where a bare marker would become the "needed a reply" warning, the agent ends a
                  # marker that follows a written reply on that reply, before transform/persistence.
@@ -134,16 +169,25 @@
                  finally:
 --- a/gateway/stream_consumer.py
 +++ b/gateway/stream_consumer.py
-@@ -411,7 +411,7 @@
+@@ -31,6 +31,7 @@
+     is_intentional_silence_response as _is_intentional_silence_response,
+     is_partial_silence_marker as _is_partial_silence_marker,
+     ends_with_partial_silence_marker as _ends_with_partial_silence_marker,
++    strip_leading_silence_marker as _strip_leading_silence_marker,
+     strip_trailing_silence_marker as _strip_trailing_silence_marker)
+ from gateway.stream_consumer_directives import has_pending_media_directive, strip_image_tags_for_display
+ from gateway.stream_consumer_fences import ensure_closed_code_fences
+@@ -411,7 +412,8 @@
  
      def on_commentary(self, text: str) -> None:
          """Queue a completed interim assistant commentary message."""
 -        if text:
++        text = _strip_leading_silence_marker(text)
 +        if text and not _is_intentional_silence_response(text):
              self._queue.put((_COMMENTARY, text))
  
      def flush_pending_sync(self, timeout: float = 5.0) -> bool:
-@@ -571,6 +571,14 @@
+@@ -571,6 +573,14 @@
                      continue
                  if tick.got_reopen_seed:
                      await self._eager_reopen_seed()
@@ -158,6 +202,24 @@
                      continue
  
                  if tick.got_done:
+@@ -772,6 +782,9 @@
+ 
+     def _should_edit(self, tick: _Tick) -> bool:
+         """Decide whether this tick flushes an edit/frame."""
++        # Commentary ticks finalize the current buffer too; they must not bypass this gate.
++        if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
++            return False
+         if not tick.is_interim:
+             return True
+         if self.cfg.buffer_only:
+@@ -1034,5 +1047,5 @@
+         around it, so interim frames stay prefix-stable. A silence marker closing the reply on its own
+         line is dropped (``strip_trailing_silence_marker``); a bare marker is left for the silence check.
+         """
+-        return _strip_trailing_silence_marker(
+-            strip_image_tags_for_display(_BasePlatformAdapter.strip_media_directives_for_display(text)))
++        return _strip_trailing_silence_marker(_strip_leading_silence_marker(
++            strip_image_tags_for_display(_BasePlatformAdapter.strip_media_directives_for_display(text))))
 --- a/gateway/turn_context.py
 +++ b/gateway/turn_context.py
 @@ -66,6 +66,7 @@
@@ -483,3 +545,122 @@
  
  class TestCancelledConsumerSetsFlags:
      """Cancellation must set final_response_sent when already_sent is True.
+--- /dev/null
++++ b/tests/gateway/test_leading_silence.py
+@@ -0,0 +1,116 @@
++"""Leading silence control-line regressions."""
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
++from tests.gateway.test_gateway_silence_tokens import _event, _runner, _source
++from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", ["machine", "human", "oob", "failed"])
++async def test_final_control_line_keeps_body(monkeypatch, tmp_path, mode):
++    runner = _runner(monkeypatch, tmp_path)
++    event = _event(internal=mode in ("machine", "oob"), reply_expected=mode == "human")
++    event._human_reply_expected = mode == "oob"
++    runner._run_agent = AsyncMock(return_value={
++        "final_response": "[SILENT]\n\nThe requested result is ready.",
++        "messages": [], "failed": mode == "failed",
++    })
++    response = await runner._handle_message_with_agent(event, _source(), "leading-final", 1)
++    if mode == "failed":
++        assert response.startswith("The requested result is ready.")
++        assert "[SILENT]" not in response
++        assert "Your request was not processed." in response
++    else:
++        assert response == "The requested result is ready."
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", [
++    "The literal [SILENT] is documented here.",
++    "> [SILENT]\nThis is quoted.",
++    "```text\n[SILENT]\n```\nThis is a sample.",
++    "[SILENT] is a literal token in this sentence.",
++    '"[SILENT]"\nThis is quoted.',
++])
++async def test_quoted_or_inline_marker_is_content(monkeypatch, tmp_path, text):
++    runner = _runner(monkeypatch, tmp_path)
++    runner._run_agent = AsyncMock(return_value={"final_response": text, "messages": []})
++    response = await runner._handle_message_with_agent(_event(), _source(), "leading-quote", 1)
++    assert response == text
++
++
++@pytest.mark.asyncio
++async def test_commentary_tick_cannot_flush_a_bare_marker():
++    adapter = ProgressCaptureAdapter()
++    consumer = GatewayStreamConsumer(adapter, "synthetic", StreamConsumerConfig(cursor=""))
++    consumer.on_delta("[SILENT]")
++    consumer.on_commentary("Substantive progress.")
++    consumer.finish("[SILENT]")
++    await consumer.run()
++    assert [row["content"] for row in adapter.sent] == ["Substantive progress."]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("streamed", [False, True])
++async def test_consumer_prefix_keeps_body(streamed):
++    adapter = ProgressCaptureAdapter()
++    consumer = GatewayStreamConsumer(adapter, "synthetic", StreamConsumerConfig(cursor=""))
++    text = "[SILENT]\n\nThe requested result is ready."
++    if streamed:
++        consumer.on_delta("[SIL")
++        consumer.on_delta("ENT]\n")
++        consumer.on_delta("\nThe requested result is ready.")
++    else:
++        consumer.on_commentary(text)
++    consumer.finish(text)
++    await consumer.run()
++    visible = [row["content"] for row in adapter.sent + adapter.edits]
++    assert visible and all(row == "The requested result is ready." for row in visible)
++
++
++@pytest.mark.asyncio
++async def test_real_worker_interim_without_token_streaming(monkeypatch, tmp_path):
++    from tests.gateway import test_silence_after_reply_line as wiring
++    from gateway.run_turn_runner import TurnRunner
++    captured = {}
++    make_runner = wiring._make_runner
++
++    def build(adapter):
++        captured["adapter"] = adapter
++        return make_runner(adapter)
++
++    def conversation(agent, message, **kwargs):
++        assert agent.interim_assistant_callback is not None
++        agent.interim_assistant_callback("[SILENT]\n\nSubstantive progress.")
++        return {"final_response": "The final answer.", "messages": [], "api_calls": 1}
++
++    monkeypatch.setattr(wiring, "_make_runner", build)
++    monkeypatch.setattr(wiring.RecordingAgent, "run_conversation", conversation)
++    original = TurnRunner._setup_stream_consumer
++
++    def setup(self, platform_key):
++        self._ctx.interim_assistant_messages_enabled = True
++        self._ctx.resolve_display_setting = lambda *args: False
++        return original(self, platform_key)
++
++    monkeypatch.setattr(TurnRunner, "_setup_stream_consumer", setup)
++    await wiring._run(monkeypatch, tmp_path, reply_expected=False,
++                      persist_user_display_kind="internal_notification")
++    assert [row["content"] for row in captured["adapter"].sent] == ["Substantive progress."]
++
++
++@pytest.mark.asyncio
++async def test_queued_final_keeps_body(monkeypatch, tmp_path):
++    runner = _runner(monkeypatch, tmp_path)
++    runner._deliver_queued_first_response = AsyncMock(return_value=True)
++    ctx = SimpleNamespace(mute_notification_reply=False, session_key=None,
++        stream_consumer_holder=[None], source=_source(), persist_user_display_kind=None,
++        reply_expected=True, human_reply_expected=True, _status_thread_metadata=None,
++        event_message_id="synthetic", inbound_message_id="synthetic", run_generation=1)
++    result = {"final_response": "[SILENT]\n\nThe queued answer.", "messages": []}
++    await runner._run_agent_deliver_first_response(ctx, None, result, result, None)
++    assert runner._deliver_queued_first_response.await_args.args[0] == "The queued answer."
