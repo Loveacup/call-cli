@@ -147,11 +147,11 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 一个适配器提供三个方法：`prepare_start(model, effort, approval)` 返回持久选择字段；`run(store, task, emit)` 执行已认领轮次，发出安全的 `stage/answer/question/tool` 事件并返回 `TurnResult(state, exit_code, stop_reason, note)`；`control(task, action, timeout)` 提供精确会话控制与关闭后的 `status_snapshot/no-session` 读回。执行中检查共享任务的 `cancelling`，只有执行真正结算才能返回 cancelled；未知结果返回 unknown，不重放。适配器不修改归属、轮次或 writer 占用；现有设备锁可以复用，不新增进程服务或状态库。新增后端只需实现并注册它，随 runner 安装，不必修改其他后端；不要求使用 ACP。
 
-当前扩展边界：公共 start 仍显式接受 AGY 专用 `agy_approval`，并以第三个 `approval` 参数交给适配器；不存在通用后端私有参数字典。close 仍沿用 ACPX 风格约定：CLI 要求 JSON `action=status_snapshot`、`status=no-session`；Hermes 端检查 stdout 的 `no-session` / `not running` 字符串。非 ACP 适配器必须归一化到此控制返回格式。这不阻碍已实现的 fake 后端；未来出现实际专属参数或关闭格式需求时再扩展公共契约，不代表任意新后端零入口修改。
+公共 start 接受 AGY 专用 agy_approval、agy_swarm、agy_worker_model；G4C 默认 native，G4A 默认 off，显式模式覆盖。native 唯一 ACP owner 不经 ACPX control/recovery；close 按当前 task/turn 结果、worker add/kill completed 与 unload 证据释放，不要求 ACP 未提供的 rawOutput，也不证明任意后代死亡。异常保 unknown/HOLD。
 
 结算状态与该轮唯一 `<turn>:settled` 事件在同一事务提交，事件带持久 seq、问题 ID、回答摘要和适用的介入续作提示。runner 仅打印事务接受的结算事件；即使其后轮次已推进或进入关闭，也不会丢弃这个已合法结算的通知。被拒绝的旧 runner 不广播终态，普通旧轮事件过滤保持不变；游标补读可恢复已入库事件，不承诺进程崩溃后的 stdout 重放。
 
-当前 `acpx_backend.py` 负责 ACPX 命令、会话创建、模型读回、共享安装锁与 Shared Runtime 传输；`transport.py` 保留通用本机/SSH 命令和协作协议；`events.py` 规范化 ACP 公开事件。OMP/Codex/Pi 使用该适配器原默认策略，AGY 在 `agy.py` 局部覆盖 raw command、显式 model/effort、默认 approve-all、提示与结果判断。`test_backends.py` 用非 ACP fake 后端通过同一公开协调入口完成问答、运行期介入、续轮、隔离、writer 冲突和关闭；这不是模型或宿主通知验收。
+ACPX 路径及其他 backend 不变；agy.py 按持久路由选择 native owner。native 复用 Store/runner/安装锁/skill/event；首 end_turn 仍 running，完整 load 观察后台。逐轮清除旧结果与清理证据，当前轮独立对账。AGY unknown 原子事件带 attention_required/next_action，runner stdout 与 OMP 托管轮询 follow-up/Hermes notify 主动返回；真实宿主接收/消费未验，不新增监控平台。详见 [AGY 合同](../skill/references/agy-models.md)。
 
 公共 start 可选 `skills` 数组，两个入口通过 Store 创建固定快照；ACPX 后端每轮在 prompt 前经现有目标命令暂存并加入技能路径/模式提示。其他后端可复用 `skills.stage(store, task, emit)` 与 `skills.guidance(task)`，不使用时不得声称支持读取。目标 `CALLCLI_SKILL` 行规范化为独立 skill 事件，Store 按轮次记录实际自报；required 缺报只标未验证，不改业务结算。契约、限制和选择策略见[技能传递](../skill/references/skill-passing.md)。
 
@@ -159,7 +159,7 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 安装按入口生成文件与 SHA-256 manifest，不用旧总数推算。当前 import 与相邻资源读取关系如下；这些文件须来自同一固定 commit，源码更新不自动更新已安装副本或内存 schema。
 
-- 公共 core／runner 闭包：`bridge.py`、`native_continuity.py`（Hermes native wrapper 使用；只读当前 profile `state.db` metadata）、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`。后两个资源分别由 `skills.py`、`acpx_backend.py` 相邻读取。`collab.py` 仍直用基础 `Store`，不启用 native metadata continuity。
+- 公共 core／runner 闭包：`bridge.py`、`native_continuity.py`（Hermes native wrapper 使用；只读当前 profile `state.db` metadata）、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`agy_native.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`。后两个资源分别由 `skills.py`、`acpx_backend.py` 相邻读取。`collab.py` 仍直用基础 `Store`，不启用 native metadata continuity。
 - 通用 POSIX 入口：公共闭包加 `collab.py`。
 - Hermes 插件入口：公共闭包加 `__init__.py`、`plugin.yaml`；manifest 声明 `call_cli`，不声明或全局启用 OMP extension。已有插件若提供 `collab.py`、`models.cjs`、`remote-client.cjs` 等附带入口，按其实际依赖保留，不替换整个物理目录或删除未列文件。
 - 实验性 OMP 宿主入口：公共闭包加 `collab.py`、`omp_bridge.py`、`omp-extension.mjs`；`.mjs` 通过相邻路径启动 Python bridge，后者导入 `collab.py`，再复用现有 runner。它不是 Hermes 插件注册项。

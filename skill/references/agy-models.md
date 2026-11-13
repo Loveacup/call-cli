@@ -2,12 +2,28 @@
 
 在执行设备上使用已安装的原生 `agy acp`，不下载第三方 antigravity adapter，也不改默认 provider。
 
+## 按模型默认的 native swarm
+
+未指定模型沿用 G4C；新 G4C 任务默认 `agy_swarm: native`，G4A 文字／知识任务默认单代理 `off`，可按任务显式 `native` 开启。G4C 可显式 off；worker 默认 G4H，覆盖保留。CLI `--agy-swarm native|off`／宿主同名字段持久化路由；旧任务不重新计算默认，其他 backend 不变。native 从实时目录解析并读回精确模型，显式覆盖必须广告，无静默替换。
+
+`agy_native.py` 在同一 `agy acp` 连接执行 new／设置／读回／首部 `/swarm` prompt。首轮 end_turn 后保持 running、原 owner 与占用，串行完整 load 观察 native board 自动唤醒后的结果，不发送定时 prompt、不读私有 DB。首回放按已发布工具 ID／消息逐次对齐，后续完整 load 共同前缀对账；失败或变更保 unknown。thought 丢弃，公开工具只留安全字段。
+
+`native_snapshot` 是内部对账副本；Hermes／OMP 宿主 status/list/wait 投影排除它，仍公开 `native_result` 与安全权限决定。通用本地 CLI 记录可保留 snapshot 供授权对账，不把它作为宿主周期通知载荷。
+
+正常结算按本 task/turn 的最终结果、对应 worker 原生 add/kill completed 和 session unload；ACP 缺 rawOutput 不再单独导致 HOLD。这是可观察生命周期结算与释放，不宣称所有后代进程死亡。新轮清除旧 result/cleanup/roster，恢复完整历史只作为边界，本轮结果不使用旧工具或 envelope。fatal_error、异常退出、断线、缺必要事件和不确定取消保 unknown/HOLD，不自动重放。AGY unknown 原子事件标 attention_required，runner stdout 主动回报；OMP 现有轮询发送 triggerTurn follow-up，缺终态事件时以 unknown task snapshot 提醒，Hermes 沿既有 notify terminal 返回。事件生成、宿主接收、模型实际消费分别核验；真实宿主端到端仍未验。复用 AGY 1.5.7 单 worker active-load 证据，不追加付费 swarm／取消专项；真实取消全停未验。native 不接受硬执行 timeout。
+
+生产 prompt 仍强制 turn。仅同一 owner 新建精确 session、task 第 1 轮、提交前 load 为空且 prompt 已返回时，兼容缺 turn 的旧 envelope；仍要求 task 和本轮 add/kill 对账。保存 owner 推定的 turn_attribution 与未改动 original_envelope，不伪称模型回传 turn。恢复会话／第 2 轮起／无 owner 上下文均不适用，继续严格 turn 校验。
+
+以下为显式 off 与旧任务的 ACPX 模型／诊断路径。
+
 ## 发起端 Core CLI 负责选择
 
 1. 先读当前 `agy models`，再在执行设备的 Call CLI 检出目录运行 `node models.cjs /absolute/workdir`。后者通过 ACPX 公共 `inspectAgentModels` 读取本次 ACP 模型元数据，无业务 prompt、文件或终端能力；可能留下原生 metadata session 历史，探测连接会关闭。
 2. 从返回的 `availableModelIds` 选择一个精确 ID。用户明确选择优先；未指定时由发起端根据任务复杂度、延迟、成本选择，并说明理由。简单探测优先轻量模型，复杂实现/审查按需求选择能力更强的当前候选，不永久绑定历史型号。
 3. 可选 JEV 只比较本次实际候选及脱敏任务摘要，不接收凭据、私有任务正文；结果必须属于候选集。不在集合内就拒绝该建议，由发起端在原集合选择。JEV 不是必需依赖，不自动安装，不替代用户选择。
-4. 新 AGY 任务必须传 `model`；普通 agent 仍可省略。模型不可用或控制失败时停下报告，不替换模型、不切 provider、不重复业务任务。
+4. 未指定模型采用 G4C；off 路径使用对应 G4C 广告 family，显式模型按本次目录选择。模型不可用或控制失败停下报告，不换模型/provider，不重复业务任务。
+
+未指定模型而显式 off 当前持久化 G4C family，由旧 ACPX 设置／读回路径处理；该组合未在 AGY 1.5.7 真 adapter 验证，family 与 current_model_id 的 tier-ID 差异可能使读回拒绝，拒绝时不提交 prompt。需要当前已核选择时显式传发现的精确 G4C ID 再 off；不把该未验组合写成真实执行通过。
 
 ## ACPX 0.22 / AGY 元数据差异
 

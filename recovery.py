@@ -7,7 +7,7 @@ def public_close_receipt(receipt):
 def recovery_card(task, db_path=None, seq=0, host=None):
     surface = task.get('initiating_surface', host or 'unknown')
     exact_reconcile = (task['state'] == 'unknown' and task['device'] == 'local'
-                       and bool(task.get('acpx_record_id')))
+                       and bool(task.get('acpx_record_id')) and task.get('agy_swarm') != 'native')
     if task['state'] == 'unknown':
         if not exact_reconcile:
             next_action = 'retain HOLD; exact-record recovery unavailable here; resolve identity/device via authorized operator'
@@ -16,6 +16,8 @@ def recovery_card(task, db_path=None, seq=0, host=None):
             next_action = action + ' exact record without replay'
         else:
             next_action = 'retain HOLD pending exact-record probe-only reconciliation through an authorized available entry point; no replay'
+        if task.get('agy_swarm') == 'native':
+            next_action = 'retain native worker HOLD; inspect recovered native_result and owned public evidence; ACPX record close cannot release'
     else:
         next_action = 'inspect exact task before explicit control'
     return dict(task_id=task['id'], device=task['device'],

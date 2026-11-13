@@ -46,7 +46,7 @@ class HostBridge(Collaboration):
         from recovery import public_close_receipt
         result = {key:(public_close_receipt(item) if key == 'close_receipt' else HostBridge.public(item))
                   for key,item in value.items()
-                  if key not in {'origin','prompt','reply_commands','controller'}}
+                  if key not in {'origin','prompt','reply_commands','controller','native_snapshot'}}
         if 'id' in value:
             result['host_binding'] = 'omp-extension'
         if 'controller' in value:
@@ -57,7 +57,7 @@ class HostBridge(Collaboration):
         self.binding = self.identity(host)
         self.origin(capability)
         allowed = {
-            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'skills'},
+            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'skills'},
             'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
             'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout', 'expected_turn', 'command_id'},
             'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},

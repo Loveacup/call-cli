@@ -19,10 +19,11 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 跨设备使用协调主机已有 SSH 别名。Windows 目标增加 `--remote-shell powershell`，cwd 使用该设备上的绝对盘符路径。发起端的路径不会自动映射到目标；不要把损坏的盘符或引号“修好”后悄悄继续。
 
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。
-- `--agent` 取 `omp/codex/pi/agy`：是真正的执行目标；AGY 另传当前发现的 `--model`。
+- `--agent` 取 omp/codex/pi/agy。AGY 未指定模型用 G4C，G4C 默认 native swarm；G4A 文字／知识默认 off，可显式 native 开启，G4C 可显式 off。worker 默认 G4H，模型覆盖保留。路由随任务持久化，旧任务及其他 CLI 不变。
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
+- native 不设硬执行 timeout，首 end_turn 后仍 running。正常按本轮最终结果、对应 worker add/kill completed 和 session unload 结算并释放，不承诺所有后代死亡；缺 rawOutput 不单独保 HOLD。旧轮 result/cleanup/roster 不复用。fatal/异常退出/缺必要事件/取消不明保 unknown，attention_required 事件经 runner／既有宿主主动回流；OMP triggerTurn follow-up 与 Hermes notify 仅说明路径，实际接收／消费另验。真实取消未验且不追加付费专项。
 - 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
@@ -56,7 +57,7 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
 - `completed/cancelled`：对应轮已结算，仍需检查真实结果或残留。
 - `unknown`：保留任务与资源定位，先对账原会话和进程；不要重放。
-- 四个执行 CLI（OMP/Codex/Pi/AGY）共用完成证据边界：正常 exit 0 与本轮有效 `end_turn` 之外，还须有最后一次工具事件后的非空回答，或保留待答问题为 `waiting_reply`。仅 stage、skill 回执、空输出或工具状态为 `unknown`，写占用不释放、不自动重放；工具之后才出现的回答仍可正常完成。按显式 `CALLCLI_STAGE` / `CALLCLI_SKILL` / `CALLCLI_QUESTION` 分类，不用自然语言关键词判断。普通助手文字仍按回答处理，不证明业务验收；当前投影不传结构化工具正文，协议也没有已定义的无文字业务成功契约，不能把工具 `completed` 当最终成果。取消与协议失败继续走原结算边界。
+- 以下 ACPX 完成／错误规则适用于 OMP/Codex/Pi 及 off／旧 AGY，不适用于 native swarm 的首轮 end_turn：正常 exit 0、本轮有效 end_turn 及最后工具后非空回答，或待答问题 waiting_reply。仅 stage／skill／空输出／工具状态保 unknown，不重放；普通回答不是独立业务验收。
 - AGY 一轮公开输出的最后一个非空行若恰为 `⚠ Agent execution terminated due to error.`，即使协议返回 `end_turn` / exit 0，也记为 `unknown`，并在 `settlement_note` 与最终事件中写明“AGY 报告致命执行错误、未完成、结果不明、不自动重放”。该判定只拒绝完成，不代表已知根因；引用、前后缀或其后仍有内容的同类文字按普通内容处理。
 - AGY 工具 failed 且最后一个工具事件后无最终回答、也无待答问题时，仅在传输 exit 0、未失败且 end_turn 的情况下，记 `unknown` 并附 `settlement_note`；stage 不算回答。传输失败保留直接的退出说明，不改称工具失败或权限拒绝。正常提问保留 `waiting_reply`，可用准确 question ID 回复；既有 fatal 最终行仍覆盖提问。工具失败后恢复并给出最终回答可 `completed`。协议结束、工具失败和业务结果分别核对。
 - `busy: true, task: null`：数据库锁竞争，没有可信状态；保留游标，稍后再看。

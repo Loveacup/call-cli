@@ -6,6 +6,8 @@
 
 POSIX 用 `command -v acpx omp codex pi agy`，Windows 用 `Get-Command`。自定义 agent 可由配置 command/argv 定位；只读必要字段，不输出认证配置。OMP 常用 `omp acp`；AGY 使用原生 `agy acp`。未知 agent 名不代表内置支持；AGY 精确模型／effort 与历史查询见[模型参考](agy-models.md)。
 
+G4C 默认 native、G4A 默认 off，可按任务显式覆盖。native 由 agy_native.py 唯一 owner 控制，下面 ACPX 命令只用于其他 CLI、off／旧 AGY。首 end_turn 不结束任务；正常以本轮结果、对应 add/kill completed 和 session unload 结算释放，不宣称任意后代全死。异常/取消不明保 unknown/HOLD；不另开控制 writer。见[AGY 参考](agy-models.md)。
+
 - 无工具问答：`--deny-all --no-fs --no-terminal`。
 - 读文件：`--approve-reads --non-interactive-permissions deny`。
 - 已授权的本地编辑／测试：`--approve-all`，任务包明确路径与交付。

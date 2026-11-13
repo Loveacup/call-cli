@@ -251,3 +251,35 @@ for(const stop of ['close','detach'])test(`${stop} clears a pending intervention
   assert.equal(f.timers.length,0,'stop must leave no timer');
   assert.equal(f.calls.filter(c=>c.args?.action==='wait').length,1,'stop must not advance the target');
 });
+
+test('AGY unknown wakes original initiator without a status request and preserves review intent', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'agy',cwd:'/work',prompt:'owned'},f.ctx);
+  f.setPacket({task:{id:'task-a',agent:'agy',turn:1,state:'unknown'},events:[{
+    seq:3,kind:'unknown',turn:1,token:'1:settled',text:'AGY reported a fatal execution error',
+    attention_required:true,next_action:'Inspect exact task; no automatic replay'}]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  const notice=JSON.parse(f.sent[0].message.content);
+  assert.equal(notice.task_id,'task-a');
+  assert.equal(notice.events[0].attention_required,true);
+  assert.deepEqual(f.sent[0].options,{deliverAs:'followUp',triggerTurn:true});
+  assert.equal(f.calls.filter(c=>c.args?.action==='status').length,0);
+  assert.equal(f.calls.at(-1).host.session_id,'host-a');
+  f.setPacket({task:{id:'task-a',state:'unknown'},events:[]});
+  await f.adapter.execute({action:'intervene',task_id:'task-a',command_id:'review-1',prompt:'Review failure; do not replay'},f.ctx);
+  assert.equal(f.calls.at(-1).args.command_id,'review-1');
+  f.adapter.detach();
+});
+
+test('AGY unknown snapshot without terminal event still raises one origin attention notice', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'agy',cwd:'/work',prompt:'owned'},f.ctx);
+  f.setPacket({task:{id:'task-a',agent:'agy',turn:2,state:'unknown',settlement_note:'disconnected'},events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  assert.match(f.sent[0].message.content,/disconnected/);
+  assert.equal(f.sent[0].options.triggerTurn,true);
+  assert.equal(f.timers.length,0);
+  assert.ok(!f.calls.some(c=>['intervene','cancel'].includes(c.args?.action)));
+});

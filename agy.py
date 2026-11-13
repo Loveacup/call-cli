@@ -82,3 +82,17 @@ class AgyBackend(AcpxBackend):
 
     def outcome_note(self, decoder, exit_code, state):
         return outcome_note(decoder, exit_code, state)
+
+    def run(self, store, task, emit):
+        if task.get('agy_swarm') != 'native':
+            return super().run(store, task, emit)
+        try:
+            from .agy_native import run_native
+        except ImportError:
+            from agy_native import run_native
+        return run_native(store, task, emit, self.prompt_guidance(task))
+
+    def control(self, task, action, timeout=20):
+        if task.get('agy_swarm') == 'native':
+            raise ValueError('Native ACP control belongs to the claimed single owner; no ACPX control permitted')
+        return super().control(task, action, timeout)

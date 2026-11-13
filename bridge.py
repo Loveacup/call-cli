@@ -106,6 +106,10 @@ class Store:
         current = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task['id'],)).fetchone()[0])
         if current['state'] == 'closed' or current.get('release_epoch'):
             raise ValueError('Task is permanently fenced')
+        if task.get('agy_swarm') == 'native' and current['turn'] != task['turn']:
+            for key in ('native_result', 'native_cleanup', 'native_cancel', 'native_snapshot',
+                        'native_workers', 'native_roster', 'native_prompt_submitted', 'native_phase'):
+                task.pop(key, None)
         db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(task), task['id']))
 
     def update(self, task_id, **changes):
@@ -423,6 +427,11 @@ class Store:
             event['recovery'] = recovery_card(task, self.path)
             if task.get('intervention', {}).get('status') == 'pending':
                 event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
+            if state == 'unknown' and task['agent'] == 'agy':
+                event.update(attention_required=True, notification_scope='originating-session',
+                             next_action='AGY outcome unknown. Inspect this exact task and artifacts now; preserve HOLD. '
+                                         'Do not replay automatically; reconcile before any authorized continuation.',
+                             delivery='event-generated; host receipt and consumption unverified')
             inserted = db.execute('INSERT INTO events VALUES (?,?,?)',
                                   (task_id, event['token'], json.dumps(event)))
             event['seq'] = inserted.lastrowid

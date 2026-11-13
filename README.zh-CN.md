@@ -124,7 +124,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
   - 若要在运行中或结算后改向，传入幂等安全的 `--command-id`：
     `python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" intervene --task "$TASK_ID" --command-id rev-1 --prompt '修订后的范围'`
     随后继续短 `wait`，由协调端取消旧轮、确认结算并在同一会话启动第 2 轮。
-- **调用 AGY 或传递任务技能：** 调用 AGY 前须先在执行设备运行发现脚本获取当前广告的模型 ID（不同设备/账号返回的候选模型可能不同，不能预设任何设备都有固定模型 ID）。下方示例省略了默认 `--effort`；若显式传入 `--effort`，其值必须从 `models.cjs` 返回的 `thought_level.options` 中核验：
+- **调用 AGY 或传递技能：** 未指定模型用 G4C，默认 native swarm／G4H workers；G4A 文字／知识任务默认单代理 off，可显式 `--agy-swarm native` 开启。G4C 可显式 off，协调／worker 模型覆盖保留。显式选择前发现广告 ID：
   ```sh
   # 1. 发现本执行设备当前广告的精确 ACP 模型 ID 与 thought_level.options
   node "$CALL_CLI_HOME/models.cjs" "$CALL_CLI_HOME"
@@ -132,7 +132,7 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
   # 2. 将 MODEL_ID 设为本次 availableModelIds 返回的精确值，独立发起 AGY 任务、短等待结算并关闭（确认 no-session）
   MODEL_ID="gemini-4-argon"  # 仅作示例；请按当前执行设备本次发现结果选择
   AGY_TASK_JSON="$(python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
-    start --device local --agent agy --model "$MODEL_ID" \
+    start --device local --agent agy --agy-swarm off --model "$MODEL_ID" \
     --cwd "$CALL_CLI_HOME" --skill reference="$CALL_CLI_HOME/skill" \
     --prompt 'Read the passed skill as reference and list the supported actions.')"
   printf '%s\n' "$AGY_TASK_JSON"
@@ -179,9 +179,9 @@ python3 "$CALL_CLI_HOME/collab.py" --db "$CALL_CLI_DB" --client "$CLIENT_ID" \
 
 ### 1. 原生 AGY 支持与持久工具放行（`agy.py`、`models.cjs`）
 
-- **实时 ACP 模型与 effort 发现：** 在执行设备运行 `node models.cjs /absolute/workdir`，通过 ACPX 公共 `inspectAgentModels` 读取当前广告的模型候选。不同执行设备/账号返回的模型候选可能不同，须按该设备本次发现结果从 `availableModelIds` 中选择精确 ID 传入 `--agent agy --model ID`（Hermes：`agent: "agy", model: "ID"`）；可选 `--effort VALUE` 须从 `models.cjs` 返回的 `thought_level.options` 中核验（已在 **AGY 1.5.3 / ACPX 0.22.0** 实测 `gemini-4-argon` / `medium`、`claude-opus-5-5` / `medium` 与 `gemini-3.8-flash` / `low`）。绝不从显示名猜测或剥离后缀。每轮提交 prompt 前由原生 CLI `set` 设置并经 `sessions show` 精确读回核验，失败直接停止，不静默回退模型或切换 provider。
+- **按模型默认 swarm：** 未指定模型用 G4C；G4C 默认 native，G4A 默认单代理 off。`--agy-swarm native|off` 按任务覆盖，worker 默认 G4H，可用 `--agy-worker-model` 覆盖。native owner 现场解析精确 ID、设置并读回。旧任务沿原路径，其他 CLI 不变。详见 [AGY 合同](skill/references/agy-models.md)。
 - **默认 `approve-all` 审批与工作区写占用分离：** 新建 AGY 任务默认持久化 `agy_approval: "approve-all"`（即使 `write` 为 `false`），放行任务授权范围内的 shell 与原生工具，同时提示词优先引导使用原生 read/search 工具。若需严格只读审批，显式传入 `--agy-approval approve-reads`（Hermes：`agy_approval: "approve-reads"`），此时 shell/写请求会被非交互拒绝。**工具审批策略与 `write: false` 都不是操作系统或文件系统沙箱；** 获授权编辑文件仍须另传 `--write` 以声明写权限并占用工作区。`reply`/`intervene` 续轮保留该策略；缺省该字段的旧任务仍按原 `write` 映射，OMP/Codex/Pi 的默认策略（缺省 `approve-reads`，`--write` 选 `approve-all`）保持不变。
-- **如实结算业务结果：** 协议层 `end_turn` / exit `0` 不直接等于业务成功。对 AGY 任务，若任一工具调用状态为 `failed` 且最后一次工具事件后既无最终回答也无待答问题——或公开输出最后一个非空行恰为致命错误标记 `⚠ Agent execution terminated due to error.`——该轮如实结算为 `unknown` 并记录 `settlement_note`（不自动重放）。待答问题仍保留 `waiting_reply` 可正常回复（致命错误最终行优先覆盖）；工具失败后若恢复并输出最终回答则可正常完成。公开事件仅保留安全工具标识符、类别与状态；因当前公共 Shared Runtime 事件不暴露权限决策，`permission_diagnostics.permission_decisions` 统一记为 `unobservable`，不把工具失败臆测为权限拒绝。详见 [AGY 模型与审批工作流（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
+- **正常可观察结算／异常主动通知：** 首 end_turn 不算完成。本 task/turn 最终结果、对应原生 worker add/kill completed 与 session unload 支持正常结算和释放，不宣称所有后代已死；缺 raw kill 输出不单独导致 HOLD。fatal、断线、缺必要事件或取消不明保 unknown/HOLD，并通过 runner／宿主既有路径主动提醒发起者，不自动重放。OMP 队列 follow-up 触发回合，Hermes 用 terminal notify；真实宿主接收／实际消费未端到端证明。不追加付费取消探测或执行截止。以下 Shared Runtime 诊断适用于 off／旧 AGY。
 - **安全认证诊断：** 失败轮可识别精确 `error.detailCode: "AUTH_REQUIRED"`，或通过公开 `runtime.watchSession()` 做有界被动回放（1 秒／1000 条当前请求事件／10000 条总事件）。后者要求精确 host request、turn_started、唯一主 prompt RPC／response 及 failed turn_result，且结构字段 `error.code === -32000`、`data.authRequired === true` 同时成立。回调 ID 碰撞、重复、缺 journal 或超时均保持原因未知。只回流固定类别和来源标签；不匹配错误正文、不回流原消息／任意 data／adapter stderr，不扫描 AGY 日志，不改凭据或重放。
   已在安装的 ACPX 0.22.0 配合隔离合成 ACP 端点实测认证分类、普通错误不分类、正常结果不变、单次 prompt 与 close/no-session。通用 queue detailCode 本身不是认证证据；fatal-only executor HTTP 401 与认证生命周期仍未解决，也不证明 Hermes/Telegram 投递通过。
 - **先复核、再有意介入或取消：** Hermes/OMP 模型工具拒绝 timeout，包括旧缓存参数；这不是 shell 权限边界。公共 runner 在原循环每 600s 至多请求一次复核，静默与长期活跃共享冷却，持续活动不能推迟检查点；提醒不自动取消、关闭或续跑，也不要求逐条转给用户。发起 agent 据真实事件/成果决定下一步，通知入队不证明消费，CLI 依赖活跃 owner 轮询。原 CLI/Python 显式硬 timeout 与存量预算在受支持续轮清除前仍生效；reply/intervene 支持 clear_timeout（CLI --clear-timeout），queued 一律拒绝该清除、unknown 保留锁。多问/替换/撤回规则见 [调用手册](docs/usage.md)。启动、控制、连接有界，其中无预算轮保留 120s prompt 接受边界；不承诺多轮墙钟或费用上限。

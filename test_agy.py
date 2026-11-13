@@ -47,7 +47,7 @@ class AgyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             c = Collaboration(Path(root)/'tasks.db', launch=lambda task: None)
             client = c.connect('codex')['client_id']
-            t = c.start(client, agent='agy', cwd=root, prompt='inspect', model='advertised-family', effort='low')
+            t = c.start(client, agent='agy', agy_swarm='off', cwd=root, prompt='inspect', model='advertised-family', effort='low')
             c.store.update(t['id'], state='completed')
             t = c.intervene(client, t['id'], 'continue')
             self.assertEqual(t['model'], 'advertised-family')
@@ -91,12 +91,23 @@ class AgyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, writer['id']):
                 c.start(b, agent='agy', cwd=root, prompt='edit', model='advertised', write=True)
 
-    def test_agy_requires_initiator_model_choice(self):
+    def test_model_specific_swarm_defaults_and_explicit_overrides_persist(self):
         with tempfile.TemporaryDirectory() as root:
             c = Collaboration(Path(root)/'tasks.db', launch=lambda task: None)
             client = c.connect('codex')['client_id']
-            with self.assertRaisesRegex(ValueError, 'model'):
-                c.start(client, agent='agy', cwd=root, prompt='inspect')
+            for model, explicit, expected in [(None, None, 'native'), ('gemini-4-carbon-medium', None, 'native'),
+                    ('gemini-4-argon-low', None, 'off'), ('gemini-4-argon', None, 'off'),
+                    ('gemini-4-argon-low', 'native', 'native'), ('gemini-4-carbon-medium', 'off', 'off'),
+                    (None, 'off', 'off')]:
+                with self.subTest(model=model, explicit=explicit):
+                    task = c.start(client, agent='agy', model=model, agy_swarm=explicit, cwd=root, prompt='inspect')
+                    self.assertEqual(task['agy_swarm'], expected)
+                    c.store.update(task['id'], state='completed')
+                    continued = c.intervene(client, task['id'], 'continue')
+                    self.assertEqual(continued['agy_swarm'], expected)
+            task = c.start(client, agent='agy', model='gemini-4-argon-low', agy_swarm='native',
+                           agy_worker_model='gemini-4-hydrogen-low', cwd=root, prompt='polish')
+            self.assertEqual(task['agy_worker_model'], 'gemini-4-hydrogen-low')
 
     def test_fatal_without_structured_auth_and_late_results_do_not_gain_auth_cause(self):
         from events import EventDecoder

@@ -35,7 +35,7 @@ class NativeAgyTests(unittest.TestCase):
             self.assertIn(model, discovered['availableModelIds'])
             c = Collaboration(Path(root)/'tasks.db', launch=lambda task: None)
             client = c.connect('codex')['client_id']  # declared, not native Codex provenance
-            task = c.start(client, agent='agy', cwd=root, model=model, effort=effort,
+            task = c.start(client, agent='agy', agy_swarm='off', cwd=root, model=model, effort=effort,
                            prompt='Do not use tools. Reply exactly CALLCLI_AGY_READY.', timeout=90)
             try:
                 self.assertEqual(__import__('test_dispatch').run_dispatched(c.store.path, task['id']), 0)
@@ -79,7 +79,7 @@ class NativeAgyTests(unittest.TestCase):
                     stderr=subprocess.DEVNULL, start_new_session=True))
             c = Collaboration(work/'tasks.db', launch=launch)
             client = c.connect('codex')['client_id']  # coordinator handle, not native host provenance
-            task = c.start(client, agent='agy', model=model, effort=effort, cwd=root,
+            task = c.start(client, agent='agy', agy_swarm='off', model=model, effort=effort, cwd=root,
                            write=True, timeout=180, prompt=(
                 'Controlled runtime-intervention probe. Only this temporary cwd is writable. '
                 'Emit CALLCLI_STAGE AGY_ACTIVE_GATE. Immediately run this foreground terminal command: '

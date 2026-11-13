@@ -22,13 +22,15 @@ SCHEMA={
         'device':{'type':'string','description':'local or an existing SSH host alias from call-cli device table'},
         'remote_shell':{'type':'string','enum':['posix','powershell'],'default':'posix'},
         'agent':{'type':'string','enum':list(BACKENDS)},
-        'model':{'type':'string','description':'Exact discovered ACP model ID; required for AGY; preserved on replies'},
+        'model':{'type':'string','description':'Advertised ACP model ID; omitted uses G4C. G4C defaults native swarm; G4A defaults off'},
         'effort':{'type':'string','description':'AGY advertised thought_level value; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
         'command_id':{'type':'string','description':'Stable intent ID; required for intervene and cross-controller or new no-question reply; reuse on retry'},
         'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
         'agy_approval':{'type':'string','enum':['approve-all','approve-reads'],'description':'AGY only: new tasks default to approve-all; approve-reads denies shell/write permission requests. Not a filesystem sandbox; independent of write reservation.'},
+        'agy_swarm':{'type':'string','enum':['native','off'],'description':'AGY task override: native/on or single-agent/off. G4C defaults native, G4A defaults off'},
+        'agy_worker_model':{'type':'string','description':'Exact advertised AGY native execution model; defaults to live-resolved G4H'},
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
@@ -79,7 +81,8 @@ class Coordinator:
                 raise ValueError('cwd must be absolute on execution device')
             if device=='local':cwd=str(Path(cwd).resolve(strict=True))
             from .transport import command
-            fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'))
+            fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'),
+                                 agy_swarm=args.get('agy_swarm'),agy_worker_model=args.get('agy_worker_model'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
             task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'),initiating_surface='hermes-native')
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=None,continuation_version=2,
@@ -132,7 +135,7 @@ class Coordinator:
     def public(task):
         def project(value):
             if isinstance(value,dict):
-                return {key:project(item) for key,item in value.items() if key not in {'prompt','reply_commands'}}
+                return {key:project(item) for key,item in value.items() if key not in {'prompt','reply_commands','native_snapshot'}}
             if isinstance(value,list):
                 return [project(item) for item in value]
             return value

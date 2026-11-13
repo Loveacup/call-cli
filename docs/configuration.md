@@ -98,7 +98,7 @@ Call CLI 使用 ACPX 的原生 agent 解析。OMP 可通过自定义 agent comma
 
 这只是合并片段。核对该版本 ACPX 的全局 `~/.acpx/config.json` 与 cwd 内 `.acpxrc.json` 规则，合并所需字段，不把示例整份覆盖到现有配置。Codex／Pi 使用实际安装的 ACP 适配，发现缺口先确认适配器入口，不把普通交互 CLI 或 Codex `app-server` 直接当作 ACP 程序。
 
-新增设备别名不等于新增 CLI 后端；当前目标参数接受 OMP、Codex、Pi、AGY，AGY 需显式传发现的模型 ID。Windows Codex 在 SSH 服务上下文可能失败，其独立桌面入口见 [CODEX_SSH.md](../CODEX_SSH.md)，没有自动切换路由承诺。
+新增设备别名不等于新增 CLI 后端；目标接受 OMP/Codex/Pi/AGY。未指定 AGY 模型用 G4C；G4C 默认 native、G4A 默认单代理 off，可显式覆盖，worker 默认 G4H。旧任务沿记录路径。Windows Codex 的 SSH 边界见 [CODEX_SSH.md](../CODEX_SSH.md)，不自动切路由。
 
 ## 4. 选择入口与模块
 
@@ -144,7 +144,7 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 
 每个逻辑新任务查询执行端 installed/latest 一次并持久保存。正常派工只检查，不安装包；只在独立授权、确认无活动任务且来源已验证后维护升级。内部 patch 维护仍有安装锁及 busy 检查；跨主次版本先评估，不升级其他 agent 或改认证配置。
 
-不绑定历史精确版本，按公共 runtime 能力验证。续轮不查 npm，但在共享安装锁内读取当前 CLI 版本，SDK 版本须与这个本次安装身份一致；这不是固定版本锁。AGY 使用原生 `agy acp`，先运行 `node models.cjs /absolute/workdir` 发现候选，传显式 `model` 和可选独立 `effort`；详见 [AGY 工作流](../skill/references/agy-models.md)。部署时按[完整运行时清单](integrations.md#后端扩展接口)一起保留后端模块、`models.cjs` 与 `shared-prompt.cjs`，不能只复制 runner。
+不绑定历史版本，按当前公共能力验证。ACPX 路径续轮在共享安装锁内核验 CLI/SDK 身份；AGY native owner 复用该锁，但直接用 agy acp 的广告目录、config 设置和 load 读回，不使用 Shared Runtime 的缺失 load 接口。详见 [AGY 工作流](../skill/references/agy-models.md)。部署须带上 [完整运行时清单](integrations.md#运行时依赖闭包)，包括 agy_native.py；源码更新不代表已部署。
 
 ## 6. 验证并完成交付
 

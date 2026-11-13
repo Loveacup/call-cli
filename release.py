@@ -309,6 +309,39 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
         raise ValueError('Close requires the observed expected_turn')
     if task['state'] == 'closed':
         return dict(state='released', phase='verified', operation='close', task=task_id)
+    if task.get('agy_swarm') == 'native':
+        # The ACP owner records this turn's observable worker/session settlement,
+        # not proof that arbitrary descendant processes died.
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = store._owned(db, task_id, origin)
+            if current != task:
+                raise ValueError('Native close snapshot changed')
+            if current['state'] not in {'completed', 'cancelled', 'unknown'}:
+                raise ValueError('Native owner must settle before close')
+            cleanup = current.get('native_cleanup', {})
+            verified = (current['state'] in {'completed', 'cancelled'} and cleanup.get('session_unloaded') is True
+                        and cleanup.get('turn') == current['turn'] and isinstance(cleanup.get('workers'), list)
+                        and ((bool(cleanup['workers']) and current.get('native_result', {}).get('turn') == current['turn']
+                              and cleanup.get('evidence') == 'native-add-kill-completed-and-session-unload')
+                             or cleanup.get('no_prompt') is True))
+            verified = verified or (current['state'] == 'cancelled'
+                        and current.get('session_creation_attempted') is False
+                        and not current.get('native_session_id') and not current.get('native_prompt_submitted'))
+            if not verified:
+                current['state'] = 'unknown'
+                store._check_writers(db, current)
+                store._save(db, current)
+                return dict(state='unknown', phase='hold', stage='native-proof',
+                            reason_code='native_workers_unproven', external_close_attempted=False)
+            current.update(state='closed', prompt='', release_epoch=1)
+            Release.install(db)
+            receipt = dict(state='released', phase='verified', operation='close', task=task_id,
+                           source='native-single-owner-cleanup', external_close_attempted=False)
+            db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
+                       (task_id, 1, json.dumps(current), canonical(receipt)))
+            Release._publish(db, current, receipt)
+        return receipt
     never_created = (task['state'] == 'cancelled' and task.get('acpx_created') is False
                      and task.get('session_creation_attempted') is False
                      and not task.get('acpx_record_id'))
@@ -344,6 +377,8 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
 
 def recover_native(store, origin, task_id, expected_turn, operation, backend=None):
     """Host-authenticated exact-task recovery; no policy file or model identity."""
+    if store.get(task_id, origin).get('agy_swarm') == 'native':
+        raise ValueError('Native swarm cannot use ACPX exact-record recovery; retain native worker HOLD')
     backend = backend or NativeBackend()
     task = store.get(task_id, origin)
     if expected_turn is None or type(expected_turn) is not int or task['turn'] != expected_turn:

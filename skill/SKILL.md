@@ -48,7 +48,7 @@ OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请�
 
 ## 权限与任务材料
 
-授权决定业务范围；工具批准策略不是文件沙箱。`write` 表示编辑授权与资源占用，不把 `write:false` 当访问隔离。AGY 新任务默认 approve-all、可显式 approve-reads；其他 CLI 的默认策略不因此扩大。模型必须按[AGY 模型与审批](references/agy-models.md)发现、显式设置并读回，不能猜后缀或静默换 provider。
+授权决定业务范围；审批不是沙箱，write 表示编辑授权与目录占用。AGY 未指定模型用 G4C；G4C 默认 native swarm、G4A 文字／知识默认单代理 off，可按任务显式 native/off，worker 默认 G4H、覆盖保留。默认 approve-all、可显式 approve-reads；其他 CLI 不变。按[AGY 合同](references/agy-models.md)实时设置读回，本轮结果＋对应 add/kill completed＋unload 支持正常结算释放，不要求不存在的 rawOutput、不宣称后代全死。fatal/异常 unknown 主动回流发起端，接收与消费分验；不自动重放。
 
 方法材料先本地选择，不足再按相关性、维护来源与实质更新找公开候选；[任务技能传递](references/skill-passing.md)提供 required／optional／reference 快照与逐轮读取／采用核验。暂存、读取、自报采用、独立验收是不同证据；传递 skill 不扩大业务权限，也不默认全局安装。
 

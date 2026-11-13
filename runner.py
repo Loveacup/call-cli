@@ -75,15 +75,21 @@ def run_task(db_path, task_id, *, turn=None, launch_id=None, epoch=None):
     emit('started',task['device']+'/'+task['agent'])
     try:
         result = backend_for(task['agent']).run(store, task, emit)
+        text = None
+        if task['agent'] == 'agy' and result.state == 'unknown':
+            text = ('AGY task '+task_id+' turn '+str(turn)+' needs initiator attention: '
+                    +(result.note or 'Prompt exited '+str(result.exit_code)))
         settled = store.finish_turn(task_id, turn, result.state, result.exit_code, result.stop_reason,
-                                    note=result.note, answer_tail=answer_tail)
+                                    note=result.note, text=text, answer_tail=answer_tail)
         if settled:
             publish(**settled)
         return 0 if result.state in {'completed', 'waiting_reply', 'cancelled'} else 1
     except Exception as exc:
         # Never infer remote worker death from an SSH transport failure.
-        settled = store.finish_turn(task_id,turn,'unknown',None,None,
-                                    text=type(exc).__name__+': '+str(exc)[:500], answer_tail=answer_tail)
+        text = type(exc).__name__+': '+str(exc)[:500]
+        if task['agent'] == 'agy':
+            text = 'AGY task '+task_id+' turn '+str(turn)+' exited abnormally; outcome unknown. '+text
+        settled = store.finish_turn(task_id,turn,'unknown',None,None,text=text,answer_tail=answer_tail)
         if settled:
             publish(**settled)
         return 1

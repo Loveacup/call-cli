@@ -75,7 +75,7 @@ class Collaboration:
 
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
               remote_shell='posix', write=False, resource='', timeout=None, model=None, effort=None,
-              agy_approval=None, skills=None):
+              agy_approval=None, agy_swarm=None, agy_worker_model=None, skills=None):
         from transport import device_identity
         origin = self.origin(client)
         if remote_shell not in {'posix', 'powershell'}:
@@ -83,7 +83,10 @@ class Collaboration:
         if (not prompt.strip() or not cwd or (timeout is not None and
                 (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400))):
             raise ValueError('Nonempty prompt/cwd and optional timeout in (0,86400] required')
-        fields = prepare_start(agent, model, effort, agy_approval)
+        fields = prepare_start(agent, model, effort, agy_approval,
+                               agy_swarm=agy_swarm, agy_worker_model=agy_worker_model)
+        if fields.get('agy_swarm') == 'native' and timeout is not None:
+            raise ValueError('Native swarm has no hard execution deadline; use explicit off for legacy timeout')
         from pathlib import PurePosixPath, PureWindowsPath
         path_type=Path if device=='local' else (PureWindowsPath if remote_shell=='powershell' else PurePosixPath)
         if not path_type(cwd).is_absolute():
@@ -199,10 +202,12 @@ def main(argv=None):
     start = sub.add_parser('start')
     start.add_argument('--device', default='local')
     start.add_argument('--agent', choices=list(BACKENDS), default='codex')
-    start.add_argument('--model', help='Exact advertised ACP model ID; required for AGY')
+    start.add_argument('--model', help='Advertised model ID; omitted uses G4C. G4C defaults native swarm; G4A defaults single-agent/off')
     start.add_argument('--effort', help='Exact advertised thought_level value (AGY)')
     start.add_argument('--agy-approval', choices=['approve-all', 'approve-reads'],
                        help='AGY only: new tasks default to approve-all; approve-reads denies shell/write requests')
+    start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY per-task override: native/on or single-agent/off; default depends on coordinator model')
+    start.add_argument('--agy-worker-model', help='Exact advertised worker ID when supplied; AGY native resolves G4H intent from the live catalog and effort')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
     start.add_argument('--write', action='store_true')
