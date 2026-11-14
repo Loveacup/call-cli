@@ -22,8 +22,7 @@ class DynamicTests(unittest.TestCase):
             client = c.connect('omp')['client_id']
             for fields in (dict(agy_mode='dynamic', model='4as'),
                            dict(agy_mode='dynamic', agy_swarm='off'),
-                           dict(agy_mode='dynamic', agy_worker_model='gemini-4-hydrogen'),
-                           dict(agy_mode='teamwork')):
+                           dict(agy_mode='dynamic', agy_worker_model='gemini-4-hydrogen')):
                 with self.subTest(fields=fields), self.assertRaises(ValueError):
                     c.start(client, agent='agy', cwd=directory, prompt='never launch', **fields)
             self.assertEqual(launches, [])

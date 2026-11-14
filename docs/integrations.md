@@ -162,11 +162,11 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 一个适配器提供三个方法：`prepare_start(model, effort, approval)` 返回持久选择字段；`run(store, task, emit)` 执行已认领轮次，发出安全的 `stage/answer/question/tool` 事件并返回 `TurnResult(state, exit_code, stop_reason, note)`；`control(task, action, timeout)` 提供精确会话控制与关闭后的 `status_snapshot/no-session` 读回。执行中检查共享任务的 `cancelling`，只有执行真正结算才能返回 cancelled；未知结果返回 unknown，不重放。适配器不修改归属、轮次或 writer 占用；现有设备锁可以复用，不新增进程服务或状态库。新增后端只需实现并注册它，随 runner 安装，不必修改其他后端；不要求使用 ACP。
 
-CLI、Hermes、OMP start 共用 `backends.prepare_start` 解析 AGY 模型与路由；新任务未指定默认 `ocs`，裸简称 off、s 为 native、t 当前 unsupported，简称与显式 agy_swarm 冲突在创建／launch 前拒绝。完整广告 ID/family 与旧任务保持兼容，不在各入口重复解析。安全选择错误可公开固定诊断，不回显用户输入／传输异常。简称定义与证据边界见[AGY 合同](../skill/references/agy-models.md)；native 不经 ACPX control/recovery，历史 G4C 样本不是 OCS 验收。
+CLI、Hermes、OMP start 共用 `backends.prepare_start` 解析 AGY 模型与路由；新任务未指定默认 `ocs`，裸简称 off、s 为 Swarm、t 为 Teamwork，简称与显式模式／agy_swarm 冲突在创建／launch 前拒绝。完整广告 ID/family 与旧任务保持兼容，不在各入口重复解析。安全选择错误可公开固定诊断，不回显用户输入／传输异常。简称定义与源码／真实验证边界见[AGY 合同](../skill/references/agy-models.md)；native 不经 ACPX control/recovery。
 
 结算状态与该轮唯一 `<turn>:settled` 事件在同一事务提交，事件带持久 seq、问题 ID、回答摘要和适用的介入续作提示。runner 仅打印事务接受的结算事件；即使其后轮次已推进或进入关闭，也不会丢弃这个已合法结算的通知。被拒绝的旧 runner 不广播终态，普通旧轮事件过滤保持不变；游标补读可恢复已入库事件，不承诺进程崩溃后的 stdout 重放。
 
-agy.py 按持久路由选择 native owner，复用 Store/runner/安装锁/skill/event；首 end_turn 仍 running，完整 load 观察后台，按 turn 隔离旧结果/cleanup。OMP 与 AGY unknown 原子事件带 attention_required/next_action，原 runner stdout 与 OMP 托管 followUp/Hermes notify 返回；真实宿主接收/模型消费仍未验，不新增监控平台。见 [AGY 合同](../skill/references/agy-models.md)与[当前验收索引](../VERIFICATION.md#current-acceptance-index)。
+agy.py 按持久路由选择 native owner，复用 Store/runner/安装锁/skill/event。Swarm／Teamwork 薄桥从所选命令广告进入原生 slash command，以公开 end_turn／完整 load、工具和问题状态及当前最终回答结算；Teamwork 交接 RPC 返回与该响应不当最终结果。正常 close 只消费 mode 匹配的原 owner 会话卸载 receipt，不要求逐成员证明、不证明后代停止。修改及 native 问题答复走同 owner 排队 dialogue；取消单次转达、不重放／强杀，停止未证如实 unknown。Dynamic 合同独立；Teamwork 结构化业务 phase／子许可转发仍未核实，真实宿主消费和业务须另验。
 
 公共 start 可选 `skills` 数组，两个入口通过 Store 创建固定快照；ACPX 后端每轮在 prompt 前经现有目标命令暂存并加入技能路径/模式提示。其他后端可复用 `skills.stage(store, task, emit)` 与 `skills.guidance(task)`，不使用时不得声称支持读取。目标 `CALLCLI_SKILL` 行规范化为独立 skill 事件，Store 按轮次记录实际自报；required 缺报只标未验证，不改业务结算。契约、限制和选择策略见[技能传递](../skill/references/skill-passing.md)。
 

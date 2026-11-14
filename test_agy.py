@@ -140,18 +140,26 @@ class AgyTests(unittest.TestCase):
             self.assertEqual(c.list(client),[])
             self.assertEqual(launched,[])
 
-    def test_teamwork_intent_is_unsupported_without_dispatch(self):
+    def test_teamwork_shorthand_and_explicit_route_persist_before_dispatch(self):
         with tempfile.TemporaryDirectory() as root:
             launched=[]
             c=Collaboration(Path(root)/'tasks.db',launch=launched.append)
             client=c.connect('omp')['client_id']
-            for model in ('oct','oat','4ct','4at','4ht'):
-                for mode in (None,'native','off'):
-                    with self.subTest(model=model,mode=mode):
-                        with self.assertRaisesRegex(ValueError,'Teamwork.*unsupported'):
-                            c.start(client,agent='agy',cwd=root,prompt='never send',model=model,agy_swarm=mode)
-            self.assertEqual(c.list(client),[])
-            self.assertEqual(launched,[])
+            for fields,expected in [({'model':'oct'},'gemini-pro-orchestrator'),
+                    ({'model':'oat'},'gemini-pro-orchestrator-argon'),
+                    ({'model':'4ct'},'gemini-4-carbon'),({'model':'4at'},'gemini-4-argon'),
+                    ({'model':'4ht'},'gemini-4-hydrogen'),
+                    ({'agy_mode':'teamwork'},'gemini-pro-orchestrator')]:
+                task=c.start(client,agent='agy',cwd=root,prompt='native task',**fields)
+                self.assertEqual((task['model'],task['agy_mode'],task['agy_swarm']),
+                    (expected,'teamwork','native'))
+                self.assertEqual(launched[-1]['agy_mode'],'teamwork')
+                self.assertEqual(c.status(client,task['id'])['agy_approval'],'approve-all')
+            for fields in ({'model':'oct','agy_mode':'swarm'}, {'model':'ocs','agy_mode':'teamwork'},
+                    {'model':'oct','agy_swarm':'off'}):
+                with self.assertRaisesRegex(ValueError,'conflict'):
+                    c.start(client,agent='agy',cwd=root,prompt='never send',**fields)
+            self.assertEqual(len(c.list(client)),6)
 
     def test_malformed_shorthand_never_dispatches(self):
         with tempfile.TemporaryDirectory() as root:

@@ -38,9 +38,10 @@ class EventDecoder:
         self.final_answer = ''
         self.tool_details = {}
         self.tool_summaries = {}
+        self.diagnostic = None
 
     def _shared_message(self, frame):
-        # The facade emits a terminal frame only after the native turn.result settles.
+        # Facade failures can precede native turn creation; only this terminal is observed.
         if frame.get('requestId') != self.shared_request_id or self.shared_result_seen:
             self.failed = True
             return None
@@ -52,6 +53,14 @@ class EventDecoder:
             else:
                 self.failed = True
                 if frame.get('status') == 'failed':
+                    stage, reason = frame.get('stage'), frame.get('reasonCode')
+                    if isinstance(stage, str) and isinstance(reason, str) and (stage, reason) in {
+                                           ('input_validate', 'input_validate_failed'),
+                                           ('runtime_load', 'runtime_load_failed'), ('auth_load', 'auth_load_failed'),
+                                           ('runtime_create', 'runtime_create_failed'), ('prompt_submit', 'prompt_submit_failed'),
+                                           ('prompt_events', 'prompt_events_failed'), ('prompt_result', 'prompt_result_failed'),
+                                           ('prompt_result', 'turn_failed'), ('prompt_result', 'invalid_result')}:
+                        self.diagnostic = (stage, reason)
                     category = frame.get('errorCategory')
                     source = frame.get('errorSource', 'turn_result' if category == 'auth_required' else None)
                     allowed = {'auth_required': {'turn_result', 'session_watch'},

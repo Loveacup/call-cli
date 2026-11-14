@@ -123,6 +123,7 @@ class AcpxBackend:
         execution_lock = None
         threads = []
         io_stop = threading.Event()
+        failure_stage, failure_reason = 'backend_setup', 'setup_failed'
         def stop_transport():
             # This Popen child only: never a process group or the shared queue owner.
             if proc is not None and proc.poll() is None:
@@ -146,6 +147,7 @@ class AcpxBackend:
             if store.get(task_id)['state']=='cancelling':
                 return TurnResult('cancelled', 0, 'cancelled', 'Cancelled before provider launch')
             if turn == 1 or task.get('needs_session',False):
+                failure_stage, failure_reason = 'session_create', 'creation_failed'
                 store.update(task_id,session_creation_attempted=True)
                 new = self.control(task,'new',timeout=60)
                 if new.returncode:
@@ -155,6 +157,9 @@ class AcpxBackend:
                 if not isinstance(record_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', record_id):
                     raise RuntimeError('ACPX creation omitted a valid native record ID')
                 store.update(task_id, acpx_created=True, needs_session=False, acpx_record_id=record_id)
+                emit('diagnostic', 'Native session record observed; prompt not yet submitted.',
+                     stage='session_create', reason_code='record_observed')
+                failure_stage, failure_reason = 'backend_setup', 'setup_failed'
             task = store.get(task_id)
             if not task.get('acpx_record_id'):
                 # Resume a pre-upgrade task by reading its exact named session, never by
@@ -185,6 +190,9 @@ class AcpxBackend:
             # Preserve the last attempted provider request across admitted but
             # pre-provider-cancelled successor turns. Uncertain submission stays HOLD.
             store.update(task_id, backend_request_id=request_id)
+            failure_stage, failure_reason = 'prompt_submit', 'transport_failed'
+            emit('diagnostic', 'Prompt transport submission attempted; runtime acceptance not yet observed.',
+                 stage='prompt_submit', reason_code='submission_attempted')
             started_at = time.monotonic()
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             output = queue.Queue()
@@ -266,6 +274,7 @@ class AcpxBackend:
                      threading.Thread(target=drain_errors,daemon=True,name='callcli-transport-stderr'),
                      threading.Thread(target=write_payload,daemon=True,name='callcli-transport-stdin')]
             for t in threads:t.start()
+            failure_stage, failure_reason = 'prompt_events', 'transport_observation_failed'
             decoder = EventDecoder(shared_request_id=request_id)
             ended = False
             cancelling = False
@@ -283,8 +292,15 @@ class AcpxBackend:
                     return
                 try:event=json.loads(line.decode('utf-8','replace'))
                 except (json.JSONDecodeError,UnicodeError):return
+                was_started = decoder.prompt_started
                 decoded = decoder.feed(event)
-                if decoder.shared_result_seen:ended = True
+                if decoder.prompt_started and not was_started:
+                    emit('diagnostic', 'Prompt acceptance observed; execution outcome not yet established.',
+                         stage='prompt_execution', reason_code='acceptance_observed')
+                if decoder.shared_result_seen:
+                    ended = True
+                    emit('diagnostic', 'Facade terminal observed; this alone does not establish a native result or business success.',
+                         stage='prompt_result', reason_code='result_observed', acceptance_observed=decoder.prompt_started)
                 public = event.get('event', {})
                 activity = (event.get('type') == 'callcli.shared.event' and event.get('requestId') == request_id
                             and not decoder.shared_result_seen and
@@ -313,6 +329,7 @@ class AcpxBackend:
                                            and current['state'] != 'cancelling')
                 if not received_terminal and (current['state']=='cancelling' or startup_expired or (deadline is not None and now>deadline)) and not cancelling:
                     cancelling=True;stop_started=time.monotonic()
+                    failure_stage, failure_reason = 'prompt_control', 'cancel_unsettled'
                     result=self.control(task,'cancel',timeout=20)
                     if result.returncode:
                         raise RuntimeError('Cancel was not accepted; remote fate unknown')
@@ -327,10 +344,13 @@ class AcpxBackend:
                             except queue.Empty:break
                         break
                 if write_failed.is_set():
+                    failure_stage, failure_reason = 'prompt_submit', 'payload_delivery_failed'
                     raise RuntimeError('Transport payload delivery failed; remote fate unknown')
                 if reader_failed.is_set():
+                    failure_stage, failure_reason = 'prompt_events', 'transport_observation_failed'
                     raise RuntimeError('Transport output observation failed; remote fate unknown')
                 if cancelling and time.monotonic()-stop_started>25:
+                    failure_stage, failure_reason = 'prompt_control', 'cancel_unsettled'
                     raise RuntimeError('Cancel accepted but prompt has not settled')
                 if (not cancelling and current['state'] == 'running'
                         and now-last_notice >= QUIET_NOTICE_SECONDS):
@@ -407,7 +427,24 @@ class AcpxBackend:
                               'Work may be partially applied; reconcile before any authorized continuation; '
                               'no automatic replay.')
                 note = (note+' ' if note else '')+diagnostic
+            if not decoder.shared_result_seen:
+                decoder.diagnostic = ('prompt_result', 'result_not_observed')
+            elif rc != 0 and not decoder.failed and not decoder.diagnostic:
+                decoder.diagnostic = ('prompt_result', 'post_result_exit_nonzero')
+            if decoder.diagnostic:
+                diagnostic_stage, diagnostic_reason = decoder.diagnostic
+                diagnostic = ('Execution diagnostic: stage='+diagnostic_stage+' reason='+diagnostic_reason+
+                              '; outcome unknown. Preserve HOLD; reconcile before any authorized continuation; no automatic replay.')
+                emit('diagnostic', diagnostic, stage=diagnostic_stage, reason_code=diagnostic_reason,
+                     acceptance_observed=decoder.prompt_started)
+                note = ((note+' ') if note else '')+diagnostic
             return TurnResult(state, rc, decoder.stop_reason, note)
+        except Exception:
+            # Exception text and subprocess stderr can contain prompts or credentials.
+            note = ('Execution diagnostic: stage='+failure_stage+' reason='+failure_reason+
+                    '; outcome unknown. Preserve HOLD; reconcile the exact session and artifacts; no automatic replay.')
+            emit('diagnostic', note, stage=failure_stage, reason_code=failure_reason)
+            return TurnResult('unknown', None, None, note)
         finally:
             io_stop.set()
             stop_transport()

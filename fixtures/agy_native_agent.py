@@ -97,6 +97,10 @@ for line in sys.stdin:
         result = metadata()
         if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
             update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
+        if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
+            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
+        if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
+            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
     elif method == 'session/set_config_option':
         if closed:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
@@ -108,6 +112,123 @@ for line in sys.stdin:
         result = metadata()
     elif method == 'session/prompt':
         prompted = True
+        if os.environ.get('AGY_TEAMWORK_THIN'):
+            body=msg['params']['prompt'][0]['text']
+            captured=list(saved)
+            if body.startswith('CALLCLI_DIALOGUE '):
+                header,content=body.split('\n\n',1)
+                update(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body)))
+                if os.environ['AGY_TEAMWORK_THIN']=='cancel-dialogue':
+                    (root/'dialogue-active').touch()
+                    pending=json.loads(sys.stdin.readline())
+                    assert pending.get('method')=='session/cancel'
+                    with (root/'requests.jsonl').open('a') as handle:
+                        handle.write(json.dumps(pending)+'\n')
+                    (root/'cancelled').touch()
+                    saved=captured
+                    captured=None
+                    send(dict(id=msg['id'],result=dict(stopReason='cancelled')))
+                    continue
+                (root/'brief.txt').write_text(content)
+                update(dict(sessionUpdate='tool_call',toolCallId='message'+str(len(saved)),
+                    name='send_message',kind='other',status='completed'))
+                text('CALLCLI_STAGE brief updated; native team still reviewing\n')
+                if os.environ['AGY_TEAMWORK_THIN']=='unterminated-failure' and (root/'followup').exists():
+                    if not (root/'followup-asked').exists():
+                        text('CALLCLI_QUESTION Q2 Confirm failure report?')
+                        (root/'followup-asked').touch()
+                    else:
+                        text('Final failure report: brief.md absent; write permission confirmation 60s timeout.\n')
+            else:
+                delegation=[dict(sessionUpdate='tool_call',toolCallId='delegate',name='invoke_subagent',
+                    kind='other',status='completed'),dict(sessionUpdate='agent_message_chunk',
+                    content=dict(type='text',text='Interview delegated\n'))]
+                if os.environ['AGY_TEAMWORK_THIN']=='replay-only':
+                    captured.extend(delegation)
+                else:
+                    for entry in delegation: update(entry)
+            saved=captured
+            captured=None
+            send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+            continue
+        if os.environ.get('AGY_SWARM_THIN'):
+            body=msg['params']['prompt'][0]['text']
+            (root/'prompt').write_text(body)
+            captured=list(saved)
+            fault=os.environ['AGY_SWARM_THIN']
+            if fault in {'board-working','status-working','status-new-id','board-only'} and not body.startswith('CALLCLI_DIALOGUE '):
+                if fault!='board-only':
+                    update(dict(sessionUpdate='tool_call',toolCallId='dispatch',name='swarm',kind='other',status='completed',rawInput=dict(action='add',name='worker-1')))
+                    update(dict(sessionUpdate='tool_call',toolCallId='status',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='working')])))
+                text('Work accepted\n' if fault=='status-working' else 'Run /swarm board\n')
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='replay-no-newline':
+                saved=[dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='Native final replay'))]
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='enrich':
+                update(dict(sessionUpdate='tool_call',toolCallId='read',name='read_file',status='completed'))
+                text('Native final initial\n')
+                saved=captured
+                saved[0]['kind']='read'
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='late-old' and body.startswith('CALLCLI_DIALOGUE '):
+                captured.extend([dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='Late old answer\n')),
+                    dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body))])
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='async' and not body.startswith('CALLCLI_DIALOGUE '):
+                update(dict(sessionUpdate='tool_call',toolCallId='pending',name='native_work',kind='other',status='in_progress'))
+                text('CALLCLI_STAGE work in progress\n')
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='fatal':
+                text('\u26a0 Agent execution terminated due to error.\n')
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='empty':
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='block':
+                update(dict(sessionUpdate='tool_call',toolCallId='work',name='native_work',kind='other',status='in_progress'))
+                (root/'active').touch()
+                for pending_line in sys.stdin:
+                    pending=json.loads(pending_line)
+                    with (root/'requests.jsonl').open('a') as handle: handle.write(json.dumps(pending)+'\n')
+                    if pending.get('method')=='session/cancel': break
+                send(dict(id=msg['id'],result=dict(stopReason='cancelled')))
+                captured=None
+                continue
+            if fault in {'question','late-old'} and not body.startswith('CALLCLI_DIALOGUE '):
+                text('CALLCLI_STAGE draft ready\nCALLCLI_QUESTION Q1 Which label?\n')
+            else:
+                if body.startswith('CALLCLI_DIALOGUE '):
+                    if fault in {'board-working','status-working'}:
+                        update(dict(sessionUpdate='tool_call_update',toolCallId='status',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='completed')])))
+                    if fault=='status-new-id':
+                        update(dict(sessionUpdate='tool_call',toolCallId='status-later',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='completed')])))
+                    update(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body)))
+                label='revised' if body.startswith('CALLCLI_DIALOGUE ') else 'initial'
+                (root/'result.txt').write_text(label)
+                text('Native final '+label+': documentation includes Run /swarm board\n' if fault=='final-board-mention' else 'Native final '+label+'\n')
+            saved=captured
+            captured=None
+            send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+            continue
         if os.environ.get('AGY_DYNAMIC_FIXTURE'):
             body = msg['params']['prompt'][0]['text']
             (root/'prompt').write_text(body)
@@ -151,11 +272,6 @@ for line in sys.stdin:
             saved = captured
             captured = None
             send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
-            continue
-        if msg['params']['prompt'][0]['text'].startswith('CALLCLI_CANCEL_CLEANUP '):
-            if scenario and 'cleanup_replay' in scenario:
-                scenario['cancel_replay']=scenario['cleanup_replay']
-            send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
             continue
         (root/'prompt').write_text(msg['params']['prompt'][0]['text'])
         if (root/'dialogue-block').exists() and msg['params']['prompt'][0]['text'].startswith('CALLCLI_DIALOGUE '):
@@ -300,6 +416,32 @@ for line in sys.stdin:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
             continue
         captured = []
+        if os.environ.get('AGY_TEAMWORK_THIN'):
+            if prompted and (root/'interview').exists() and not (root/'asked').exists():
+                saved.extend([dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',
+                    kind='other',status='completed'),dict(sessionUpdate='agent_message_chunk',
+                    content=dict(type='text',text='CALLCLI_QUESTION Q1 Which audience and three checks?' if os.environ['AGY_TEAMWORK_THIN']=='unterminated-failure' else 'CALLCLI_QUESTION Q1 Which label for the brief?\n'))])
+                (root/'asked').touch()
+            if prompted and (root/'finish').exists() and not (root/'result.txt').exists():
+                (root/'result.txt').write_text('review of revised brief')
+                saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                    # A later response must not concatenate onto the Q2 line.
+                    text='\n- **任务状态**：失败并按指令自然停止（受原生写入权限确认超时阻塞，未扩权、未反复派工、未伪造产物）。\n- **阻塞原因**：Teamwork root（`[SESSION]`）回报称其调用原生 `write_file` 创建 [brief.md](file://[SCRATCH]/work/brief.md) 时，因等待终端控制台权限确认超时（60s timeout）被系统安全机制取消。\n' if os.environ['AGY_TEAMWORK_THIN']=='unterminated-failure' else 'Final review: revised brief inspected; invoke_subagent delegation is documented.\n')))
+            for entry in saved: update(entry)
+            send(dict(id=msg['id'],result=metadata()))
+            captured=None
+            continue
+        if os.environ.get('AGY_SWARM_THIN'):
+            if os.environ['AGY_SWARM_THIN']=='async' and (root/'finish').exists():
+                for entry in saved:
+                    if entry.get('toolCallId')=='pending': entry['status']='completed'
+                if not (root/'result.txt').exists():
+                    (root/'result.txt').write_text('initial')
+                    saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='Native final initial\n')))
+            for entry in saved: update(entry)
+            send(dict(id=msg['id'],result=metadata()))
+            captured=None
+            continue
         if os.environ.get('AGY_DYNAMIC_FIXTURE'):
             if os.environ['AGY_DYNAMIC_FIXTURE']=='async' and (root/'workflow-release').exists():
                 for entry in saved:
@@ -419,6 +561,8 @@ for line in sys.stdin:
         update(dict(sessionUpdate='tool_call', toolCallId='add'+str(turn), name='swarm', status='completed',
             args=dict(action='add', name='worker-a', model='gemini-4-hydrogen-medium'), rawOutput=dict(status='added', name='worker-a')))
         if (root/'final').exists():
+            if os.environ.get('AGY_NATIVE_RECHUNK'):
+                update(dict(sessionUpdate='tool_call_update',toolCallId='k',status='completed'))
             if not os.environ.get('AGY_NATIVE_MISSING_KILL'):
                 update(dict(sessionUpdate='tool_call', toolCallId='kill'+str(turn), name='swarm', status='completed',
                     args=dict(action='kill', name='worker-a'), rawOutput=dict(status='killed', name='worker-a')))

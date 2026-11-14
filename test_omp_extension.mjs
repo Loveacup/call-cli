@@ -28,11 +28,11 @@ test('real bridge wrapper preserves safe model rejection without exposing provid
   const previous=process.env.CALL_CLI_PYTHON;
   try {
     const executable=join(root,'fake-python');
-    await writeFile(executable,`#!${process.execPath}\nlet data='';for await(const chunk of process.stdin)data+=chunk;const r=JSON.parse(data);if(r.action==='bind'){console.log(JSON.stringify({capability:'test-only'}));}else{console.log(JSON.stringify(r.args.model==='oct'?{error:'ModelSelectionError',message:'Teamwork intent is unsupported; no business prompt submitted'}:{error:'RuntimeError',message:'PRIVATE_PROVIDER_BODY'}));process.exitCode=1;}\n`,{mode:0o700});
+    await writeFile(executable,`#!${process.execPath}\nlet data='';for await(const chunk of process.stdin)data+=chunk;const r=JSON.parse(data);if(r.action==='bind'){console.log(JSON.stringify({capability:'test-only'}));}else{console.log(JSON.stringify(r.args.model==='ocss'?{error:'ModelSelectionError',message:'Invalid AGY shorthand'}:{error:'RuntimeError',message:'PRIVATE_PROVIDER_BODY'}));process.exitCode=1;}\n`,{mode:0o700});
     process.env.CALL_CLI_PYTHON=executable;
     const f=fixture();
     const adapter=createAdapter({sendMessage:()=>{}},{db:join(root,'unused.db')});
-    await assert.rejects(adapter.execute({action:'start',agent:'agy',model:'oct',cwd:root,prompt:'never send'},f.ctx),/Teamwork intent is unsupported/);
+    await assert.rejects(adapter.execute({action:'start',agent:'agy',model:'ocss',cwd:root,prompt:'never send'},f.ctx),/Invalid AGY shorthand/);
     await assert.rejects(adapter.execute({action:'start',agent:'agy',model:'exact',cwd:root,prompt:'never send'},f.ctx),error=>!error.message.includes('PRIVATE_PROVIDER_BODY') && error.message.includes('RuntimeError'));
     assert.deepEqual(f.timers,[]);
     adapter.detach();
@@ -69,6 +69,7 @@ test('registered OMP tool advertises dialogue without host identity fields', () 
   register({zod:z,registerTool:tool=>{registered=tool;},on:()=>{}});
   assert.equal(registered.name,'call_cli_omp');
   assert.ok(enums.some(values=>values.includes('dialogue')));
+  assert.ok(enums.some(values=>values.includes('teamwork')));
 });
 
 test('model timeout is refused before binding and continuation clear remains available', async () => {

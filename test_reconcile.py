@@ -93,7 +93,8 @@ class ReconcileTests(unittest.TestCase):
         import json
         payload=dict(operation='close',substep='status_after',error_name='Error',returncode=2,
             message='PRIVATE_SENTINEL',stack='PRIVATE_SENTINEL',raw_stderr='PRIVATE_SENTINEL',
-            state='released',phase='verified',stderr_length='PRIVATE_SENTINEL',timeout='yes')
+            state='released',phase='verified',stderr_length='PRIVATE_SENTINEL',timeout='yes',
+            record_id_match=True,closed_observed=False,name_lookup_found=False,name_scope_match='PRIVATE_SENTINEL')
         with tempfile.TemporaryDirectory() as td:
             release,owner,backend=fixture(Path(td))
             def fail(policy): raise BackendFailure('verify','backend_unavailable',payload)
@@ -104,6 +105,9 @@ class ReconcileTests(unittest.TestCase):
             self.assertNotIn('PRIVATE_SENTINEL',json.dumps(receipt))
             self.assertNotIn('timeout',receipt['latest_probe'])
             self.assertEqual(receipt['state'],'unknown')
+            self.assertIs(receipt['latest_probe']['closed_observed'],False)
+            self.assertIs(receipt['latest_probe']['name_lookup_found'],False)
+            self.assertNotIn('name_scope_match',receipt['latest_probe'])
         from bridge import Origin,Store
         with tempfile.TemporaryDirectory() as td:
             store=Store(Path(td)/'tasks.db'); owner=Origin('fixture','owner','owner')

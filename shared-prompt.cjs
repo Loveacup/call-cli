@@ -121,8 +121,9 @@ function sendFrame(frame) {
 
 async function run(options, prompt, deps = {}) {
   const send = deps.send ?? sendFrame;
-  let runtime, code = 1;
+  let runtime, terminal, code = 1;
   const requestId = options?.requestId;
+  let stage = 'input_validate';
   try {
     if (!options || typeof requestId !== 'string' || !requestId || typeof prompt !== 'string'
         || typeof options.write !== 'boolean' || !path.isAbsolute(options.cwd)
@@ -132,8 +133,11 @@ async function run(options, prompt, deps = {}) {
     const permissionMode = options.permissionMode ?? (options.write ? 'approve-all' : 'approve-reads');
     if (!['approve-all', 'approve-reads'].includes(permissionMode)) throw Error('INVALID_PERMISSION_MODE');
     const timeout = options.timeoutMs === undefined ? {} : {timeoutMs:options.timeoutMs};
+    stage = 'runtime_load';
     const sdk = await (deps.loadRuntime ?? loadRuntime)(options.expectedVersion);
+    stage = 'auth_load';
     const auth = await (deps.loadAuth ?? loadAuth)(options.cwd);
+    stage = 'runtime_create';
     runtime = sdk.createSharedAcpRuntime({cwd: options.cwd,
       permissionMode,
       nonInteractivePermissions: 'deny', ...timeout,
@@ -144,6 +148,7 @@ async function run(options, prompt, deps = {}) {
       sessionKey: options.sessionName, runtimeSessionName: options.sessionId, cwd: options.cwd};
     // Selection is applied and read back by the runner before this transport.
     // Shared control methods require an already running owner and cannot bootstrap it.
+    stage = 'prompt_submit';
     const turn = runtime.startTurn({handle, text: prompt, mode: 'prompt', requestId,
       ...timeout});
     let promptNotice, noticeFailed = false;
@@ -152,10 +157,12 @@ async function run(options, prompt, deps = {}) {
         send({type:'callcli.shared.event', requestId, event:{type:'prompt_started'}}), () => {});
       promptNotice.catch(() => {noticeFailed = true;});
     }
+    stage = 'prompt_events';
     for await (const event of turn.events) {
       const projected = publicEvent(event);
       if (projected) await send({type: 'callcli.shared.event', requestId, event: projected});
     }
+    stage = 'prompt_result';
     const result = await turn.result;
     await promptNotice;
     if (noticeFailed) throw Error('OUTPUT_FAILED');
@@ -174,13 +181,16 @@ async function run(options, prompt, deps = {}) {
         diagnostic = {errorCategory:'connection_lost', errorSource:'turn_result_detail'};
       }
     }
-    await send({type: 'callcli.shared.result', requestId,
-      status: valid ? result.status : 'failed', stopReason: valid ? result.stopReason : null, ...diagnostic});
+    if (!valid) diagnostic = {stage:'prompt_result', reasonCode:result?.status === 'failed' ? 'turn_failed' : 'invalid_result', ...diagnostic};
+    terminal = {type: 'callcli.shared.result', requestId,
+      status: valid ? result.status : 'failed', stopReason: valid ? result.stopReason : null, ...diagnostic};
     code = valid ? 0 : 1;
   } catch {
     // Never serialize exceptions: they can include private prompts/configuration.
-    try {await send({type: 'callcli.shared.result', requestId: requestId ?? null, status: 'failed', stopReason: null});} catch {}
+    terminal = {type: 'callcli.shared.result', requestId: requestId ?? null, status: 'failed', stopReason: null,
+      stage, reasonCode:stage+'_failed'};
   } finally {
+    try {await send(terminal);} catch {code = 1;}
     // shutdown detaches this client; it is NOT cancellation of accepted work.
     if (runtime) {try {await runtime.shutdown();} catch {code = 1;}}
   }

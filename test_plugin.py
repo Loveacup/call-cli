@@ -62,7 +62,7 @@ class PluginTests(unittest.TestCase):
             env={'HERMES_SESSION_ID':'s1','HERMES_SESSION_KEY':'key'}
             ctx=Ctx(); c=mod.Coordinator(ctx,Path(root),lambda k,x='':env.get(k,x))
             for model,mode,reason in (('ocs','off','conflict'),('4a','native','conflict'),
-                                      ('oct',None,'unsupported'),('4ast',None,'Invalid AGY shorthand')):
+                                      ('4ast',None,'Invalid AGY shorthand')):
                 with self.assertRaisesRegex(ValueError,reason):
                     c.handle(dict(action='start',agent='agy',cwd=root,prompt='never send',model=model,agy_swarm=mode))
             self.assertEqual(c.handle({'action':'list'})['tasks'],[])
@@ -72,6 +72,11 @@ class PluginTests(unittest.TestCase):
                     ('4a','gemini-4-argon','off'),('4as','gemini-4-argon','native')):
                 task=c.handle(dict(action='start',agent='agy',cwd=root,prompt='synthetic',model=model))['task']
                 self.assertEqual((task['model'],task['agy_swarm']),(expected,mode))
+            self.assertIn('teamwork',mod.SCHEMA['parameters']['properties']['agy_mode']['enum'])
+            for fields in ({'model':'oct'}, {'model':'gemini-pro-orchestrator','agy_mode':'teamwork'}):
+                task=c.handle(dict(action='start',agent='agy',cwd=root,prompt='native request',**fields))['task']
+                self.assertEqual((task['model'],task['agy_mode'],task['agy_swarm']),
+                    ('gemini-pro-orchestrator','teamwork','native'))
 
     def test_repeated_plugin_load_retains_patchable_native_submodule(self):
         import sys

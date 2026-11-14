@@ -41,7 +41,8 @@ def safe_diagnostic(value):
     for key in ('returncode','signal','stderr_length'):
         entry=value.get(key)
         if type(entry) is int and (key!='stderr_length' or entry>=0): result[key]=entry
-    for key in ('timeout','stderr_present'):
+    for key in ('timeout','stderr_present','record_lookup_found','record_id_match','backend_session_match',
+                'cwd_match','request_match','closed_expected','closed_observed','name_lookup_found','name_scope_match'):
         if type(value.get(key)) is bool: result[key]=value[key]
     shutdown=value.get('shutdown_failure')
     if isinstance(shutdown,dict):
@@ -365,6 +366,10 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                 and trusted.get('evidence')=='parent-end-turn-complete-tool-history-and-unload'
                 and trusted.get('outcome')==current['state']
                 and current['state'] in {'completed','unknown'} and not current.get('runner_pid'))
+            verified = verified or bool(trusted and trusted.get('kind')=='native-mode-settled'
+                and trusted.get('mode')==current.get('agy_mode','swarm') and trusted.get('mode') in {'swarm','teamwork'}
+                and trusted.get('outcome')==current['state']=='completed'
+                and trusted.get('evidence')=='public-response-and-session-unload' and not current.get('runner_pid'))
             verified = verified or bool(trusted and trusted.get('kind')=='verified-cancellation'
                 and trusted.get('cancel_id')==current.get('native_cancel_id')
                 and current['state'] in {'cancelled','unknown'} and not current.get('runner_pid'))
@@ -608,13 +613,16 @@ class NativeBackend:
         except (ValueError, UnicodeError):
             raise BackendFailure('parse', 'invalid_backend_response',diagnostic) from None
         if result.returncode != 0:
-            allowed = {'record_binding_mismatch','name_scope_mismatch',
+            allowed = {'record_binding_mismatch','name_scope_mismatch','record_not_found',
                        'name_scope_replaced_or_reopened','backend_unavailable',
                        'acpx_version_mismatch','shared_runtime_unavailable',
                        'acpx_package_not_found','runtime_export_unavailable',
                        'npm_executable_not_found','npm_root_timeout'}
             reason = value.get('reason_code')
             stage = value.get('stage')
+            for key in ('record_lookup_found','record_id_match','backend_session_match','cwd_match',
+                        'request_match','closed_expected','closed_observed','name_lookup_found','name_scope_match'):
+                if type(value.get(key)) is bool: diagnostic[key]=value[key]
             for key in ('substep','error_name','error_code'):
                 entry=value.get(key)
                 if isinstance(entry,str) and entry.replace('_','').isalnum() and len(entry)<=80: diagnostic[key]=entry

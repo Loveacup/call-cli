@@ -27,7 +27,7 @@ Call CLI 通过轻量 POSIX 协调层连接 **OMP、Codex、Pi 和 AGY**。新�
 | :-- | :-- | :-- |
 | 🔄 | **持续跨 CLI 协作与回流** | 在发起端持续跟进可续读的阶段进展、待答问题与最终结果，用 600 秒协调者复核检查点代替僵硬的模型执行超时。 |
 | 🧭 | **单次控制与 `cancel+resume` 改向** | 用 `reply` 按编号回答问题，或用 `intervene` 在同一目标会话内取消当前轮、确认结算后按新要求续轮（绝不冒充执行期热插 `steer`）。 |
-| 🤖 | **原生 AGY 与显式模型模式** | 新 AGY 默认 **ocs**（Orchestrator Carbon＋native Swarm）。裸简称 **oc/oa/4c/4a/4h** 全部单代理 `off`；后缀 **s** 为原生 Swarm，**t**（Teamwork）当前 unsupported，不静默降级。 |
+| 🤖 | **原生 AGY 与显式模型模式** | 新 AGY 默认 **ocs**（Orchestrator Carbon＋native Swarm）。裸简称 **oc/oa/4c/4a/4h** 全部单代理 `off`；后缀 **s** 为 Swarm、**t** 为按广告原生命令启动的 Teamwork 源码候选；真实 Teamwork 业务验收未完成。 |
 | 🤝 | **多 CLI 并行协作与写隔离** | 让 OMP、Codex、Pi、AGY 在各自隔离的会话中并行工作，由单写者工作区锁防止并发写冲突。 |
 | 📦 | **按任务固定传递技能** | 为任务附加协调端或执行端技能（`required`、`optional`、`reference`），跨轮复用不可变快照并记录每轮采用回执。 |
 | 🔌 | **多入口接入与可选宿主桥** | 支持从任意 POSIX 终端、SSH 客户端或 CLI 技能发起协调，并提供单次加载的实验性 OMP RPC 扩展、可选 Hermes 插件及独立未应用的 Hermes 静默兼容补丁。 |
@@ -135,7 +135,7 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
       intervene --task "$TASK_ID" --command-id rev-1 --prompt '修订后的范围'
     ```
     随后继续短 `wait`（同步更新 `WAIT_JSON` 与 `AFTER`），由协调端取消旧轮、确认权威结算并在同一原生会话启动第 2 轮。
-- **调用 AGY（模型简称与只读审批）或传递技能：** 新 AGY 默认 **ocs**，不按任务内容自动换模型。小写 **oc/oa/4c/4a/4h** 裸简称全部单代理 `off`，后缀 **s** 为原生 Swarm；后缀 **t** 当前 unsupported，在派发前拒绝。显式 `--agy-swarm` 必须与简称一致；完整广告 ID 保留原路由／覆盖兼容，详见[模型合同](skill/references/agy-models.md)。新 AGY 任务即使在 `write` 为 `false` 时也默认持久化 `approve-all`；严格只读工具审批请显式传 `--agy-approval approve-reads`（审批模式与 `write: false` 都不是操作系统或文件系统沙箱；`--write` 独立声明编辑授权并占用工作区）：
+- **调用 AGY（模型简称与只读审批）或传递技能：** 新 AGY 默认 **ocs**，不按任务内容自动换模型。小写 **oc/oa/4c/4a/4h** 裸简称全部单代理 `off`，后缀 **s** 为原生 Swarm，**t** 为按广告原生命令启动的 Teamwork 源码候选。显式模式／路由必须与简称一致；完整广告 ID 保留原路由／覆盖兼容，详见[模型合同](skill/references/agy-models.md)。新 AGY 任务即使在 `write` 为 `false` 时也默认持久化 `approve-all`；严格只读工具审批请显式传 `--agy-approval approve-reads`（审批模式与 `write: false` 都不是操作系统或文件系统沙箱；`--write` 独立声明编辑授权并占用工作区）：
   ```sh
   # 1. 发现本执行设备当前广告的精确 ACP 模型 ID 与 thought_level.options
   node "$CALL_CLI_HOME/models.cjs" "$CALL_CLI_HOME"
@@ -209,12 +209,13 @@ Hermes 另提供显式 `release_only`：仅 unknown 本地 exact-record 任务�
 
 ### 2. 原生 AGY 支持、按模型默认 Swarm 与持久工具放行（`agy.py`、`agy_native.py`、`models.cjs`）
 
-- **显式模型模式（默认 ocs / G4H worker）：**
-  - `oc/oa` 映射 Orchestrator Carbon/Argon，`4c/4a/4h` 映射 Gemini 4 Carbon/Argon/Hydrogen。裸简称全部 off；`ocs/oas/4cs/4as/4hs` 为 native Swarm。重复／混合后缀、简称与路由冲突拒绝。t 是当前 unsupported 的 Teamwork 意图，不是 Swarm 或普通 prompt。
-  - 新任务经单一公共入口解析后持久化型号／路由。旧任务、其他 CLI 不迁移；完整广告 ID/family 保持既有行为。worker 仍用广告 ID/family、默认 G4H。纯文字／感性工作可显式选择 `4a/4as`；未指定仍 `ocs`。
+- **显式模型模式（默认 ocs）：**
+  - `oc/oa` 映射 Orchestrator Carbon/Argon，`4c/4a/4h` 映射 Gemini 4 Carbon/Argon/Hydrogen。裸简称全部 off；后缀 s 选 Swarm、t 选 Teamwork。显式 `agy_mode=single/swarm/teamwork/dynamic` 须匹配简称意图；缺所选命令广告不降级 Swarm 或普通 prompt。
+  - 新任务经单一公共入口解析后持久化型号／路由。旧任务、其他 CLI 不迁移；完整广告 ID/family 保持既有行为。显式 worker 型号仅作为偏好转给 AGY，无默认逐员型号或完成门槛。纯文字／感性工作可显式选择 `4a/4as`；未指定仍 `ocs`。
   - 原生 OC/OA 零 prompt 配置／读回已验，不是 OCS 模型／Swarm 或 ACPX off 业务验收。不猜 effort tier、不静默降级。详见 [AGY 合同（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
-- **单 owner AGY native Swarm 生命周期与结算（`agy_native.py`）：** 由于 ACPX 公共 Shared Runtime 不提供 `session/load`，`--agy-swarm native` 由单一 ACP owner 直接通过 `agy acp --disable-telemetry` 连接，现场解析广告模型/effort 并读回 `models.currentModelId`。首个 `end_turn` 仅结束前台 RPC，任务保持 `running` 与写占用，由同一 owner 串行执行完整 `session/load` 快照回放以观察原生留言板唤醒，期间不发送定时驱动 prompt。正常完成与 `close` 释放要求同时具备：本任务当前轮的最终 `native_result`、对应原生 worker `add`/`kill` completed 事件以及会话卸载（`native-add-kill-completed-and-session-unload`；不因 ACP 回放缺少 `rawOutput` 而强制 HOLD，也不宣称所有任意后代进程均已退出）。跨轮推进会清空旧轮 result/cleanup/roster。遇到致命错误行（`⚠ Agent execution terminated due to error.`）、断线、缺少必要清理事件或取消结果不明时，保守结算为 `unknown` / HOLD（`native_workers_unproven`），并生成带 `attention_required: true` 的原子事件经 runner stdout、OMP `followUp` 或 Hermes terminal 通知主动提醒发起端，绝不自动重放或借 ACPX 记录关闭释放。
-- **取消使用独立证明路径：** 原 owner 仅在已 end_turn、可信 roster 且无活动工具的边界发送一次 cleanup-only prompt，kill 精确 worker，允许严格确认的原生 swarm status 观察。匹配 task/session/turn/launch/epoch/cancel 的可信 receipt、completed kills 与精确 unload 才允许 cancelled，不要求 native_result；缺证/歧义仍 HOLD。取消清理未证时关 stdio、不 terminate/kill，不承诺原 owner 可恢复；成功路径仍保留已说明的默认退出 fallback。AGY 1.5.8 v3 候选单样本（G4C low、一个 G4H medium、approve-reads）已观察此链路、unload/not-found、重复 close 相等和 natural exit 0；使用线程 launcher/观测 wrapper，非已部署/默认宿主或任意后代全停证明。见[当前证据索引](VERIFICATION.md#current-acceptance-index)。
+- **单 owner 原生 Swarm 薄桥：** Call-CLI 发起原生 `/swarm`，转达授权任务、公开进度／问题、同 owner dialogue 和取消；AGY 自行组织角色与内部工作。end_turn 后完整 load 对账当前 interaction 的最终回答及公开工具／问题状态，正常响应结算与精确会话卸载不要求 CALLCLI_RESULT 或逐成员 add/kill/model 证明。业务产物仍由发起者核验，会话卸载不证明全部后代停止。见[当前 Swarm 合同](skill/references/agy-models.md)。
+- **Teamwork 源码候选：** 复用同 owner/load/dialogue/问题和精确 unload，receipt 为 mode=teamwork。委派 RPC completed 及首轮确认不当最终结果；合成路由、异步访谈、同源修改与正常 close 已验，不代表真实宿主业务验收。AGY 原生负责内部角色、分工、审批及权限；Call-CLI 不要求父写、子只读或子写权限证明。公开问题／审批事件有则沿现有机制传递，无内部事件明确不可观测，不猜测或强塞回调。见[模式合同](skill/references/agy-models.md)。
+- **取消不生成清理业务：** 仅转达一次原生 cancel，不发逐员 cleanup prompt、不重放业务。缺原生内部停止确认时保留 unknown/HOLD 并说明限制；取消未证只关 stdio、不 terminate/kill，正常成功退出沿用既有 fallback。旧可信取消 receipt 与 AGY 1.5.8 v3 样本保留为历史，不代表本候选取消行为或已部署验收。
 - **默认 `approve-all` 审批与工作区写占用分离：** 新建 AGY 任务默认持久化 `agy_approval: "approve-all"`（即使 `write` 为 `false`），放行任务授权范围内的 shell 与原生工具，同时提示词优先引导使用原生 read/search 工具。若需严格只读审批，显式传入 `--agy-approval approve-reads`（Hermes：`agy_approval: "approve-reads"`），此时 shell/写请求会被非交互拒绝。**工具审批策略与 `write: false` 都不是操作系统或文件系统沙箱；** 获授权编辑文件仍须另传 `--write` 以声明写权限并占用工作区。`reply`/`intervene` 续轮保留该策略；缺省该字段的旧任务仍按原 `write` 映射，OMP/Codex/Pi 的默认策略（缺省 `approve-reads`，`--write` 选 `approve-all`）保持不变。
 - **安全认证诊断（off ／旧 ACPX 路径）：** 失败轮可识别精确 `error.detailCode: "AUTH_REQUIRED"`，或在精确匹配 host request、turn_started、唯一主 prompt RPC/response 及 failed turn_result 且满足 `error.code === -32000` 与 `data.authRequired === true` 时，通过公开 `runtime.watchSession()` 做有界被动回放（1 秒／1000 条当前请求事件／10000 条总事件）。回调 ID 碰撞、重复、缺 journal 或超时均保持原因未知；仅向 `settlement_note` 投影固定类别和来源标签，不匹配错误正文、不扫描 AGY 日志、不改凭据或自动重放。
 

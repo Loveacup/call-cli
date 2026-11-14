@@ -36,6 +36,8 @@ native 新增 `reconcile`；跨 owner `close` 与 `reconcile` 要显式 `expecte
 
 AGY native 是独立 receipt-only 分支，不使用上述 ACPX record：当前 controller 的 unknown 可 reconcile(expected_turn) 消费已持久可信 cancellation/fresh-no-prompt cleanup；缺证返回 native_workers_unproven/HOLD，无新 owner/load/close。不会向已卸载的旧任务补证；现有 worker 权限／HOLD 生产任务未因此恢复。源码 receipt 区分取消与业务成功，公开回执不承诺任意 descendants 停止。
 
+新 Swarm 薄桥取消不再生成逐成员 cleanup prompt 或这类 verified-cancellation receipt；当前未获内部停止确认时明确 unknown/HOLD。上段 receipt-only 仍用于消费历史可信记录，不为旧任务补证或自动释放。
+
 
 native/standalone/OMP 回执提供 recovery card 与 uncovered 提示；没有已核实的 pre-exit hook 或交接就明确 false，不拦禁短命发起。runner argv 固定 turn/launch-id/epoch；仅未 claim 的首轮支持旧缺参 argv，后续旧 argv 拒绝而不执行最新轮。源码合成验证不代表安装或宿主已加载。
 

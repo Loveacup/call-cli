@@ -19,18 +19,18 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 跨设备使用协调主机已有 SSH 别名。Windows 目标增加 `--remote-shell powershell`，cwd 使用该设备上的绝对盘符路径。发起端的路径不会自动映射到目标；不要把损坏的盘符或引号“修好”后悄悄继续。
 
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。AGY 仅作执行端，不作为发起端或待验入口。
-- `--agent` 仍取 omp/codex/pi/agy。新 AGY 默认 `ocs`，不按任务自动换模型；小写 `oc/oa/4c/4a/4h` 裸简称全部 off，加 s 为 native Swarm，加 t 当前 unsupported、零业务 prompt 拒绝。简称与显式 `agy_swarm` 冲突拒绝，完整 advertised ID/family 保持兼容；worker 仍用广告 ID/family。详见[简称与模型合同](../skill/references/agy-models.md)。旧任务不回填、其他 CLI 不变。零 prompt 配置已验，OCS 模型/Swarm、OA/off 业务与部署未验。
+- `--agent` 仍取 omp/codex/pi/agy。新 AGY 默认 `ocs`，不按任务自动换模型；小写 `oc/oa/4c/4a/4h` 裸简称全部 off，加 s 为 native Swarm，加 t 为 native Teamwork 源码路径（须有命令广告，无 fallback）。简称与显式模式／路由冲突拒绝，完整 advertised ID/family 保持兼容。详见[简称与模式合同](../skill/references/agy-models.md)。旧任务不回填、其他 CLI 不变；源码、部署和真实业务验收分开报告。
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
-- native 不设硬执行 timeout，首 end_turn 后仍 running。正常业务按本轮结果、对应 worker add/kill completed 和 session unload 结算；可信取消按独立 owner receipt，不要求 native_result。缺 rawOutput 不单独保 HOLD；fatal/断线/缺证/取消不明仍 unknown，不自动重放。AGY 1.5.8 v3 候选单 worker 已实测 end_turn 后一次公开 cancel、cleanup kill+status、精确 unload/not-found、可信 cancelled、重复 close 相等及 natural exit 0。限线程 launcher/观测 wrapper 路径，不是部署、active-tool 热取消或所有后代全停证明；宿主接收/消费另验，后续付费调用须明确授权。见[当前验收索引](../VERIFICATION.md#current-acceptance-index)。
+- native 不设硬执行 timeout。Swarm／Teamwork 正常请求依公开 end_turn、完整 load、无活动工具／待答问题和当前结果，再精确 unload 与负向读回，不要求逐成员 add/kill。Teamwork 委派 RPC completed 不是业务完成；异步问题及修改沿同 owner 的 dialogue，带 expected_turn／稳定 command_id／问题原 question_id。取消只转达一次 native cancel，停止未证如实 unknown、不重放／强杀；不把旧 cleanup 样本当新薄桥证明。详见[模式合同](../skill/references/agy-models.md)和[验收索引](../VERIFICATION.md#current-acceptance-index)。
 - 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
 
 ## Dynamic Workflows 源码候选
 
-CLI start 显式传 `--agy-mode dynamic --model <完整广告ID或family>`；Hermes/OMP 用 `agy_mode: "dynamic"`。无Dynamic简称；旧 `agy_swarm` 是兼容路由，若显式给出须为native。`agy_worker_model`不适用，子模型tier属于审核Script。`single/swarm`可用同一模式字段表达，省略不改旧默认。
+CLI start 显式传 `--agy-mode dynamic --model <完整广告ID或family>`；Hermes/OMP 用 `agy_mode: "dynamic"`。无Dynamic简称；旧 `agy_swarm` 是兼容路由，若显式给出须为native。`agy_worker_model`不适用，子模型tier属于审核Script。`single/swarm/teamwork`可用同一模式字段表达，省略不改旧默认。
 
 收到 `permission` 事件后读取完整 `script` 和 `script_sha256`，由原发起方按已授权范围审核，再提交 `permission` 动作：`task_id/expected_turn/command_id/permission_id/script_sha256/decision`，decision仅allow_once或reject_once。CLI对应 `permission --task ... --expected-turn ... --command-id ... --permission-id ... --script-sha256 ... --decision allow_once|reject_once`。稳定command_id重复同意图不重发；approve-all不自动批workflow脚本。脚本可能包含任务敏感信息，仅回原来源，不向无关会话转发。
 
@@ -173,6 +173,16 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 | Windows Codex `0xC0000142` | 核对 SSH 服务窗口站问题与独立桌面入口，不关闭沙箱或扩大 ACL |
 | Codex 沙箱内 Node spawn SSH `EPERM` | 使用已配置的 PowerShell 原生客户端，不自动重复已启动业务 |
 | 资源耗尽／多次控制命令超时 | 暂停新派工，按设备和精确进程身份排查，不盲重试或广泛 kill |
+
+### 安全失败诊断（源码 A 片）
+
+既有 `start/status/events` 可观察固定 `diagnostic` 事件：`session_create/record_observed`、`prompt_submit/submission_attempted`、`prompt_execution/acceptance_observed`、`prompt_result/result_observed` 分别表示记录读回、尝试传输、公开 `promptStarted` 已观测、匹配 request 的 facade terminal 已观测；都不是业务成功证明。facade 在 runtime/auth 加载失败时也会产生 terminal，因此 `result_observed` 不证明存在 native turn.result。未观测受理不证明从未执行。
+
+失败仅投影固定 `stage/reason_code`：创建失败 `session_create/creation_failed`；SDK、认证配置和 runtime 构造分别为 `runtime_load`、`auth_load`、`runtime_create` 加 `_failed`；提交、事件观察、结果读取分别为 `prompt_submit`、`prompt_events`、`prompt_result` 加 `_failed`。权威 failed 仅报告 `prompt_result/turn_failed`，非合法终态为 `invalid_result`，未收到终态为 `result_not_observed`。既有结构化 `auth_required/timeout/connection_lost` 白名单保留；不从异常文字推断根因或认证来源。
+
+Python 传输错误报告 `transport_failed/payload_delivery_failed/transport_observation_failed`，取消不明为 `prompt_control/cancel_unsettled`；未分类 runner 异常只在已提交的 unknown 终态报告 `stage=runner reason=backend_failed`。不公开异常类型、消息、stderr、stack、prompt、配置路径或凭据。阶段诊断不清洗模型主动输出的公开正文，也不认证其内容。
+
+Shared Runtime 客户端 shutdown 只是 detach，不是取消执行。恢复既有顺序：先发 terminal，再 detach；不以清理诊断替换已收到的业务结果或增加成功门禁。Python 既有本地退出清理保留 2s 界；超界或非零退出仍可能 unknown/HOLD，但保留原 stopReason 和公开答案，这不是本片新增的结算策略。终态后非零退出仅报告 `prompt_result/post_result_exit_nonzero`，不猜测一定是 shutdown 失败。新增诊断字段非字符串或不在白名单时忽略，仍消费合法 `errorCategory/errorSource`。没有自动重试、重放或释放；创建已尝试却无 record 仍不能当作 never-created。隔离合成验证不等于部署、现场根因或所有 provider 场景通过。
 
 ## 回报完成
 

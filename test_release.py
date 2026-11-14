@@ -45,6 +45,38 @@ class ClosedFenceTests(unittest.TestCase):
                     self.assertNotIn('PRIVATE',str(exc.diagnostic))
                 else:self.fail('Backend failure was not classified')
 
+    def test_native_backend_preserves_only_typed_match_observations(self):
+        from release import NativeBackend, BackendFailure, safe_diagnostic
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        from contextlib import nullcontext
+        import json
+        payload = dict(stage='probe', reason_code='record_binding_mismatch', record_lookup_found=True,
+            record_id_match=True, backend_session_match=True, cwd_match=True, request_match=True,
+            closed_expected=True, closed_observed=False, name_lookup_found=False,
+            name_scope_match='PRIVATE_CANARY', cwd='/PRIVATE_CANARY', message='PRIVATE_CANARY')
+        response = SimpleNamespace(returncode=1, stdout=json.dumps(payload).encode(), stderr=b'PRIVATE_CANARY')
+        with patch('subprocess.run', return_value=response), patch('shutil.which', return_value='/fixture/node'), \
+             patch('updates.device_lock', return_value=nullcontext()):
+            with self.assertRaises(BackendFailure) as caught:
+                NativeBackend().probe({})
+        diagnostic = safe_diagnostic(caught.exception.diagnostic)
+        self.assertIs(diagnostic.get('closed_observed'), False)
+        self.assertIs(diagnostic.get('name_lookup_found'), False)
+        self.assertIs(diagnostic.get('record_id_match'), True)
+        self.assertNotIn('name_scope_match', diagnostic)
+        self.assertNotIn('PRIVATE_CANARY', json.dumps(diagnostic))
+        payload.update(reason_code='record_not_found', record_lookup_found=False)
+        payload.pop('record_id_match')
+        response.stdout = json.dumps(payload).encode()
+        with patch('subprocess.run', return_value=response), patch('shutil.which', return_value='/fixture/node'), \
+             patch('updates.device_lock', return_value=nullcontext()):
+            with self.assertRaises(BackendFailure) as caught:
+                NativeBackend().probe({})
+        self.assertEqual(caught.exception.reason_code, 'record_not_found')
+        self.assertIs(caught.exception.diagnostic['record_lookup_found'], False)
+        self.assertNotIn('record_id_match', caught.exception.diagnostic)
+
 
     def test_durable_release_fence_blocks_preloaded_sql_writer(self):
         import json

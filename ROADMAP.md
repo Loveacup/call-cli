@@ -4,6 +4,8 @@
 
 支持跨 CLI 新建协作会话，发起端为 OMP、Codex、Pi 或 Hermes，可通过现有 SSH 跨设备；AGY 仅作执行端，用户已取消其发起端需求。不接管已手动打开的交互会话。
 
+当前：Swarm 薄桥已由用户报告部署；OCS 只读协作已正常 closed 且运行期修订实际采用。本片收束 Teamwork 核心源码链路：来源→advertised 命令启动→公开进度／问题／失败回流→同来源修改／取消→公开结果→自身会话正常收尾。AGY 原生负责内部角色、分工、审批、权限和调度，Call-CLI 不施加父写／子只读或子权限证明门槛。源码 fixture 通过不等于真实 Teamwork 业务全链已通；没有公开事件的内部状态明确不可观测。保留既有 P0A/SDK/Swarm/sparse 成果；本片不部署、不改生产配置或旧任务。下文旧阶段与计数保留历史，以当前模式合同为准。
+
 ## 当前交付：可监控、可介入的在线双向协作（通用入口已实现并验证）
 
 `collab.py` 与单文件 `remote-client.cjs` 已交付。OMP→MacBook Codex、Codex→PC Pi、PC Pi→Mac mini OMP 三条链路，各通过问答、执行中主动介入、发起端原生输入介入，共9个真实场景；另有实际 Hermes 经通用入口发起的问答闭环。50项本地测试通过，原始公开事件与实际产物核验记录见 `evidence/acceptance.json`。原生输入由测试驱动提供，不声称物理终端界面或用户真实键入已验。
@@ -52,19 +54,13 @@
 
 一次明确授权的真实源码通用入口Dynamic正常样本已走通：默认launcher、同来源阶段/脚本审批/父JSON独立核值、精确unload与自然exit0、public close及重复回执一致，工作目录为空。未改运行源码，无额外框架或重试；见 [真实样本记录](VERIFICATION.md)。下一缺口仍是宿主原生消费/用户执行期调整、取消级联及子事件，不借正常样本升级。Teamwork原生UI有子审批入口，但本ACP链未收到子许可；保持原生路径，待公开转发/作用域证据，不造替代调度器或盲改权限。四模式整体目标不变。
 
-## Teamwork：下一单次原生验证方案（离线准备，未执行）
+## Teamwork：当前收束边界（源码，未部署）
 
-不是永久禁用：既有AGY 1.5.8样本已真实启动/teamwork、访谈、ask_question、send_message修订、brief落盘与明确批准；失败局限于本次子许可/结果链。现有call-cli仍未宣称Teamwork执行adapter，不能仅换slash并沿用Dynamic工具终态或Swarm kill条件。最小共享接入仍为agy_mode、一个NativeOwner、公开session/update/load与原来源输入；不映射到ACP的default/auto/plan权限mode，不建替代scheduler。
+源码最小纵向片复用现有原来源、owner、events/load、dialogue、cancel 和 mode receipt；见[模式合同](skill/references/agy-models.md)及[验证记录](VERIFICATION.md)。业务授权作用于整个原生请求，内部组织与权限交由 AGY，不规定父写／子只读、角色分工、内部审批 mode 或子写能力证明。
 
-下一实验需另行授权，一次新session/独立scratch项目，父Argon/low/default，不用skip-permissions/auto或预置grants。目标只有一个development演示milestone：在唯一项目目录写result.json（sum=5,difference=3,label=revised），原生最小必要团队/审核，不强造产品不支持的角色数。项目brief写与子写分开逐次审；若需命令，只批准实际呈现的精确读取/核值命令，不准python/sh全前缀。AGY自身ledger可能写app-data任务目录，必须在实验授权前明确接受或说明不可满足；不承诺scratch限制能约束原生ledger。
+真实宿主尚未验证：原会话消费执行期进度／问题／失败，用户修订在正确任务中的采用、结果回流与正常 close。取消单次转达，不把未知内部停止说成已停。结构化 phase／审批事件仅在公开接口实际暴露时沿现有机制传递；缺事件记不可观测，不猜测或强塞回调。已报告的 60s 许可超时保留为历史失败，不成为禁用 Teamwork 或要求父写的依据。
 
-1. 启动：新单owner初始化/new/load核teamwork广告，发送一次/teamwork，要求保留原生访谈与brief执行门；首次end_turn只记父返回，不能当项目完成。
-2. 查看与调整：原session公开update/load观察；必要时仅一次明确的访谈接续，不做周期模型status。回答已知问题并把initial改revised，核完整brief实际采用及精确目录/hash；不把send_message completed当接收或结果采用。
-3. 许可与执行：复核brief后一次明确批准；记录真实到达owner的RPC ID、session/tool归属、完整实际参数与offered单次选项，再精准回答。不能根据猜测的child ID批准；若原生公开请求重映射到root，须依实际参数证明归属，不人为要求child一定不同sessionId。未到达的许可不能在客户端补造。不得以approve-all或新hook掩盖问题。
-4. 限量观察：最多6个父业务prompt（含启动/访谈/修订/执行批准及必要的一次控制核对；明确记录成本，达到上限不重试）。无新事件时保持非生成式观察；在执行批准后一个5分钟人工复核点判断继续或走下面取消，不把该点实现成任务硬截止。原生UI的/agents A/D只作为已有文档支持的另一入口，不在同样本中悄悄切过去；本方案首选验证公开ACP原owner。
-5. 验收或取消：正常分支独立读唯一结果JSON并严格核值，再核原生公开coordinator/子终态证据、精确父unload/not-found与自然exit；只见父乐观文本或end_turn不称全员完成。若子许可未达/范围越界/结果阻塞，停止新的业务prompt；在该新样本上一次session/cancel可作为另行明确允许的停止动作，公开子终态缺失就记录unknown/HOLD，不自动重试/恢复或强杀。正常与取消是不同结局，一个样本不冒充两种都验。
-
-停止条件与产物：任何要求访问秘密、旧任务、其他目录业务文件或改grants立即停止审批并报告；未证子停止保留责任，不重复close。保留公开请求/响应投影、brief/hash、精确决策、产物比对与父/子证据等级，不读thought/transcript/私有IPC。若结果仍只有root回流而没有nested终态，先取得AGY公开支持的转发/停止合同再写自动结算；不因此判Teamwork整体不可用。当前离线无法证明该接口足以正常/取消闭环，故本轮不发送新模型请求或伪实现。
+本片不再安排子权限实验、真实模型重跑或新增控制制度；单代理／Swarm／Dynamic 不回归。停止写入交验收，真实宿主验证与部署仍须对应授权。
 
 ## 范围收口与已证修复归入源码（2026-11-14）
 
@@ -72,7 +68,7 @@ AGY 仅作执行端，撤回其通用发起端 runtime/test 增量；保留 Dyna
 
 Hermes 显式 release_only 与 Node/npm 子进程解析修复已归入源码；沿用现有 principal、snapshot、fence/attempt 和 exact proof，不扩大 resolver。独审发现 PATH-only 在 bundled-first 宿主仍失败，已改为现有 plugin settings 的显式 local_toolchain_bin，由 local start/续轮和 native release 共用；未配置及远端默认不变，不复制生产 Homebrew 绝对路径。定向36项与 bundled-first 真实 SDK-only 同链加载通过，见验证记录；生产仍需另准的精确代码/schema安装、设置传递和实际加载读回，本轮不落地。已由原 controller 收尾的旧 writer 不重开、不再操作。
 
-剩余门禁：真实 Hermes／OMP 原来源消费、用户在原会话执行期修订及结果采用；单代理／Swarm 正常与取消闭环的未覆盖组合；Dynamic 原生宿主回流、执行期调整、取消级联及子事件。Teamwork 当前仍预派发拒绝，需新的公开 nested permission／终态合同或另行明确原生 UI surface 后再做有信息增量的单次验收，不重复同路试错。发布由后续集中处理：干净提交的完整资源闭包、哈希、各安装副本／schema 加载与真实宿主验收分别核验；本轮不暂存、提交、推送、安装、部署或重启。
+尚未验证：真实 Hermes／OMP 原来源消费、用户在原会话执行期修订及业务采用的未覆盖组合；Dynamic 原生宿主回流、取消级联及子事件；Teamwork 本片源码路径的真实宿主进度／问答／失败、修改／取消、结果与正常 close。没有公开 phase／许可事件时如实不可观测，不将子权限证明作为接入或完成门槛。用户已报告的 OCS closed 样本保留为该样本事实，不冒充 Teamwork 证明。发布另行处理；本轮不暂存、提交、推送、安装、部署或重启，不重复权限或模型试验。
 
 ## 路线图：通用异步接收与自动唤醒
 

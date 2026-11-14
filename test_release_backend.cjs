@@ -50,6 +50,55 @@ function adapter({badReadback=false,replacement=false,badBefore}={}) {
     else await assert.rejects(probeTarget(target,deps), error=>error.stage==='probe');
     assert.equal(closes,0);
   }
+  // Same pre-close lookup miss followed by an open-record probe, without retrying close.
+  let missedCloses = 0;
+  const missed = {loadRuntime:async()=>({createAgentRegistry:()=>({}),createSharedAcpRuntime:()=>({
+    getStatus:async()=>({acpxRecordId:target.record,backendSessionId:target.acp,
+      lastRequestId:'fixture-task:4',details:{cwd:target.cwd,closed:false}}),
+    findSession:async()=>undefined,close:async()=>{missedCloses++;},shutdown:async()=>{}
+  })})};
+  await assert.rejects(closeTarget(target,missed), error => failureReason(error)==='name_scope_mismatch'
+    && error.name_lookup_found === false && error.record_id_match === true);
+  await assert.rejects(probeTarget(target,missed), error => failureReason(error)==='record_binding_mismatch'
+    && error.closed_observed === false && error.closed_expected === true
+    && error.record_id_match === true && error.backend_session_match === true
+    && error.cwd_match === true && error.request_match === true);
+  assert.equal(missedCloses,0);
+  for (const name of ['SessionNotFoundError','Error']) {
+    let closes = 0;
+    const deps = {loadRuntime:async()=>({createAgentRegistry:()=>({}),createSharedAcpRuntime:()=>({
+      getStatus:async()=>{throw Object.assign(Error('PRIVATE_CANARY'),{name});},
+      close:async()=>{closes++;},shutdown:async()=>{}
+    })})};
+    await assert.rejects(probeTarget(target,deps), error => {
+      assert.equal(failureReason(error),name === 'SessionNotFoundError' ? 'record_not_found' : 'backend_unavailable');
+      assert.equal(error.record_lookup_found,name === 'SessionNotFoundError' ? false : undefined);
+      assert.equal(error.record_id_match,undefined);
+      assert.equal(error.closed_observed,undefined);
+      return true;
+    });
+    assert.equal(closes,0);
+  }
+  for (const status of [undefined, {acpxRecordId:'PRIVATE_CANARY',backendSessionId:'PRIVATE_CANARY',
+      details:{cwd:'/PRIVATE_CANARY',closed:false}},
+    {acpxRecordId:target.record,backendSessionId:target.acp,lastRequestId:'fixture-task:4',
+      details:{cwd:target.cwd,closed:'PRIVATE_CANARY'}}]) {
+    const deps = {loadRuntime:async()=>({createAgentRegistry:()=>({}),createSharedAcpRuntime:()=>({
+      getStatus:async()=>status,findSession:async()=>undefined,close:async()=>{throw Error('MUST_NOT_CLOSE');},shutdown:async()=>{}
+    })})};
+    await assert.rejects(probeTarget(target,deps), error => {
+      assert.equal(failureReason(error),'record_binding_mismatch');
+      assert.equal(error.record_lookup_found,status !== undefined);
+      if (status?.acpxRecordId !== target.record) {
+        assert.equal(error.record_id_match,status === undefined ? undefined : false);
+        assert.equal(error.backend_session_match,undefined);
+        assert.equal(error.closed_observed,undefined);
+        assert.equal(error.cwd_match,undefined);
+      } else assert.equal(error.closed_observed,undefined);
+      assert.doesNotMatch(JSON.stringify(error),/PRIVATE_CANARY/);
+      return true;
+    });
+  }
   const dual=adapter();
   const originalRuntime=dual.deps.loadRuntime;
   dual.deps.loadRuntime=async()=>{

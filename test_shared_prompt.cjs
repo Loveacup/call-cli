@@ -157,6 +157,8 @@ test('malformed native handle is rejected before SDK or agent invocation', async
   assert.equal(code, 1);
   assert.equal(loads, 0);
   assert.equal(frames[0].status, 'failed');
+  assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
+    status:'failed', stopReason:null, stage:'input_validate', reasonCode:'input_validate_failed'}]);
 });
 
 test('execution-device auth and policy reach native shared owner without leaking to frames', async () => {
@@ -277,7 +279,8 @@ test('only a failed turn AUTH_REQUIRED detail yields a safe task-bound diagnosti
     assert.equal(code, 1);
     assert.equal(starts, 1);
     assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
-      status:'failed', stopReason:null, ...(expected ? {errorCategory:expected} : {})}]);
+      status:'failed', stopReason:null, stage:'prompt_result', reasonCode:status === 'failed' ? 'turn_failed' : 'invalid_result',
+      ...(expected ? {errorCategory:expected} : {})}]);
     assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|UNAUTHENTICATED|retryable/);
   }
 });
@@ -309,7 +312,8 @@ test('only fixed failed-turn codes project deadline and disconnect diagnostics w
     assert.equal(code, valid ? 0 : 1);
     assert.equal(starts, 1);
     assert.deepEqual(frames, [{type:'callcli.shared.result', requestId:options.requestId,
-      status:valid ? result.status : 'failed', stopReason:valid ? result.stopReason : null, ...diagnostic}]);
+      status:valid ? result.status : 'failed', stopReason:valid ? result.stopReason : null,
+      ...(!valid ? {stage:'prompt_result', reasonCode:result.status === 'failed' ? 'turn_failed' : 'invalid_result'} : {}), ...diagnostic}]);
     assert.doesNotMatch(JSON.stringify(frames), /PRIVATE|retryable|QUEUE_RUNTIME|AGENT_DISCONNECTED|TIMEOUT/);
   }
 });
@@ -368,7 +372,8 @@ test('passive-watch errors and unavailable journals cannot replace the failed re
       })}),send:async frame => frames.push(frame)
     });
     assert.equal(code,1);
-    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null,
+      stage:'prompt_result',reasonCode:'turn_failed'}]);
   }
 });
 
@@ -411,7 +416,8 @@ test('watch deadline publishes failure before noncooperative next settles and cl
     assert.equal(shutdown, true);
     assert.equal(returned, 1);
     assert.equal(cleaned, 1);
-    assert.deepEqual(frames, [{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+    assert.deepEqual(frames, [{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null,
+      stage:'prompt_result',reasonCode:'turn_failed'}]);
   }
 });
 
@@ -431,6 +437,7 @@ test('iterator return rejection or pending cleanup cannot delay the failed frame
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(code, 1);
     assert.equal(returned, 1);
-    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null}]);
+    assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null,
+      stage:'prompt_result',reasonCode:'turn_failed'}]);
   }
 });

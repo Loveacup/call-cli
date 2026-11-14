@@ -40,7 +40,7 @@ class ModelSelectionError(ValueError):
 
 def prepare_start(agent, model=None, effort=None, agy_approval=None, *, agy_swarm=None, agy_worker_model=None, agy_mode=None):
     if agy_mode is not None:
-        if agent != 'agy' or agy_mode not in {'single', 'swarm', 'dynamic'}:
+        if agent != 'agy' or agy_mode not in {'single', 'swarm', 'teamwork', 'dynamic'}:
             raise ModelSelectionError('Unsupported explicit AGY mode')
         route = 'off' if agy_mode == 'single' else 'native'
         if agy_swarm is not None and agy_swarm != route:
@@ -57,18 +57,21 @@ def prepare_start(agent, model=None, effort=None, agy_approval=None, *, agy_swar
     aliases = {'oc':'gemini-pro-orchestrator', 'oa':'gemini-pro-orchestrator-argon',
                '4c':'gemini-4-carbon', '4a':'gemini-4-argon', '4h':'gemini-4-hydrogen'}
     if isinstance(model, str):
-        if model.endswith('t') and model[:-1] in aliases:
-            raise ModelSelectionError('Teamwork intent is unsupported; no business prompt submitted')
-        base = model[:-1] if model.endswith('s') else model
+        suffix = model[-1:] if model[-1:] in {'s','t'} else ''
+        base = model[:-1] if suffix else model
         if base in aliases:
-            shorthand_mode = 'native' if model.endswith('s') else 'off'
+            intent = 'teamwork' if suffix == 't' else 'swarm' if suffix == 's' else 'single'
+            if agy_mode is not None and agy_mode != intent:
+                raise ModelSelectionError('model shorthand conflicts with agy_mode')
+            if suffix == 't': agy_mode = 'teamwork'
+            shorthand_mode = 'native' if suffix else 'off'
             if agy_swarm is not None and agy_swarm != shorthand_mode:
                 raise ModelSelectionError('model shorthand conflicts with agy_swarm; bare requires off, s requires native')
             agy_swarm = shorthand_mode
             model = aliases[base]
         elif re.fullmatch(r'(?:oc|oa|4[cah])[st]*(?:[ ,_:/+\-]*(?:oc|oa|4[cah])[st]*)*'
                           r'(?: +[st]+)?(?:-(?:low|medium|high))?', model, re.IGNORECASE):
-            raise ModelSelectionError('Invalid AGY shorthand; use oc/oa/4c/4a/4h with at most one s suffix; t is unsupported')
+            raise ModelSelectionError('Invalid AGY shorthand; use oc/oa/4c/4a/4h with at most one s or t suffix')
     model = 'gemini-pro-orchestrator' if model is None else model
     argon = isinstance(model, str) and (model == 'gemini-pro-orchestrator-argon'
         or model == 'gemini-4-argon' or model.startswith('gemini-4-argon-'))
@@ -87,6 +90,6 @@ def prepare_start(agent, model=None, effort=None, agy_approval=None, *, agy_swar
     else:
         fields = backend_for(agent).prepare_start(model, effort, agy_approval)
     fields['agy_swarm'] = mode
-    if agy_mode is not None:
-        fields['agy_mode'] = agy_mode
+    if agy_mode is not None or mode == 'native':
+        fields['agy_mode'] = agy_mode or 'swarm'
     return fields
