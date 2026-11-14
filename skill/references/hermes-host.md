@@ -43,6 +43,8 @@ native/standalone/OMP 回执提供 recovery card 与 uncovered 提示；没有�
 
 全部公开 close（Hermes、CLI、OMP）复用同一 proof/fence，不再按 same-controller 选择文本 no-session 分支。本地 exact record 先持久 fence/attempt，unknown 一律只 probe；错 record/backend session/request、非结构化文本、缺 closed/no-session 证据均保 HOLD。未创建会话只在 cancelled 且明确 acpx_created=false、session_creation_attempted=false、无 record 的不变快照上无后端调用结算；缺 record/remote/无受支持精确证明的后端返回 unknown 与 exact_record_unavailable，不盲目重关。
 
+显式 `release_only` 是普通 unknown close 的受限例外，仅原始且仍为当前 controller 可用，必填 observed expected_turn；只处理 unknown/HOLD、已结算非 native runner 与 local exact record。至多一次外部 close 前先持久 fence/attempt，之后严格 probe，已有 fence 不重复 close。资源 closed 不改业务成功与否，新 receipt 保留 business_state=unknown；不借 ended-owner 权限扩大准入，不新增 CLI/OMP 动作。源码归入不等于当前原会话已加载，实际以 schema 为准。
+
 无问题 reply 迁移：本版本新 native task 持久 continuation_version=2，必须由调用方先读 status.turn，再显式提交同一 expected_turn 和稳定 command_id；重试复用原字段，不能临时读取最新 turn 当旧意图。旧持久任务缺字段/version1 仍兼容旧同 controller 请求，但不声称具备同等 stale-intent 防护。question_id 绑定的问题回复保持兼容；跨 controller 接续始终要求 turn/command。无需手改数据库或迁移旧记录。
 
 ## 通知轮缺少身份

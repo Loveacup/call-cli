@@ -4,6 +4,19 @@ import re
 import shlex
 import subprocess
 
+def local_toolchain_env(bin_dir):
+    """Explicit host deployment setting; never search another installation."""
+    import os
+    import shutil
+    from pathlib import Path
+    if not isinstance(bin_dir, str) or not Path(bin_dir).is_absolute():
+        raise ValueError('local_toolchain_bin must be an absolute directory')
+    for name in ('node', 'npm', 'acpx'):
+        if not shutil.which(name, path=bin_dir):
+            raise ValueError(name + '_executable_not_found')
+    return dict(os.environ, PATH=bin_dir + os.pathsep + os.environ.get('PATH', ''))
+
+
 def command(device, shell, argv):
     if device == 'local':
         return argv

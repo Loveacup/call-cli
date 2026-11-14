@@ -25,6 +25,51 @@ def probe_workspace():
         shutil.rmtree(root)
 
 
+def launch_probe_runner(db, task):
+    return subprocess.Popen([
+        __import__('sys').executable, '-B', str(Path(__file__).with_name('runner.py')),
+        '--db', str(db), '--task', task['id'],
+        '--turn', str(task['turn']), '--launch-id', task['launch_id'],
+        '--epoch', str(task.get('control_epoch', 1))],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+class ProbeLauncherTests(unittest.TestCase):
+    def test_captured_launch_runs_once_and_cannot_claim_successor(self):
+        from unittest.mock import patch
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root/'agy'
+            executable.write_text('#!'+sys.executable+'\n'+(Path(__file__).parent/'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            launches = []
+            def launch(task):
+                launches.append(task.copy())
+            with patch.dict(os.environ, HOME=directory, PATH=str(root)+os.pathsep+os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=directory):
+                c = Collaboration(root/'tasks.db', launch=launch)
+                client = c.connect('codex')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='synthetic launcher', write=True)
+                c.store.update(task['id'], version_check={'decision':'fixture'})
+                (root/'task-id').write_text(task['id'])
+                (root/'final').touch()
+                first = launches[0]
+                self.assertEqual(launch_probe_runner(c.store.path, first).wait(timeout=15), 0)
+                self.assertEqual(c.status(client, task['id'])['state'], 'completed')
+                successor = c.intervene(client, task['id'], 'synthetic successor', command_id='next', expected_turn=1)
+                self.assertEqual(successor['turn'], 2)
+                before = (root/'requests.jsonl').read_text()
+                self.assertNotEqual(launch_probe_runner(c.store.path, first).wait(timeout=5), 0)
+                self.assertEqual((root/'requests.jsonl').read_text(), before)
+                self.assertEqual(c.status(client, task['id'])['state'], 'queued')
+                with patch.dict(os.environ, AGY_NATIVE_TURN='2'):
+                    self.assertEqual(launch_probe_runner(c.store.path, launches[1]).wait(timeout=15), 0)
+                self.assertEqual(c.status(client, task['id'])['state'], 'completed')
+                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+
+
 @unittest.skipUnless(os.environ.get('RUN_NATIVE_AGY_TESTS') == '1', 'opt-in live model')
 class NativeAgyTests(unittest.TestCase):
     def test_explicit_model_effort_and_same_session_continuation(self):
@@ -72,11 +117,7 @@ class NativeAgyTests(unittest.TestCase):
             (work/'input.txt').write_text(nonce)
             workers = []
             def launch(task):
-                workers.append(subprocess.Popen([
-                    __import__('sys').executable, '-B', str(Path(__file__).with_name('runner.py')),
-                    '--db', str(work/'tasks.db'), '--task', task['id']],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, start_new_session=True))
+                workers.append(launch_probe_runner(work/'tasks.db', task))
             c = Collaboration(work/'tasks.db', launch=launch)
             client = c.connect('codex')['client_id']  # coordinator handle, not native host provenance
             task = c.start(client, agent='agy', agy_swarm='off', model=model, effort=effort, cwd=root,

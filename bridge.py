@@ -116,7 +116,7 @@ class Store:
             for key in ('native_result', 'native_cleanup', 'native_cancel', 'native_snapshot',
                         'native_workers', 'native_roster', 'native_prompt_submitted', 'native_phase', 'native_observation',
                         'native_input', 'interaction_seq', 'native_interaction_next', 'native_cancel_id',
-                        'native_unload_observation', 'native_owner_exit', 'native_cancel_cleanup'):
+                        'native_unload_observation', 'native_owner_exit', 'native_cancel_cleanup', 'native_permission'):
                 task.pop(key, None)
         db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(task), task['id']))
 
@@ -263,6 +263,62 @@ class Store:
             self._save(db, task)
         return task
 
+    def permission(self, task_id, origin, *, expected_turn, command_id, permission_id, script_sha256, decision):
+        if not isinstance(command_id, str) or not command_id.strip() or decision not in {'allow_once', 'reject_once'}:
+            raise ValueError('Permission requires stable command_id and single-use decision')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._owned(db, task_id, origin)
+            same = getattr(self, '_same_principal', self._allows)
+            if not same(Origin(**task.get('controller',task['origin'])).key(), origin):
+                raise PermissionError('Permission belongs to current controller')
+            self._check_intent(task, expected_turn)
+            if type(expected_turn) is not int:
+                raise ValueError('Permission requires expected_turn')
+            intent = dict(permission_id=permission_id, script_sha256=script_sha256, decision=decision, expected_turn=expected_turn)
+            old = task.get('commands', {}).get(command_id)
+            if old:
+                if old.get('kind')!='permission' or old.get('intent')!=intent:
+                    raise ValueError('Permission command conflict')
+                return task
+            entry = task.get('native_permission', {})
+            if (task['state']!='running' or not task.get('native_input',{}).get('accepting')
+                    or task.get('native_input',{}).get('settling') or entry.get('status')!='pending' or entry.get('id')!=permission_id
+                    or entry.get('script_sha256')!=script_sha256
+                    or any(entry.get(k)!=v for k,v in self._native_binding(task).items())):
+                raise ValueError('Permission identity stale or unavailable')
+            entry.update(status='decided', decision=decision, command_id=command_id)
+            task.setdefault('commands', {})[command_id] = dict(kind='permission', intent=intent, status='decided')
+            self._save(db, task)
+        return task
+
+    def native_permission_open(self, task_id, turn, launch_id, epoch, entry):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            if (task['state']!='running' or not task.get('native_input',{}).get('accepting')
+                    or task.get('native_input',{}).get('settling')
+                    or task.get('native_permission', {}).get('status') in {'pending','decided','send_started'}):
+                raise ValueError('Native permission admission unavailable')
+            task['native_permission'] = dict(entry, status='pending', **self._native_binding(task))
+            self._save(db, task)
+
+    def native_permission_state(self, task_id, turn, launch_id, epoch, permission_id, status):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            entry = task.get('native_permission', {})
+            if status=='send_started' and (task['state']!='running' or not task.get('native_input',{}).get('accepting')
+                    or task.get('native_input',{}).get('settling')):
+                raise ValueError('Cancelled permission cannot authorize a send')
+            expected = {'send_started':'decided', 'returned':'send_started'}
+            if entry.get('id')!=permission_id or entry.get('status')!=expected.get(status):
+                raise ValueError('Native permission send stale')
+            entry['status'] = status
+            if entry.get('command_id'):
+                task['commands'][entry['command_id']]['status'] = status
+            self._save(db, task)
+
     def _native_owned(self, db, task_id, turn, launch_id, epoch):
         task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
         if (self._native_binding(task) != dict(turn=turn, launch_id=launch_id, epoch=epoch)
@@ -333,6 +389,8 @@ class Store:
                     or task.get('native_cancel_id')!=receipt.get('cancel_id')):
                 raise ValueError('Native cleanup cancel intent mismatch')
             task['native_cleanup'] = receipt
+            if receipt.get('kind')=='native-mode-settled' and receipt.get('mode')=='dynamic':
+                task['native_phase'] = 'settled' if receipt.get('outcome')=='completed' else 'unknown'
             db.execute('UPDATE native_cleanup_receipts SET receipt=? WHERE task=? AND turn=? AND launch=? AND epoch=?',
                 (json.dumps(receipt),task_id,turn,launch_id,epoch))
             self._save(db, task)
@@ -436,6 +494,7 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             task = self._native_owned(db, task_id, turn, launch_id, epoch)
             if (task['state'] != 'running' or task.get('interaction_seq', 0) != interaction_seq
+                    or task.get('native_permission',{}).get('status') in {'pending','decided','send_started','unknown'}
                     or task.get('questions') or any(c.get('kind') == 'dialogue'
                         and c.get('turn') == turn and c['status'] in {'accepted','claimed','send_started','unknown'}
                         for c in task.get('commands', {}).values())):
@@ -452,6 +511,11 @@ class Store:
             task.setdefault('native_input', {})['accepting'] = False
             if task.get('native_observation'):
                 task['native_observation']['input_available'] = False
+            permission = task.get('native_permission', {})
+            if permission.get('status') in {'pending','decided','send_started'}:
+                permission['status'] = 'unknown' if permission['status']=='send_started' else 'not_sent'
+                if permission.get('command_id'):
+                    task['commands'][permission['command_id']]['status'] = permission['status']
             for entry in task.get('commands', {}).values():
                 if entry.get('kind') == 'dialogue' and all(entry.get(k) == v for k,v in self._native_binding(task).items()):
                     if entry['status'] in {'claimed','send_started'}:

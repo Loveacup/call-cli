@@ -16,7 +16,7 @@ metadata:
 
 ## 核心方向
 
-目标是从真实 origin 到执行期进度／问题／失败回原会话，用户及发起 agent 都能动态调整正确任务，核验接收与生效，持续续办直至验收收尾。任意受支持 CLI 均可发起或执行；OMP 同样逐层验证，不预设达标。
+目标是从真实 origin 到执行期进度／问题／失败回原会话，用户及发起 agent 都能动态调整正确任务，核验接收与生效，持续续办直至验收收尾。发起端为 OMP、Codex、Pi 或 Hermes；AGY 仅为执行端，不再验收其发起能力。OMP 同样逐层验证，不预设达标。
 
 [当前核心需求](references/core-requirements.md)是唯一维护正本，个人副本仅保留语义镜像。**修改本技能或配套实现前先读；需求变化先更新正本，再同步正文、引用、模板和验收。** 源码支持、安装部署、当前 schema、真实执行和用户收到分别判定，不把目标写成已完成。
 
@@ -33,7 +33,7 @@ metadata:
 | 通用 `collab.py`／已安装包装器 | 私有 client handle；发起端自己消费短 wait 并向原会话转述 | 按[在线流程](references/online-collab.md)核对当前 help；不宣称 chat/thread 绑定或自动回注 |
 | 原生 ACPX | 命名会话、流与控制能力依适配器 | [独立短测或诊断](references/native-commands.md)，不绕过已登记任务再执行一遍 |
 
-旧 schema 缺动作时，先核验已有受支持入口及宿主桥；明确通用路径损失和协调者中继责任。需要新工具快照时才考虑宿主支持的重载／新会话，`/new` 不是普遍唯一解，也不会让新来源取得旧任务所有权。某个入口的 runtime 标签不支持某 CLI，只说明该入口缺口，不代表该 CLI 永远不能发起。
+旧 schema 缺动作时，先核验已有受支持入口及宿主桥；明确通用路径损失和协调者中继责任。需要新工具快照时才考虑宿主支持的重载／新会话，`/new` 不是普遍唯一解，也不会让新来源取得旧任务所有权。AGY 发起端已取消，不为此补 runtime 标签或替代入口。
 
 OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请求共用 bind、各 task 独立跟踪；身份不由模型填写。退出或切 session 只停宿主投递，不取消业务。已验零模型 RPC close，不代表普通 TUI、ACP defer、恢复或真实最终业务 E2E 通过；维护检查仍覆盖 call-cli 与本轮实际参与 CLI 的协作 skill，不因新增入口改变检查目标。
 
@@ -48,7 +48,7 @@ OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请�
 
 ## 权限与任务材料
 
-授权决定业务范围；审批不是沙箱，write 表示编辑授权与目录占用。AGY 未指定模型用 G4C；G4C 默认 native swarm、G4A 文字／知识默认单代理 off，可按任务显式 native/off，worker 默认 G4H、覆盖保留。默认 approve-all、可显式 approve-reads；其他 CLI 不变。按[AGY 合同](references/agy-models.md)实时设置读回，本轮结果＋对应 add/kill completed＋unload 支持正常结算释放，不要求不存在的 rawOutput、不宣称后代全死。fatal/异常 unknown 主动回流发起端，接收与消费分验；不自动重放。
+授权决定业务范围；审批不是沙箱，write 表示编辑授权与目录占用。新 AGY 未指定默认 `ocs`，不按任务自动换模型；裸简称 off、后缀 s 原生 Swarm、后缀 t 当前 unsupported 且零业务 prompt 拒绝，简称与显式路由冲突拒绝。完整广告 ID 和旧任务保持兼容，其他 CLI 不迁移。默认 approve-all、可显式 approve-reads。简称、文字／感性任务显式偏好与配置证据见[AGY 合同](references/agy-models.md)；本轮结果＋对应 add/kill completed＋unload 支持正常结算释放，不要求不存在的 rawOutput、不宣称后代全死。fatal/异常 unknown 主动回流发起端，接收与消费分验；不自动重放。
 
 方法材料先本地选择，不足再按相关性、维护来源与实质更新找公开候选；[任务技能传递](references/skill-passing.md)提供 required／optional／reference 快照与逐轮读取／采用核验。暂存、读取、自报采用、独立验收是不同证据；传递 skill 不扩大业务权限，也不默认全局安装。
 

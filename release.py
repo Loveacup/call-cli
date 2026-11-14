@@ -360,6 +360,11 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                         and bool(cleanup['workers']) and current.get('native_result', {}).get('turn') == current['turn']
                         and cleanup.get('evidence') == 'native-add-kill-completed-and-session-unload')
             trusted = store.native_cleanup_verified(db, current)
+            verified = verified or bool(trusted and trusted.get('kind')=='native-mode-settled'
+                and trusted.get('mode')==current.get('agy_mode')=='dynamic'
+                and trusted.get('evidence')=='parent-end-turn-complete-tool-history-and-unload'
+                and trusted.get('outcome')==current['state']
+                and current['state'] in {'completed','unknown'} and not current.get('runner_pid'))
             verified = verified or bool(trusted and trusted.get('kind')=='verified-cancellation'
                 and trusted.get('cancel_id')==current.get('native_cancel_id')
                 and current['state'] in {'cancelled','unknown'} and not current.get('runner_pid'))
@@ -418,6 +423,16 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
 def recover_native(store, origin, task_id, expected_turn, operation, backend=None):
     """Host-authenticated exact-task recovery; no policy file or model identity."""
     native = store.get(task_id, origin)
+    release_only = operation == 'release_only'
+    if release_only:
+        same = getattr(store, '_same_principal', store._allows)
+        if not all(same(Origin(**owner).key(), origin) for owner in
+                   (native['origin'], native.get('controller', native['origin']))):
+            raise PermissionError('Release-only requires the original current controller')
+        if native.get('agy_swarm') == 'native' or native.get('runner_pid'):
+            raise ValueError('Release-only requires a settled non-native runner')
+        if native['state'] not in {'unknown', 'closed'}:
+            raise ValueError('Release-only requires unknown/HOLD')
     if native.get('agy_swarm') == 'native':
         if type(expected_turn) is not int or native['turn']!=expected_turn:
             raise ValueError('Native recovery requires observed expected_turn')
@@ -427,14 +442,16 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
             raise ValueError('Native reconcile requires unknown/HOLD')
         return close_task(store, origin, task_id, expected_turn)
     backend = backend or NativeBackend()
-    task = store.get(task_id, origin)
+    task = native
     if expected_turn is None or type(expected_turn) is not int or task['turn'] != expected_turn:
         raise ValueError('Recovery requires the observed expected_turn')
-    if operation not in {'close', 'reconcile'}:
+    if operation not in {'close', 'reconcile', 'release_only'}:
         raise ValueError('Unsupported recovery operation')
     if not store._allows(Origin(**task.get('controller', task['origin'])).key(), origin):
         raise PermissionError('Former controller has inspection rights only')
-    if task['state'] == 'unknown':
+    if release_only:
+        operation = 'close'
+    elif task['state'] == 'unknown':
         operation = 'reconcile'  # Unknown effects never authorize another close.
     if operation == 'reconcile' and task['state'] not in {'unknown','closed'}:
         raise ValueError('Reconcile requires unknown/HOLD; healthy business remains unchanged')
@@ -493,6 +510,8 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
             receipt = dict(operation='native-recovery',target=policy,epoch=1,state='unknown',
                            phase='hold',attempts=[],admission='trusted-native-origin',binding_source='record-resolved',
                            arbitraryDetachedDescendantsProven=False)
+            if release_only:
+                receipt.update(operation='release-only', business_state='unknown')
             db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
                        (task_id,1,json.dumps(current),canonical(receipt)))
             Release._publish(db,current,receipt)
@@ -531,6 +550,9 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
 
 
 class NativeBackend:
+    def __init__(self, toolchain_bin=''):
+        self.toolchain_bin = toolchain_bin
+
     def close(self, policy):
         return self._run(policy, False)
 
@@ -541,7 +563,27 @@ class NativeBackend:
         return self._run(policy, 'resolve')
 
     def _run(self, policy, probe):
+        import os
+        import shutil
         import subprocess
+        if self.toolchain_bin:
+            try:
+                from .transport import local_toolchain_env
+            except ImportError:
+                from transport import local_toolchain_env
+            try:
+                env = local_toolchain_env(self.toolchain_bin)
+            except ValueError as exc:
+                reason = str(exc) if str(exc) in {'node_executable_not_found', 'npm_executable_not_found', 'acpx_executable_not_found'} else 'invalid_toolchain_bin'
+                raise BackendFailure('resolve', reason) from None
+            node = shutil.which('node', path=self.toolchain_bin)
+        else:
+            node = shutil.which('node')
+            if not node:
+                raise BackendFailure('resolve', 'node_executable_not_found')
+            env = dict(os.environ, PATH=str(Path(node).parent) + os.pathsep + os.environ.get('PATH', ''))
+            if not shutil.which('npm', path=env['PATH']):
+                raise BackendFailure('resolve', 'npm_executable_not_found')
         try:
             from .updates import device_lock
         except ImportError:
@@ -550,8 +592,8 @@ class NativeBackend:
         operation = probe if isinstance(probe, str) else 'probe' if probe else 'close'
         with device_lock(task):
             try:
-                result = subprocess.run(['node', str(Path(__file__).with_name('release-backend.cjs')), operation],
-                                        input=canonical(policy).encode(), capture_output=True, timeout=45)
+                result = subprocess.run([node, str(Path(__file__).with_name('release-backend.cjs')), operation],
+                                        input=canonical(policy).encode(), capture_output=True, timeout=45, env=env)
             except subprocess.TimeoutExpired as exc:
                 raise BackendFailure('timeout','backend_timeout',dict(operation=operation,timeout=True,
                     stderr_present=bool(exc.stderr),stderr_length=len(exc.stderr or b''))) from None
@@ -567,7 +609,10 @@ class NativeBackend:
             raise BackendFailure('parse', 'invalid_backend_response',diagnostic) from None
         if result.returncode != 0:
             allowed = {'record_binding_mismatch','name_scope_mismatch',
-                       'name_scope_replaced_or_reopened','backend_unavailable'}
+                       'name_scope_replaced_or_reopened','backend_unavailable',
+                       'acpx_version_mismatch','shared_runtime_unavailable',
+                       'acpx_package_not_found','runtime_export_unavailable',
+                       'npm_executable_not_found','npm_root_timeout'}
             reason = value.get('reason_code')
             stage = value.get('stage')
             for key in ('substep','error_name','error_code'):

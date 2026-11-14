@@ -44,6 +44,8 @@ acpx --version
 
 需要跨设备时读取当前用户已授权 SSH 别名的必要字段，并用有界、非交互连接核验目标。不要上传 SSH 配置或输出私钥／完整认证配置。非交互 PATH 与交互终端可能不同，应定位并显式使用实际入口。
 
+Hermes 宿主若有 bundled Node/npm 抢先，部署时在现有插件 settings 设置 `local_toolchain_bin` 为已核验 Node/npm/ACPX 的绝对 bin 目录；程序通过 ctx.get_config 读取，不靠用户改全局 PATH。local start/续轮经 terminal 的 `env PATH=...` 子环境传给 runner，local version check/control/SDK loader 继承同链；native close/reconcile/release_only 将同一设置显式传给 NativeBackend。配置目录必须包含可执行 node/npm/acpx，缺失即拒绝，不回退 bundled 链；npm 仍走既有 npm root -g。空配置保留原发现行为，远端 SSH 默认不变，不改宿主父环境、不安装工具链。源码不包含本机路径默认值；部署命令见[集成手册](integrations.md)。
+
 ## 2. 准备源码与执行依赖
 
 在用户授权的位置取得源码。先检查目的目录，已存在则识别其来源和改动，不直接重新克隆或覆盖：

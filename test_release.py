@@ -28,13 +28,16 @@ class ClosedFenceTests(unittest.TestCase):
         from release import NativeBackend, BackendFailure
         from unittest.mock import patch
         from types import SimpleNamespace
+        from contextlib import nullcontext
         import subprocess
         cases=[(OSError('PRIVATE'), 'spawn'), (subprocess.TimeoutExpired('PRIVATE',45), 'timeout'),
             (SimpleNamespace(returncode=2,stdout=b'bad',stderr=b'PRIVATE'), 'parse'),
             (SimpleNamespace(returncode=1,stdout=b'{"stage":"load","substep":"load_runtime","reason_code":"backend_unavailable","error_name":"Error"}',stderr=b'PRIVATE'), 'load')]
         for outcome, stage in cases:
             kwargs={'side_effect':outcome} if isinstance(outcome,Exception) else {'return_value':outcome}
-            with self.subTest(stage=stage), patch('subprocess.run',**kwargs):
+            with self.subTest(stage=stage), patch('subprocess.run',**kwargs), \
+                 patch('shutil.which', side_effect=lambda name, **kw: '/fixture/bin/' + name), \
+                 patch('updates.device_lock', return_value=nullcontext()):
                 try: NativeBackend().resolve({})
                 except BackendFailure as exc:
                     self.assertEqual(exc.stage,stage)

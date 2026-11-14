@@ -9,7 +9,7 @@ import uuid
 
 root = Path(os.environ['AGY_NATIVE_FIXTURE'])
 session = '11111111-1111-4111-8111-111111111111'
-model = 'gemini-4-carbon'
+model = os.environ.get('AGY_NATIVE_INITIAL_MODEL', 'gemini-4-carbon')
 closed = (root/'closed-session').exists()
 effort = 'medium'
 prompted = False
@@ -26,16 +26,50 @@ answer_map = []
 deferred_seq = 0
 deferred_slots = {}
 deferred_answers = []
+review_prompts = 0
+review_loads = 0
+
+
+def review_gate(name):
+    if not scenario or name not in scenario.get('review_gates', []):
+        return False
+    import select
+    (root/('waiting-'+name)).touch()
+    while not (root/('release-'+name)).exists():
+        if (root/('active-'+name)).exists():
+            update(dict(sessionUpdate='tool_call_update', toolCallId='read', status='completed'))
+        if select.select([sys.stdin], [], [], .01)[0]:
+            pending = json.loads(sys.stdin.readline())
+            assert pending.get('method') == 'session/cancel', pending.get('method')
+            with (root/'requests.jsonl').open('a') as handle:
+                handle.write(json.dumps(pending)+'\n')
+            (root/'cancelled').touch()
+            return True
+    return False
+
 
 def send(value):
     print(json.dumps(dict(jsonrpc='2.0', **value)), flush=True)
 
 def metadata():
-    return dict(sessionId=session, models=dict(currentModelId=model+'-'+effort,
-        availableModels=[dict(modelId=x+'-'+level) for x in ('gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon') for level in ('low', 'medium')]),
-        configOptions=[dict(id='model', currentValue=model,
-        options=[dict(value=x, name=x) for x in ('gemini-4-carbon', 'gemini-4-hydrogen', 'gemini-4-argon')]),
-        dict(id='thought_level', currentValue=effort, options=[dict(value=x) for x in ('low', 'medium')])])
+    if (root/'catalog.json').exists():
+        catalog = json.loads((root/'catalog.json').read_text())
+        if model in catalog['selected']:
+            return dict(sessionId=session, **catalog['selected'][model])
+        metadata = catalog['initial']
+        metadata['models']['currentModelId'] = model+'-'+effort
+        for option in metadata['configOptions']:
+            if option['id']=='model': option['currentValue']=model
+            if option['id']=='thought_level': option['currentValue']=effort
+        return dict(sessionId=session, **metadata)
+    standalone=('gemini-pro-orchestrator','gemini-pro-orchestrator-argon')
+    config=[dict(id='model',currentValue=model,options=[dict(value=x,name=x) for x in
+        ('gemini-4-carbon','gemini-4-hydrogen','gemini-4-argon',*standalone)])]
+    if model not in standalone:
+        config.append(dict(id='thought_level',currentValue=effort,options=[dict(value=x) for x in ('low','medium')]))
+    return dict(sessionId=session,models=dict(currentModelId=model if model in standalone else model+'-'+effort,
+        availableModels=[dict(modelId=x+'-'+level) for x in ('gemini-4-carbon','gemini-4-hydrogen','gemini-4-argon')
+            for level in ('low','medium')]+[dict(modelId=x) for x in standalone]),configOptions=config)
 
 def update(value):
     if os.environ.get('AGY_NATIVE_NO_RECEIPTS'):
@@ -61,6 +95,8 @@ for line in sys.stdin:
             saved = []
             (root/'closed-session').unlink()
         result = metadata()
+        if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
+            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
     elif method == 'session/set_config_option':
         if closed:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
@@ -72,6 +108,50 @@ for line in sys.stdin:
         result = metadata()
     elif method == 'session/prompt':
         prompted = True
+        if os.environ.get('AGY_DYNAMIC_FIXTURE'):
+            body = msg['params']['prompt'][0]['text']
+            (root/'prompt').write_text(body)
+            captured = list(saved)
+            fault = os.environ['AGY_DYNAMIC_FIXTURE']
+            if fault=='question' and not body.startswith('CALLCLI_DIALOGUE '):
+                text('CALLCLI_QUESTION Q1 Which label?\n')
+                saved = captured
+                captured = None
+                send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+                continue
+            text('CALLCLI_STAGE workflow pending\n')
+            script = '' if fault=='bad-script' else 'print("synthetic")'
+            if fault!='unapproved':
+                send(dict(id='permit', method='session/request_permission', params=dict(sessionId='foreign' if fault=='foreign' else session,
+                    toolCall=dict(toolCallId='workflow', title='run_workflow', kind='other', rawInput=dict(Script=script),
+                        args=dict(Script='changed' if fault=='mismatched-script' else script)),
+                    options=[dict(optionId='allow', kind='allow_once'), dict(optionId='deny', kind='reject_once')]+
+                        ([dict(optionId='ambiguous',kind='allow_once')] if fault=='duplicate-option' else []))))
+                permission = json.loads(sys.stdin.readline())
+                if permission.get('result', {}).get('outcome', {}).get('optionId') != 'allow':
+                    send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+                    continue
+            if fault=='disconnect':
+                raise SystemExit(7)
+            if fault=='block':
+                update(dict(sessionUpdate='tool_call', toolCallId='workflow', name='run_workflow', kind='other', status='in_progress'))
+                (root/'workflow-active').touch()
+                for pending_line in sys.stdin:
+                    pending = json.loads(pending_line)
+                    with (root/'requests.jsonl').open('a') as f:
+                        f.write(json.dumps(pending)+'\n')
+                    if pending.get('method')=='session/cancel': break
+                send(dict(id=msg['id'], result=dict(stopReason='cancelled')))
+                continue
+            update(dict(sessionUpdate='tool_call', toolCallId='workflow', name='run_workflow', kind='other',
+                rawInput=dict(Script='changed' if fault=='changed-executed-script' else script),
+                status='in_progress' if fault=='async' else 'failed' if fault=='failed' else 'completed'))
+            if fault!='async':
+                text('workflow failed\n' if fault=='failed' else '{"A":{"sum":5},"B":{"difference":3},"verified":true,"label":"revised"}\n')
+            saved = captured
+            captured = None
+            send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+            continue
         if msg['params']['prompt'][0]['text'].startswith('CALLCLI_CANCEL_CLEANUP '):
             if scenario and 'cleanup_replay' in scenario:
                 scenario['cancel_replay']=scenario['cleanup_replay']
@@ -194,8 +274,14 @@ for line in sys.stdin:
             text('world\n')
         result = dict(stopReason='end_turn')
         if scenario:
-            for entry in scenario['foreground']:
+            review_gate('before-prompt'+str(review_prompts))
+            foregrounds = scenario.get('foregrounds', [scenario['foreground']])
+            for entry in foregrounds[min(review_prompts, len(foregrounds)-1)]:
                 update(entry)
+            gate = 'prompt'+str(review_prompts)
+            review_prompts += 1
+            if review_gate(gate):
+                result = dict(stopReason='cancelled')
         if os.environ.get('AGY_NATIVE_EXIT') == 'foreground':
             raise SystemExit(7)
         if os.environ.get('AGY_NATIVE_FATAL') == 'foreground':
@@ -214,6 +300,19 @@ for line in sys.stdin:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
             continue
         captured = []
+        if os.environ.get('AGY_DYNAMIC_FIXTURE'):
+            if os.environ['AGY_DYNAMIC_FIXTURE']=='async' and (root/'workflow-release').exists():
+                for entry in saved:
+                    if entry.get('toolCallId')=='workflow': entry['status']='completed'
+                if not any(entry.get('content',{}).get('text','').startswith('{"A"') for entry in saved):
+                    saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='{"A":{"sum":5},"B":{"difference":3},"verified":true}\n')))
+            for entry in saved:
+                if os.environ['AGY_DYNAMIC_FIXTURE']=='renamed-workflow' and entry.get('toolCallId')=='workflow':
+                    entry = dict(entry,name='read_board')
+                update(entry)
+            send(dict(id=msg['id'], result=metadata()))
+            captured = None
+            continue
         if scenario and (root/'cancelled').exists() and 'cancel_replay' in scenario:
             for entry in scenario['cancel_replay']:
                 update(entry)
@@ -270,8 +369,12 @@ for line in sys.stdin:
             if replay_index >= len(scenario['replays']):
                 raise SystemExit(7)
             replay = scenario['replays'][replay_index]
+            review_gate('before-load'+str(review_loads))
             for entry in replay.get('updates', []) if isinstance(replay, dict) else replay:
                 update(entry)
+            gate = 'load'+str(review_loads)
+            review_loads += 1
+            review_gate(gate)
             replay_index += 1
             if isinstance(replay, dict) and replay.get('fail'):
                 send(dict(id=msg['id'], error=dict(code=-32603, message='Synthetic incomplete replay')))
@@ -336,6 +439,9 @@ for line in sys.stdin:
         (root/'cancelled').touch()
         continue
     elif method == 'session/close':
+        if os.environ.get('AGY_DYNAMIC_FIXTURE')=='close-fail':
+            send(dict(id=msg['id'], error=dict(code=-32603, message='synthetic close failure')))
+            continue
         closed = True
         (root/'closed-session').touch()
         result = {}

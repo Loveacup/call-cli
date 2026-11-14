@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('node:assert/strict');
-const {closeTarget, probeTarget} = require('./release-backend.cjs');
+const {closeTarget, probeTarget, failureReason} = require('./release-backend.cjs');
 const target = {task:'fixture-task',turn:4,record:'11111111-1111-4111-8111-111111111111',
   acp:'fixture-acp',session:'call-fixture-task',cwd:'/fixture',agent:'omp'};
 function adapter({badReadback=false,replacement=false,badBefore}={}) {
@@ -67,5 +67,14 @@ function adapter({badReadback=false,replacement=false,badBefore}={}) {
     && e.code==='EIO' && e.shutdownFailure?.name==='Error');
   await assert.rejects(closeTarget(target,{loadRuntime:async()=>{throw Error('PRIVATE_LOAD');}}),
     e=>e.stage==='load' && e.substep==='load_runtime');
+  for (const [error, reason] of [
+    [Error('ACPX_VERSION_MISMATCH'), 'acpx_version_mismatch'],
+    [Error('SHARED_RUNTIME_UNAVAILABLE'), 'shared_runtime_unavailable'],
+    [{code:'MODULE_NOT_FOUND',message:"Cannot find module 'acpx/package.json'"}, 'acpx_package_not_found'],
+    [{code:'ERR_PACKAGE_PATH_NOT_EXPORTED'}, 'runtime_export_unavailable'],
+    [{syscall:'spawnSync npm',code:'ENOENT'}, 'npm_executable_not_found'],
+    [{syscall:'spawnSync npm',code:'ETIMEDOUT'}, 'npm_root_timeout'],
+    [{message:'PRIVATE_SENTINEL',stack:'PRIVATE_SENTINEL'}, 'backend_unavailable']
+  ]) assert.equal(failureReason(error), reason);
   console.log('STRICT_NATIVE_RELEASE_PROOF_OK');
 })().catch(error=>{console.error(error);process.exitCode=1;});

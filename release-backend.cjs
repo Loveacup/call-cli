@@ -94,7 +94,19 @@ async function probeTarget(target, deps = {}, resolve = false) {
       source:'shared-runtime-exact-record-probe',arbitraryDetachedDescendantsProven:false};
   });
 }
-module.exports = {closeTarget, probeTarget};
+// Strict diagnostic vocabulary; raw messages, stacks and stderr remain private.
+function failureReason(error) {
+  if (['RECORD_BINDING_MISMATCH','NAME_SCOPE_MISMATCH','NAME_SCOPE_REPLACED_OR_REOPENED',
+       'ACPX_VERSION_MISMATCH','SHARED_RUNTIME_UNAVAILABLE'].includes(error?.message))
+    return error.message.toLowerCase();
+  if (error?.code === 'MODULE_NOT_FOUND' &&
+      error?.message?.startsWith("Cannot find module 'acpx/package.json'")) return 'acpx_package_not_found';
+  if (error?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED') return 'runtime_export_unavailable';
+  if (error?.syscall === 'spawnSync npm' && error?.code === 'ENOENT') return 'npm_executable_not_found';
+  if (error?.syscall === 'spawnSync npm' && error?.code === 'ETIMEDOUT') return 'npm_root_timeout';
+  return 'backend_unavailable';
+}
+module.exports = {closeTarget, probeTarget, failureReason};
 if (require.main === module) {
   const fs = require('node:fs');
   const operation = process.argv[2] ?? 'close';
@@ -103,8 +115,7 @@ if (require.main === module) {
   (handler ? handler(JSON.parse(fs.readFileSync(0, 'utf8'))) : Promise.reject(Error('INVALID_OPERATION'))).then(value => {
     process.stdout.write(JSON.stringify(value) + '\n');
   }).catch(error => {
-    const reason = ['RECORD_BINDING_MISMATCH','NAME_SCOPE_MISMATCH','NAME_SCOPE_REPLACED_OR_REOPENED'].includes(error.message)
-      ? error.message.toLowerCase() : 'backend_unavailable';
+    const reason = failureReason(error);
     const stage = ['load','registry','create','resolve','close','verify','probe','shutdown'].includes(error.stage) ? error.stage : 'resolve';
     const safe=value=>typeof value==='string' && /^[A-Za-z0-9_]{1,80}$/.test(value) ? value : undefined;
     process.stdout.write(JSON.stringify({action:'release_unknown',operation,stage,reason_code:reason,

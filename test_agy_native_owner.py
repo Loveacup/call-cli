@@ -118,6 +118,109 @@ class NativeOwnerTests(unittest.TestCase):
                 owner.select(metadata)
             self.assertEqual([call.args[0] for call in request.call_args_list], ['session/set_config_option']*2)
 
+    def test_orchestrator_exact_config_catalog_selects_without_tier_or_prompt(self):
+        from agy_native import NativeOwner
+        catalog=json.loads((Path(__file__).parent/'fixtures/agy_orchestrator_catalog.json').read_text())
+        for model in catalog['selected']:
+            for metadata in (catalog['initial'],catalog['selected'][model]):
+                with self.subTest(model=model,has_effort=len(metadata['configOptions'])>1):
+                    owner=object.__new__(NativeOwner); owner.task=dict(model=model); owner.session_id='owned'
+                    selected_model=[metadata['configOptions'][0]['currentValue']]; calls=[]
+                    def request(method,params,**kw):
+                        calls.append((method,params)); self.assertEqual(method,'session/set_config_option')
+                        self.assertEqual(params['configId'],'model')
+                        selected_model[0]=params['value']; return {},[]
+                    def load():
+                        current=selected_model[0]
+                        if current in catalog['selected']:return catalog['selected'][current],[]
+                        worker=json.loads(json.dumps(catalog['initial']))
+                        worker['configOptions'][0]['currentValue']=current
+                        worker['models']['currentModelId']=current+'-medium'
+                        return worker,[]
+                    with patch.object(owner,'request',side_effect=request),patch.object(owner,'load',side_effect=load):
+                        result=owner.select(metadata)
+                    self.assertEqual(result['model'],model)
+                    self.assertIsNone(result['effort'])
+                    self.assertEqual(result['agy_worker_model'],'gemini-4-hydrogen-medium')
+                    self.assertEqual(selected_model[0],model)
+                    self.assertTrue(result['native_selection']['readback_verified'])
+
+    def test_explicit_coordinator_selects_from_oc_catalog_on_same_connection(self):
+        from agy_native import NativeOwner, ProtocolError
+        cases = [('gemini-4-carbon-medium', None, 'gemini-4-carbon-medium'),
+                 ('gemini-4-argon', None, 'gemini-4-argon-medium'),
+                 ('gemini-4-carbon', 'low', 'gemini-4-carbon-low'),
+                 ('gemini-4-carbon', 'not-advertised', None),
+                 ('gemini-4-carbon-medium', 'low', None)]
+        for model, effort, expected in cases:
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root/'catalog.json').write_bytes((Path(__file__).parent/'fixtures/agy_orchestrator_catalog.json').read_bytes())
+                executable = root/'agy'
+                executable.write_text('#!'+sys.executable+'\n'+(Path(__file__).parent/'fixtures/agy_native_agent.py').read_text())
+                executable.chmod(0o700)
+                task = dict(device='local', cwd=directory, model=model, effort=effort)
+                with patch.dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'],
+                        AGY_NATIVE_FIXTURE=directory, AGY_NATIVE_INITIAL_MODEL='gemini-pro-orchestrator'):
+                    owner = NativeOwner(task)
+                    try:
+                        owner.initialize()
+                        owner.new()
+                        metadata, _ = owner.load()
+                        if expected is None:
+                            with self.assertRaises(ProtocolError):
+                                owner.select(metadata)
+                        else:
+                            result = owner.select(metadata)
+                            self.assertEqual(result['model'], expected)
+                            self.assertTrue(result['native_selection']['readback_verified'])
+                            self.assertEqual(result['agy_worker_model'], 'gemini-4-hydrogen-medium')
+                        self.assertTrue(owner.close_session())
+                    finally:
+                        owner.stop()
+                requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
+                self.assertFalse(any(r.get('method')=='session/prompt' for r in requests))
+
+    def test_orchestrator_missing_catalog_or_explicit_effort_fails_before_requests(self):
+        from agy_native import NativeOwner,ProtocolError
+        initial=json.loads((Path(__file__).parent/'fixtures/agy_orchestrator_catalog.json').read_text())['initial']
+        missing=json.loads(json.dumps(initial))
+        missing['models']['availableModels']=[o for o in missing['models']['availableModels'] if o['modelId']!='gemini-pro-orchestrator']
+        for task,metadata in ((dict(model='gemini-pro-orchestrator'),missing),
+                              (dict(model='gemini-pro-orchestrator',effort='low'),initial)):
+            owner=object.__new__(NativeOwner);owner.task=task;owner.session_id='owned'
+            with patch.object(owner,'request') as request,self.assertRaises(ProtocolError):owner.select(metadata)
+            request.assert_not_called()
+
+    def test_orchestrator_restored_catalog_preserves_explicit_worker_model(self):
+        from agy_native import NativeOwner
+        catalog=json.loads((Path(__file__).parent/'fixtures/agy_orchestrator_catalog.json').read_text())
+        owner=object.__new__(NativeOwner);owner.session_id='owned'
+        owner.task=dict(model='gemini-pro-orchestrator',agy_worker_model='gemini-4-hydrogen-low')
+        current=['gemini-pro-orchestrator']
+        def request(method,params,**kw):current[0]=params['value'];return {},[]
+        def load():
+            if current[0] in catalog['selected']:return catalog['selected'][current[0]],[]
+            metadata=json.loads(json.dumps(catalog['initial']))
+            metadata['configOptions'][0]['currentValue']=current[0]
+            metadata['models']['currentModelId']=current[0]+'-medium'
+            return metadata,[]
+        with patch.object(owner,'request',side_effect=request),patch.object(owner,'load',side_effect=load):
+            result=owner.select(catalog['selected']['gemini-pro-orchestrator'])
+        self.assertEqual(result['agy_worker_model'],'gemini-4-hydrogen-low')
+
+    def test_orchestrator_wrong_readback_and_legacy_missing_model_are_not_fallbacks(self):
+        from agy_native import NativeOwner,ProtocolError
+        catalog=json.loads((Path(__file__).parent/'fixtures/agy_orchestrator_catalog.json').read_text())
+        owner=object.__new__(NativeOwner);owner.session_id='owned';owner.task=dict(model='gemini-pro-orchestrator')
+        with patch.object(owner,'request') as request,patch.object(owner,'load',return_value=(catalog['initial'],[])):
+            with self.assertRaisesRegex(ProtocolError,'readback'):owner.select(catalog['initial'])
+            self.assertEqual([c.args[0] for c in request.call_args_list],['session/set_config_option'])
+        owner.task={}
+        with patch.object(owner,'request'),patch.object(owner,'load',return_value=(catalog['initial'],[])):
+            result=owner.select(catalog['initial'])
+        self.assertEqual(result['model'],'gemini-4-carbon-medium')
+
     def test_later_replay_rechunking_retains_reconciliation_boundary(self):
         from agy_native import additions, snapshot, ProtocolError
         def text(value):
@@ -668,6 +771,184 @@ class NativeOwnerTests(unittest.TestCase):
                     events = store.events(task['id'], Origin(**store.get(task['id'])['origin']))
                     self.assertIn('owned-tool read_board read pending', [e['text'] for e in events if e['kind']=='tool'])
 
+    def test_complete_fatal_suppresses_review_in_foreground_dialogue_and_load(self):
+        from agy import AGY_FATAL_LINE
+        from types import SimpleNamespace
+        original_read = os.read
+        fatal = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=AGY_FATAL_LINE+'\n'))
+        for phase in ('foreground', 'dialogue', 'load'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root/'agy'
+                executable.write_text('#!'+sys.executable+'\n'+(Path(__file__).parent/'fixtures/agy_native_agent.py').read_text())
+                executable.chmod(0o700)
+                gate = 'before-prompt0' if phase=='foreground' else 'before-load0'
+                scenario = dict(foreground=[], replays=[[fatal]] if phase=='load' else [[]], review_gates=[gate])
+                if phase=='dialogue':
+                    scenario['review_gates'].append('before-prompt1')
+                scenario['foregrounds'] = [[fatal]] if phase=='foreground' else [[], [fatal]] if phase=='dialogue' else [[]]
+                (root/'scenario.json').write_text(json.dumps(scenario))
+                clock = [0.0]
+                def read(fd, size):
+                    data = original_read(fd, size)
+                    if b'Agent execution terminated due to error.' in data:
+                        clock[0] = 600.0
+                    return data
+                timer = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 1000+clock[0], sleep=time.sleep)
+                with patch.dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'], AGY_NATIVE_FIXTURE=directory), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root/'locks'), \
+                        patch('updates.ensure_current', return_value={'decision':'fixture'}), \
+                        patch('agy_native.time', timer), patch('agy_native.os.read', side_effect=read), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root/'tasks.db', launch=lambda task: None)
+                    client = c.connect('omp')['client_id']
+                    task = c.start(client, agent='agy', cwd=directory, prompt='owned')
+                    thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'],
+                        turn=1, launch_id=task['launch_id'], epoch=1))
+                    thread.start()
+                    try:
+                        deadline = time.monotonic()+4
+                        while not (root/('waiting-'+gate)).exists() and time.monotonic()<deadline:
+                            time.sleep(.01)
+                        self.assertTrue((root/('waiting-'+gate)).exists())
+                        if phase=='dialogue':
+                            c.dialogue(client, task['id'], 'explicit revision', expected_turn=1, command_id='revision')
+                        if phase=='dialogue':
+                            (root/('release-'+gate)).touch()
+                            gate = 'before-prompt1'
+                            deadline = time.monotonic()+4
+                            while not (root/('waiting-'+gate)).exists() and time.monotonic()<deadline:
+                                time.sleep(.01)
+                            self.assertTrue((root/('waiting-'+gate)).exists())
+                        clock[0] = 599.0
+                        (root/('release-'+gate)).touch()
+                        thread.join(6)
+                        self.assertFalse(thread.is_alive())
+                        self.assertEqual(c.status(client, task['id'])['state'], 'unknown')
+                        events = c.events(client, task['id'])
+                        self.assertFalse(any(e.get('quiet_notice') for e in events), events)
+                        requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
+                        self.assertFalse(any(r.get('method') in {'session/cancel','session/close'} for r in requests))
+                        self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests), 2 if phase=='dialogue' else 1)
+                    finally:
+                        (root/('release-'+gate)).touch()
+                        if thread.is_alive():
+                            c.cancel(client, task['id'])
+                            thread.join(5)
+
+    def test_buffered_terminal_or_foreign_frames_precede_review_but_active_frames_tick(self):
+        from agy_native import NativeOwner, ProtocolError
+        for frame in (dict(id=1, error=dict(code=-1, message='synthetic')),
+                dict(id=1, result=dict(stopReason='cancelled')),
+                dict(method='session/update', params=dict(sessionId='foreign', update={}))):
+            with self.subTest(frame=frame):
+                owner = object.__new__(NativeOwner)
+                owner.serial=0; owner.session_id='owned'
+                owner.task={}
+                owner.buffer=json.dumps(frame).encode()+b'\n'
+                owner.send=lambda value: None
+                ticks=[]; owner.review=lambda: ticks.append(True)
+                try:
+                    owner.request('session/prompt', {}, timeout=None)
+                except ProtocolError:
+                    pass
+                self.assertEqual(ticks, [])
+        owner = object.__new__(NativeOwner)
+        owner.serial=0; owner.session_id='owned'; owner.send=lambda value: None
+        owner.task={}
+        frame=dict(method='session/update', params=dict(sessionId='owned', update=dict(
+            sessionUpdate='tool_call_update', toolCallId='busy', status='in_progress')))
+        owner.buffer=(json.dumps(frame)+'\n').encode()*2000+ b'{"id":1,"result":{}}\n'
+        ticks=[]; owner.review=lambda: ticks.append(True)
+        owner.request('session/prompt', {}, timeout=None)
+        self.assertEqual(len(ticks), 2000)
+
+    def test_review_cooldown_spans_prompt_dialogue_and_background_until_cancelled(self):
+        from types import SimpleNamespace
+        for active in (False, True):
+            with self.subTest(active=active), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root/'agy'
+                executable.write_text('#!'+sys.executable+'\n'+(Path(__file__).parent/'fixtures/agy_native_agent.py').read_text())
+                executable.chmod(0o700)
+                add = dict(sessionUpdate='tool_call', toolCallId='add', name='swarm', status='completed',
+                    args=dict(action='add', name='worker-a', model='gemini-4-hydrogen-medium'))
+                read = dict(sessionUpdate='tool_call', toolCallId='read', name='read_board', status='completed')
+                kill = dict(sessionUpdate='tool_call', toolCallId='kill', name='swarm', status='completed',
+                    args=dict(action='kill', name='worker-a'))
+                gates = ['prompt0', 'load0', 'prompt1', 'load1']
+                (root/'scenario.json').write_text(json.dumps(dict(foreground=[add, read],
+                    replays=[[add, read]]*2, cancel_replay=[add, read, kill], review_gates=gates)))
+                if active:
+                    for gate in gates:
+                        (root/('active-'+gate)).touch()
+                clock = [0.0]
+                timer = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 1000+clock[0],
+                    sleep=lambda seconds: time.sleep(.001))
+                with patch.dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'], AGY_NATIVE_FIXTURE=directory), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root/'locks'), \
+                        patch('updates.ensure_current', return_value={'decision':'fixture'}), \
+                        patch('agy_native.time', timer), contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root/'tasks.db', launch=lambda task: None)
+                    client = c.connect('omp')['client_id']
+                    other = c.connect('omp')['client_id']
+                    task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                    errors = []
+                    def run():
+                        try:
+                            run_task(c.store.path, task['id'], turn=task['turn'], launch_id=task['launch_id'], epoch=1)
+                        except BaseException as exc:
+                            errors.append(exc)
+                    thread = threading.Thread(target=run)
+                    def notices():
+                        return [e for e in c.events(client, task['id']) if e.get('quiet_notice')]
+                    def await_condition(predicate):
+                        deadline = time.monotonic()+4
+                        while time.monotonic() < deadline:
+                            if predicate():
+                                return
+                            time.sleep(.01)
+                        self.fail('Native coordination condition not observed: '+repr((errors, c.status(client, task['id'])['state'], len(notices()))))
+                    thread.start()
+                    try:
+                        for index, gate in enumerate(gates):
+                            await_condition(lambda: (root/('waiting-'+gate)).exists())
+                            clock[0] = (index+1)*600-1
+                            time.sleep(.15)
+                            self.assertEqual(len(notices()), index, gate+' bypassed shared cooldown')
+                            clock[0] += 1
+                            await_condition(lambda: len(notices()) == index+1)
+                            self.assertEqual(c.status(client, task['id'])['state'], 'running')
+                            self.assertEqual(notices()[-1]['interaction_seq'], int(index >= 2))
+                            with self.assertRaises(PermissionError):
+                                c.events(other, task['id'])
+                            requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
+                            self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests), 1+int(index >= 2))
+                            self.assertFalse(any(r.get('method') in {'session/cancel','session/close'} for r in requests))
+                            if gate == 'load0':
+                                c.dialogue(client, task['id'], 'explicit revision', expected_turn=1, command_id='revision')
+                            if gate == 'load1':
+                                c.cancel(client, task['id'])
+                            # Enter bounded loads near the next deadline without resetting the review clock.
+                            if gate.startswith('prompt'):
+                                clock[0] = (index+2)*600-1
+                            (root/('release-'+gate)).touch()
+                        thread.join(5)
+                        self.assertFalse(thread.is_alive())
+                        self.assertEqual(errors, [])
+                        self.assertEqual(c.status(client, task['id'])['state'], 'cancelled')
+                        clock[0] = 6000
+                        time.sleep(.15)
+                        self.assertEqual(len(notices()), 4)
+                        self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+                    finally:
+                        if thread.is_alive():
+                            c.cancel(client, task['id'])
+                            for gate in gates:
+                                (root/('release-'+gate)).touch()
+                            thread.join(5)
+                        self.assertFalse(thread.is_alive(), 'Synthetic owner did not stop')
+
     def test_repeated_history_review_uses_cooldown_without_semantic_progress(self):
         from types import SimpleNamespace
         clock = [0.0]
@@ -1183,6 +1464,7 @@ class NativeOwnerTests(unittest.TestCase):
                 def __init__(self,task):
                     self.task=task; self.session_id=None; self.created_session=False
                     self.permission_decisions=[]; self.prompt_returned=False; self.request_cancel_sent=False; self.loads=0
+                    self.review_blocked=False
                 def initialize(self): return {}
                 def new(self): self.session_id='session'; self.created_session=True; return {}
                 def select(self,metadata): return dict(agy_worker_model=model)

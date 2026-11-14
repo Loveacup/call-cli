@@ -4,9 +4,10 @@
 
 无论调用哪个 CLI，发起端都应持续掌握执行工作，将有价值的进展、问题、阻塞与最终结果送回真实的原会话；用户可随时在原会话补充或调整，由协调者传达到正确任务、确认实际生效并继续负责交付。用户不应切换终端搬运消息，或靠反复追问维持任务推进。这是本技能及配套实现优化、升级、修复的共同指向，不是某一 CLI 的特例，也不是当前所有链路已通过验收的声明。
 
-- 任意受支持的 agent／CLI 均可作为发起端或执行端；发起、事件回流及控制分别适配各自宿主，绑定真实来源与精确任务，不把 Hermes 或任何 CLI 固化为必经中转。声明 runtime 名称不能替代宿主会话身份；不得把无原会话回流的 standalone 路径静默当作等价替代，入口不可达时说明缺口，不伪造来源或任务所有权。
+- OMP、Codex、Pi 与 Hermes 可作为发起端；AGY 仅作为执行端，用户已取消其发起端需求，不再列为入口缺口或待验目标。发起、事件回流及控制分别适配各自宿主，绑定真实来源与精确任务，不把 Hermes 或任何 CLI 固化为必经中转。声明 runtime 名称不能替代宿主会话身份；不得把无原会话回流的 standalone 路径静默当作等价替代，入口不可达时说明缺口，不伪造来源或任务所有权。
 - 区分事件产生、持久化、回注、协调者消费与用户实际收到；协调者转述有意义的阶段成果与待决策事项，不逐 token 汇报，也不只等最终结果。提问和介入结算后的必要续作由协调者承接。有长期责任方时，由该方直接创建并持有需跨轮的任务生命周期；短命代理需要发起时按实际宿主能力选择入口，事先明确持续协调与收尾路径，不假定父方自动继承所有权。暂不支持恢复不等于禁止该 CLI 发起。
 - 用户可在原会话提出调整；发起 agent 也应根据执行期进展、偏差或阻塞，在已获授权范围内主动动态协调和调整，不依赖用户反复提醒。区分已提交、排队、被执行端接收及实际体现；按真实能力优先 steer，queue 与 cancel-and-resume 是不同语义，明确说明后备方式，不静默降级、不宣称无损。
+- Hermes 作为 Alex 的副手，应理解真实需求并主动承担协调、纠偏、验收与收尾；已授权范围内的普通步骤自行推进，不逐项重复请批。重大取舍或新增生产副作用仍须按真实权限处理；审查发现本身不扩大生产操作授权。
 - 按 CLI 原生能力、适配器、传输入口、协调层和宿主回流逐层核验；交互界面支持不证明所用 API 支持，OMP 亦须按同一标准验证。公共协作核心、发起端适配、执行端适配及工具链／skill 传递保持清晰职责与小接口，复用已有机制，仅隔离真实差异，不为各 CLI 组合新造调度体系。
 - 新任务默认不设执行总截止；Hermes/OMP 模型工具不接收 timeout，保留 CLI/Python 显式硬 timeout 作为非常规兼容能力，不将其静默改为提醒。公共 runner 每 600s 至多请求一次发起方复核，持续活跃也不能无限推迟；静默与活跃检查点共享冷却，不自动取消、关闭或续跑。发起 agent 核查现状后选择继续等待、明确介入或取消，提醒不必逐条转给用户；入队不等于消费，CLI 依赖活跃 owner 轮询。已有硬预算在受支持续轮显式 clear_timeout 前仍生效；多问清除延迟到最后一答，中途介入替换答题序列时以介入自身 clear 选择为准，queued 拒绝清除。连接、启动与控制保持有界；unknown 保留资源占用并先对账，不自动重放。参数收口不是 shell 权限边界，时间限制不是费用保证。
 - 一次逻辑协作启动时，检查 call-cli 本身及本轮实际参与的 CLI 协作 skill 的维护源与安装现态；按需核查本轮所选传递 skill 的来源、版本、目标端可用性与实际采用。区分可用更新与已部署版本、查询失败与已是最新；不扫描所有 skill、不在状态查询或同任务续轮重复检查，不因发现更新而擅自覆盖本地适配、打断任务或更改配置。
@@ -27,7 +28,32 @@
 
 ## AGY native swarm target and acceptance boundary
 
-New AGY tasks without a model keep the G4C default. G4C (`gemini-4-carbon`) defaults to native swarm; G4A (`gemini-4-argon`) defaults to single-agent/off for writing and knowledge tasks, with explicit native/on available per task. G4C may explicitly opt off. Workers default to G4H (`gemini-4-hydrogen`), with explicit coordinator/worker overrides preserved. Resolve advertised models and read back coordinator selection without silent fallback. Persist the chosen route; existing tasks retain their recorded path. Other CLI backends remain unchanged. The initial `/swarm` brief specifies explicit worker model, ownership, report-to-`@coordinator`, acceptance and cleanup.
+单代理、Swarm、Teamwork、Dynamic 全部属于本轮整体实施与验收范围，不将未实现模式移出范围，也不把目标写成已支持。默认 OCS 仅适用于未显式选择的新任务；用户和发起者（包括 Hermes）可按任务或偏好显式选择其他模型／模式，用户指定优先。不按任务内容静默改写省略参数的默认值，不重算旧任务。可信运行中协调三项返工已由协调者报告独立复审PASS；简称以本文件有限语法为准。Dynamic新增下述源码接入候选，不把隔离合同升级为实装／真实用户闭环。Teamwork仍属本轮范围、由独立实测提供事实，当前源码继续预派发拒绝，不假定并行试验结果。
+
+新 AGY 任务未指定模型默认 `ocs`，不按任务内容自动换模型。简称为小写精确拼写：`oc` = Orchestrator Carbon（`gemini-pro-orchestrator`），`oa` = Orchestrator Argon（`gemini-pro-orchestrator-argon`），`4c/4a/4h` = Gemini 4 Carbon/Argon/Hydrogen（`gemini-4-carbon/argon/hydrogen`）。所有裸简称均为单代理 `off`；仅后缀 `s` 表示原生 Swarm，如 `ocs/oas/4cs/4as/4hs`。后缀 `t` 表示 Teamwork 意图，当前明确 unsupported，在创建任务／派发／业务 prompt 前拒绝，不降级为 Swarm 或普通 prompt，不新增编排框架。简称编码的路由与显式 `agy_swarm` 必须一致，否则清楚拒绝；大小写变体、混合／重复后缀和组合简称拒绝，不猜测。原完整 advertised model ID/family 继续使用既有实时选择与显式路由覆盖（Carbon/OC 原默认 native，Argon/OA 原默认 off）；省略 model 而显式 off 保留 OC/off 兼容。worker 参数仍使用广告 ID/family、默认 G4H，不把执行模式后缀解释为 worker 型号。Alex 纯文字／感性工作偏好显式 `4a` 或 `4as`，不改变未指定时的 `ocs`。所有发起入口共用 `backends.prepare_start`，仅新任务解析并持久化 model/route，不回填或重算旧任务；其他 CLI 不变。OC/OA exact/config 设置与读回不猜 effort；缺广告或不支持的显式 effort 拒绝不降级。零 prompt 配置证据不等于模型或 Swarm 执行验收。初始 `/swarm` brief 保留 ownership、worker model、report-to-`@coordinator`、验收与清理要求。
+
+简称解析采用有限保留语法，不猜任意前缀：已定义小写简称照常解析；大小写变体、重复／混合 `s/t`、多个简称直接拼接或经空格／`,`／`_`／`:`／`/`／`+`／`-` 组合，以及简称后误附 `-low/-medium/-high` 均拒绝。该保留语法内的字符串不兼作不透明完整 ID；其他非空 literal ID（如 `octopus-exact`、`oc-special`）原样交给现有 advertised catalog 校验，不按 `oc/oa/4a` 前缀拒绝，也不保证未广告 ID 可执行。未指定的自然语言拼法不作无限猜测；模式仍须用已定义简称或显式参数表达。
+
+### Dynamic 源码接入候选
+
+显式 `agy_mode=dynamic` 选择同一 native ACP owner 与 `/run-workflow`，没有新增简称；`single/swarm` 为共享模式字段的既有两种语义。省略模式保持既有默认及旧记录行为，`agy_swarm` 路由冲突拒绝。Dynamic 模型使用完整 advertised ID/family，子 agent 的 inherit/flash_lite/flash/pro 属于待审批 Script 的原生命名空间，不复用 `agy_worker_model`，不把父配置说成子模型已证。缺 `run-workflow` 广告在业务 prompt 前拒绝，无普通 prompt/Swarm fallback。
+
+原controller通过 `permission` 对精确 permission_id、expected_turn、稳定command_id、Script SHA-256 作 allow_once/reject_once；脚本最大128000 UTF-8字节，原样提供给原来源审批，不执行自造AST自动授权。若同时有args.Script必须与rawInput.Script一致；只接纳不歧义的两个单次选项。普通非workflow工具仍按已有审批策略；异源/子session回调不获父批准。许可记录、send_started与returned分别取证；approve-all不能替代脚本精确审批。发送不明、取消或owner退出保留未发送/unknown，不自动重放。
+
+原始workflow事件在normalize之前核对args.Script与rawInput.Script、继承同ID的workflow身份核验稀疏update；原始重复tool_call不等价合法tool_call_update，单次回放/执行响应中重复创建保HOLD，不以snapshot合并证明single-use。pending/decided/send_started/unknown许可阻止seal，封口后不再接纳或发送新批准；卸载期间新增许可拒绝、新执行/正文使旧快照失效并保unknown/HOLD。通信RPC deadline不计精确审批中的原来源决策等待，发送/接收与实际通信仍有界，不引入任务总截止。
+
+仅对已识别workflow的原始args/rawInput：字段缺省、空对象或同Script对象可保留既有身份；显式null、字符串、数组、数字、布尔及非字符串Script无法证明同一性，保守unknown/HOLD。现有真实ACP样本未证明null是“无变化”信号；此局部证据合同不是全局ACP类型判断，不推断恶意或断言不同脚本实际执行。普通工具不套用此workflow guard。
+
+命令广告可晚于load response；缺广告时在原读取loop中最多观察1s异步通知，见精确run-workflow即返回，无新RPC/业务prompt；到界仍未广告才拒绝。最终工具终态且前台已end_turn、无未决问题时，replay无换行父答案以该边界finish，先确认可用输出再seal/unload；半行问题仍HOLD。其他父工具failed不一律否定workflow completed：失败之后有新的父最终答案才按恢复性失败处理，completed仅代表该父结果合同，不代表所有工具成功。末尾失败后无新答案保留上下文/HOLD；workflow自身failed仍非业务成功。
+
+Dynamic可信mode receipt提交时同步native_phase：正常completed为settled，失败unknown为unknown；不把dynamic_pending留在已结算任务上。该显示修正仅作用于新receipt提交，不改写历史任务或放宽实际完成／close证明。
+
+公开进展仅为父工具安全ID/name/status、父公开文本、问题与许可；当前ACP样本无直接Logs/Output/phase/子agent事件，native_observation明确unavailable，父回答不升级为子结果独立证明。首end_turn后完整load持续对账；正常完成须run_workflow completed、对应已批准脚本hash、父工具无活动项、父公开最终答案及精确卸载/负向读回；业务验收仍由发起者独立完成。失败工具可在相同安全终态卸载并留可信mode receipt，但任务仍unknown，不报业务成功。close只消费原owner的精确mode receipt，不借Swarm roster/add/kill。
+
+显式dialogue是同turn排队输入，前台返回后串行发送，不承诺运行中脚本/child热修改；问题回答绑定原question_id与interaction。半行问题归属不明、历史变更、fatal、断连、缺审批/脚本hash/工具证据、取消传播未证均unknown/HOLD，不自动续派。取消不产生Swarm cleanup prompt，不把session/cancel、stdio退出或卸载当所有后代已停；无持续恢复owner保证。新源码仅隔离合同验证，真实call-cli宿主/用户闭环和取消级联仍待单独授权验收。Teamwork仍属本轮整体范围，本候选不声称实现Teamwork。
+
+Teamwork修正真实样本已证明brief采用revised，但原生材料报告implementer/reviewer交互许可60s超时，父ACP未收到子许可，终态non-victory且预期结果缺失；不是父方明确拒绝，也非子agent逐个终止证明。保留本轮整体目标，当前不假称完整支持，不自动重跑真实样本或绕审批。
+
 
 Implement an AGY-only single native ACP owner because the public Shared Runtime SDK has no `session/load`. Reuse the existing Store, runner, events, writer exclusion and approval policy; do not create a second controller, scheduler or private-database reader. A first `end_turn` settles only the foreground RPC: keep the logical task running and retain occupancy while native background work may continue. The same owner serializes full `session/load` snapshots after the foreground turn, commits only complete successful replays and publishes only reconciled additions. Preserve repeated legitimate messages; changed prefixes or ambiguous history require reconciliation, not silent truncation. Discard thought chunks.
 
@@ -73,6 +99,8 @@ This slice exposes new recovery/reconcile only through the Hermes native plugin 
 All public close entrypoints (Hermes, standalone CLI and OMP) share the same proof boundary regardless of controller identity. Local exact-record close commits a durable fence/attempt before external close and requires exact structured probe evidence to release. Unknown is probe-only on every entrypoint; arbitrary JSON status or substring text is never sufficient. An unchanged cancelled task with explicit acpx_created=false and session_creation_attempted=false and no record can be fenced closed without backend calls. Missing-record/remote/unproven backend close preserves unknown/HOLD and reports exact_record_unavailable without external control. Existing same-controller close request shapes remain usable; explicit expected_turn, when supplied, is checked. Ended-controller recovery admission still requires observed turn; it is not made available across CLI/OMP controller identities.
 
 CLI/OMP close output projects only state, phase, stage, reason_code and external_close_attempted; nested close receipts use the same whitelist. Complete owner/target/proof/attempt history remains internal and is not rewritten by projection. Recovery cards mark exact_record_reconcile for unknown tasks with a local ACPX record, independently of the historical creating surface. Advice uses the current caller entry: Hermes points to reconcile, CLI/OMP to probe-only close; unknown entries use neutral exact-record probe guidance without promising an action verb. Capability is not authorization or proof of backend availability/settlement. Missing-record/remote tasks retain HOLD and request authorized identity/device resolution.
+
+Hermes 原生 `release_only` 是普通 unknown close 的显式资源释放例外：仅原始且仍为当前的 controller、显式整数 expected_turn、unknown/HOLD、已结算非 native runner、local exact record 可准入。复用完整快照复核、持久 fence/attempt、至多一次外部 close 与严格 closed-record/request/no-session 读回；已有 fence 只 probe，已释放重复返回原 receipt。不转移 owner、不派业务、不将资源关闭改称业务成功；新 receipt 保留 business_state=unknown，任意 detached descendants 仍未证。宿主可显式配置 local_toolchain_bin 为已核验 Node/npm/ACPX 的绝对 bin 目录，local start/续轮与 close/reconcile/release_only 共用该目录的子进程环境，配置缺程序拒绝而不回退 bundled 链；未配置及远端默认不变。继续用既有 npm root -g，不内置本机安装路径或新增自动搜索层级。
 
 ## P2 fixed-target release-only candidate
 

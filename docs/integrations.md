@@ -1,6 +1,6 @@
 # 给 AI：接入技能与 Hermes 模块
 
-先完成[环境与入口发现](configuration.md)。**技能、客户端、Hermes 插件不是同一个安装对象**：技能指导 AI 如何协作，客户端负责 SSH 传输，插件提供 Hermes 宿主工具。只安装用户需要的部分。
+先完成[环境与入口发现](configuration.md)。**技能、客户端、Hermes 插件不是同一个安装对象**：技能指导 AI 如何协作，客户端负责 SSH 传输，插件提供 Hermes 宿主工具。只安装用户需要的部分。发起端为 OMP、Codex、Pi 或 Hermes；AGY 仅作执行端。
 
 ## OMP、Codex、Pi：安装技能
 
@@ -64,6 +64,17 @@ hermes plugins doctor call-cli
 
 这里有两层开关：`plugins enable` 控制宿主加载；`settings.enabled` 是本插件自身的业务开关。配置通过 Hermes 原生 CLI 修改，不要求用户手工编辑配置文件。当前 SDK 的插件相对配置读取位置是 `plugins.entries.<plugin_id>.settings`；旧版本路径或 CLI 选项不同就查对应帮助，不猜字段。
 
+有多套 Node/npm 时，部署者先在目标设备定位并做零模型 SDK 加载验证，取得 `VERIFIED_TOOLCHAIN_BIN`（同目录 node/npm/acpx；值属于本机部署适配，不写进源码默认）。获配置授权后通过现有 settings 传入，不修改全局 PATH：
+
+```sh
+# VERIFIED_TOOLCHAIN_BIN 已由部署者发现并核验，不执行占位值。
+hermes config set plugins.entries.call-cli.settings.local_toolchain_bin "$VERIFIED_TOOLCHAIN_BIN"
+```
+
+该设置不进入模型工具参数。local start/续轮把同一目录前置到 runner 的子进程 PATH；native close/reconcile/release_only 显式构造同配置的 NativeBackend。node/npm/acpx 不齐时拒绝，不搜索其他安装。空设置维持原行为，远端 SSH 不改；固定策略 dashboard 的独立 release 不读取 ctx settings，不在此 native 配置适用范围。磁盘 schema、宿主 settings 可见性、已加载插件代码分别读回，不因 config 命令成功宣称现役已生效；本模板不授权执行配置、部署、reload 或重启。
+
+已有 bundled-first 安装的切换顺序：准备并按授权放置新代码/schema，但先保留现役有效链；写入并读回上述 settings 值后，才按宿主支持机制使新插件代码/schema 生效；最后核实际 ctx 设置和 bundled-first SDK-only 加载。不要先激活新代码再补设置，避免空值回落窗口。若宿主不允许生效前写入该键，停止在部署门禁，不绕过；宿主刷新语义本轮未实测。新开会话不转移原任务所有权，也不授权控制旧任务。
+
 ### Hermes 内调用
 
 新工具需要新会话加载。已打开的会话不要强改工具集，也不要为让验证通过擅自重启 gateway。配置好后，在能够看到 `call_cli` 的真实宿主会话中验证：
@@ -81,7 +92,7 @@ hermes plugins doctor call-cli
 
 上例无执行预算；Hermes 模型工具拒绝 timeout，OMP 模型工具同样收口，旧缓存字段会明确报错。非常规显式硬预算仍可通过原 CLI/Python start 接口表达，shell 不受此 schema 约束；存量显式值在受支持续轮清除前继续生效。保留真实返回的 task.id 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造来源。
 
-Hermes 源码候选动作是 `start/list/status/events/reply/dialogue/intervene/cancel/close/reconcile`；当前宿主只调用实际加载 schema 中的动作。`dialogue` 必带 observed expected_turn/稳定 command_id，仅有能力的 AGY native 原 owner 串行接收，不取消；`reconcile` 沿后文精确 controller/证明门禁，非通用 CLI/OMP 权限。`intervene` 保持 cancel+resume：精确 task_id、修订 prompt 和稳定 command_id；旧轮确认结算后由当前 controller status/events 推进一次后继，unknown 不续派。通用 `--runtime hermes` 声明不产生原生来源绑定或通知，两条路径不能混称。
+Hermes 源码候选动作是 `start/list/status/events/reply/dialogue/permission/intervene/cancel/close/reconcile/release_only`；当前宿主只调用实际加载 schema 中的动作。`dialogue` 必带 observed expected_turn/稳定 command_id，仅有能力的 AGY native 原 owner 串行接收，不取消；`reconcile` 沿后文精确 controller/证明门禁，非通用 CLI/OMP 权限。`release_only` 仅原始且当前 controller 显式释放 unknown 本地 exact-record 资源，必填 expected_turn，不续派业务。`intervene` 保持 cancel+resume：精确 task_id、修订 prompt 和稳定 command_id；旧轮确认结算后由当前 controller status/events 推进一次后继，unknown 不续派。通用 `--runtime hermes` 声明不产生原生来源绑定或通知，两条路径不能混称。
 
 **Hermes 的 `status` / `events` 不是纯读操作**：它们会推进此前已由 `intervene` 授权、仍为 pending 的介入；旧轮确认结算后，查询可能启动同 session 的下一轮。没有已授权 pending 介入时不会自行派工；`unknown` 保留不确定结果，不自动重试。终端 dispatch 的迟到回执按 turn 与 launch identity 条件写回，不能覆盖新轮的状态或 process ID。
 
@@ -109,6 +120,8 @@ Native `reconcile` and ended-controller `close` are host-origin, local exact-rec
 In this slice, new ended-controller recovery is Hermes-plugin-only; standalone CLI and OMP keep their existing action sets. Native reconcile refuses healthy completed/cancelled/waiting_reply tasks before probing or fencing; an explicit recovery close also refuses pending questions. Native receipts label `binding_source=record-resolved` because backend-session identity is read from the exact record, while the dashboard policy pins it independently. That provenance difference and `arbitraryDetachedDescendantsProven=false` remain visible rather than implying all workspace writers stopped.
 
 All public `close` actions now share `release.close_task`, including same-controller Hermes, standalone CLI and OMP. Existing close request shapes remain valid; supplied expected_turn is checked, while an omitted same-controller close observes the current turn without authorizing business continuation. Local exact-record closure always commits the existing durable fence before close and requires structured exact-record probe/readback. Unknown tasks only probe; repeat close never reissues an uncertain close. Cancelled, positively never-created sessions can be fenced closed without backend calls. Missing-record, remote or otherwise unsupported exact-proof backends conservatively remain unknown/HOLD with `exact_record_unavailable`; the prior unbound status/text close is not preserved as success. Non-ACP execution remains supported, but its status-only close cannot release a writer without a supported exact proof adapter.
+
+显式 `release_only` 是上述 unknown probe-only 默认的受限例外：只准原始且仍为当前 controller，显式整数 expected_turn、unknown/HOLD、runner_pid 为空、非 native、local exact record。复用完整快照复核、durable fence 与先提交 attempt，再至多一次外部 close、严格 closed-record/request/no-session probe；已有 fence 只 probe，verified 重复原样返回。新 receipt 的 business_state=unknown 不变，资源关闭不是业务验收或任意 detached writer 停止证明；CLI/OMP 不新增该动作，ended-controller 不借此扩大权限。
 
 Native no-question reply is an explicit data-version compatibility boundary: new tasks store `continuation_version=2` and require a caller-observed `expected_turn` plus stable `command_id`; read status first and retain the same intent fields on retry. Existing tasks without the field or at version 1 keep legacy same-controller requests, without claiming the new stale-intent protection. Question-ID replies remain compatible. Cross-controller continuation always uses observed-turn/command admission. No database rewrite/migration is required or performed; never substitute a fresh server-side latest turn for a stale caller intent.
 
@@ -149,7 +162,7 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 一个适配器提供三个方法：`prepare_start(model, effort, approval)` 返回持久选择字段；`run(store, task, emit)` 执行已认领轮次，发出安全的 `stage/answer/question/tool` 事件并返回 `TurnResult(state, exit_code, stop_reason, note)`；`control(task, action, timeout)` 提供精确会话控制与关闭后的 `status_snapshot/no-session` 读回。执行中检查共享任务的 `cancelling`，只有执行真正结算才能返回 cancelled；未知结果返回 unknown，不重放。适配器不修改归属、轮次或 writer 占用；现有设备锁可以复用，不新增进程服务或状态库。新增后端只需实现并注册它，随 runner 安装，不必修改其他后端；不要求使用 ACP。
 
-公共 start 接受 AGY 专用 agy_approval/agy_swarm/agy_worker_model；G4C 默认 native，G4A 默认 off，显式覆盖。native 不经 ACPX control/recovery：正常完成依本轮 native_result+worker add/kill completed+unload；取消依独立可信 owner receipt、匹配 kill 与精确 unload，不借业务 result。原 owner 在安全边界一次 cleanup 可附确认过的 swarm status；未知仍 HOLD。v3 end_turn 后单 worker 候选实测已通过，非默认部署/宿主或任意后代死亡证明。
+CLI、Hermes、OMP start 共用 `backends.prepare_start` 解析 AGY 模型与路由；新任务未指定默认 `ocs`，裸简称 off、s 为 native、t 当前 unsupported，简称与显式 agy_swarm 冲突在创建／launch 前拒绝。完整广告 ID/family 与旧任务保持兼容，不在各入口重复解析。安全选择错误可公开固定诊断，不回显用户输入／传输异常。简称定义与证据边界见[AGY 合同](../skill/references/agy-models.md)；native 不经 ACPX control/recovery，历史 G4C 样本不是 OCS 验收。
 
 结算状态与该轮唯一 `<turn>:settled` 事件在同一事务提交，事件带持久 seq、问题 ID、回答摘要和适用的介入续作提示。runner 仅打印事务接受的结算事件；即使其后轮次已推进或进入关闭，也不会丢弃这个已合法结算的通知。被拒绝的旧 runner 不广播终态，普通旧轮事件过滤保持不变；游标补读可恢复已入库事件，不承诺进程崩溃后的 stdout 重放。
 
@@ -162,6 +175,7 @@ agy.py 按持久路由选择 native owner，复用 Store/runner/安装锁/skill/
 安装按入口实际 import、动态加载与相邻资源生成逐文件 SHA-256 manifest，不用历史文件数量推算。同一冻结候选可按 commit 或未提交内容哈希定位；源码更新不等物理副本/内存加载。
 
 - 公共 core/runner/close 闭包：`bridge.py`、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`agy_native.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`recovery.py`、`release.py`；相邻 Node 资源 `skill-stage.cjs`、`shared-prompt.cjs`、`release-backend.cjs`。`skills.py` 读取 staging helper；ACP adapter 读取 shared helper；`release.py` 调用 release helper，后者 require shared helper。Node/npm/ACPX 与目标 CLI 是设备既有依赖，不从控制端复制认证。
+- Dynamic源码候选另须相邻 `agy_dynamic.py`；沿用同一NativeOwner、Store/runner及可信cleanup receipt，不是第二连接。三种入口透传显式 `agy_mode` 与 `permission` 动作；OMP将permission作为原会话followUp事件，不自动批准。许可含完整提案Script和hash，仅向真实原来源公开；不能把父输出投射成子事件，取消级联未证仍HOLD。
 - 通用 POSIX 入口：公共闭包加 `collab.py`；直接基础 Store，不启用 Hermes metadata continuity。
 - Hermes native plugin：公共闭包加 `__init__.py`、`plugin.yaml`、`native_continuity.py`（只读本 profile metadata）；完整保留 `dashboard/plugin_api.py`、`dashboard/manifest.json`，dashboard 动态加载相邻 `release.py` 并依赖宿主 FastAPI/web_deps。固定目标 policy 是另准的私有配置，不是公开打包资源。已有附带 CLI/发现/SSH 入口按其依赖保留，不整目录覆盖或删除未知文件。
 - OMP 可选宿主入口：公共闭包加 `collab.py`、`omp_bridge.py`、`omp-extension.mjs`；不需 `native_continuity.py`，也不是 Hermes plugin 注册项。extension 通过相邻路径启动 bridge/runner，不能只复制 `.mjs`。

@@ -14,7 +14,7 @@ from pathlib import Path
 from bridge import Store, Origin
 from runner import control as runner_control
 from updates import device_lock
-from backends import BACKENDS, prepare_start
+from backends import BACKENDS, ModelSelectionError, prepare_start
 
 DEFAULT_DB = Path.home()/'.hermes/plugin-data/call-cli/tasks.sqlite3'
 
@@ -75,7 +75,7 @@ class Collaboration:
 
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
               remote_shell='posix', write=False, resource='', timeout=None, model=None, effort=None,
-              agy_approval=None, agy_swarm=None, agy_worker_model=None, skills=None):
+              agy_approval=None, agy_swarm=None, agy_worker_model=None, agy_mode=None, skills=None):
         from transport import device_identity
         origin = self.origin(client)
         if remote_shell not in {'posix', 'powershell'}:
@@ -84,7 +84,7 @@ class Collaboration:
                 (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400))):
             raise ValueError('Nonempty prompt/cwd and optional timeout in (0,86400] required')
         fields = prepare_start(agent, model, effort, agy_approval,
-                               agy_swarm=agy_swarm, agy_worker_model=agy_worker_model)
+                               agy_swarm=agy_swarm, agy_worker_model=agy_worker_model, agy_mode=agy_mode)
         if fields.get('agy_swarm') == 'native' and timeout is not None:
             raise ValueError('Native swarm has no hard execution deadline; use explicit off for legacy timeout')
         from pathlib import PurePosixPath, PureWindowsPath
@@ -117,6 +117,10 @@ class Collaboration:
                                            clear_timeout=clear_timeout, expected_turn=expected_turn)
         if launch:
             self._dispatch(task)
+        return self.status(client, task_id)
+
+    def permission(self, client, task_id, **args):
+        self.store.permission(task_id, self.origin(client), **args)
         return self.status(client, task_id)
 
     def dialogue(self, client, task_id, prompt, *, expected_turn, command_id, question_id=None):
@@ -207,11 +211,12 @@ def main(argv=None):
     start = sub.add_parser('start')
     start.add_argument('--device', default='local')
     start.add_argument('--agent', choices=list(BACKENDS), default='codex')
-    start.add_argument('--model', help='Advertised exact model ID or native AGY family; omitted uses G4C. G4C defaults native swarm; G4A defaults off')
-    start.add_argument('--effort', help='Exact advertised thought_level value (AGY)')
+    start.add_argument('--model', help='AGY shorthand oc/oa/4c/4a/4h: bare=off, suffix s=native, t=unsupported; omitted=ocs, never task-selected. Advertised IDs remain supported; shorthand/agy-swarm conflicts reject')
+    start.add_argument('--effort', help='Exact advertised thought_level for AGY; standalone OC/OA have no effort option')
     start.add_argument('--agy-approval', choices=['approve-all', 'approve-reads'],
                        help='AGY only: new tasks default to approve-all; approve-reads denies shell/write requests')
-    start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY per-task override: native/on or single-agent/off; default depends on coordinator model')
+    start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY route override for advertised IDs; must match shorthand (bare=off, s=native)')
+    start.add_argument('--agy-mode', choices=['single', 'swarm', 'dynamic'], help='Explicit AGY execution mode; Dynamic requires an advertised model ID')
     start.add_argument('--agy-worker-model', help='Advertised exact ID or family for native AGY workers; family uses catalog current effort independently of coordinator effort')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
@@ -224,7 +229,7 @@ def main(argv=None):
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
     start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
     sub.add_parser('list')
-    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'intervene', 'cancel', 'close']:
+    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close']:
         p = sub.add_parser(action)
         p.add_argument('--task', required=True)
         if action in {'events', 'wait'}:
@@ -244,6 +249,12 @@ def main(argv=None):
             p.add_argument('--expected-turn', type=int, required=True)
             p.add_argument('--command-id', required=True)
             p.add_argument('--question-id')
+        if action == 'permission':
+            p.add_argument('--expected-turn', type=int, required=True)
+            p.add_argument('--command-id', required=True)
+            p.add_argument('--permission-id', required=True)
+            p.add_argument('--script-sha256', required=True)
+            p.add_argument('--decision', choices=['allow_once','reject_once'], required=True)
     opts = vars(parser.parse_args(argv))
     action, db, client = opts.pop('action'), opts.pop('db'), opts.pop('client')
     polling_token = _polling.set(action == 'wait')
@@ -280,7 +291,8 @@ def main(argv=None):
             print(json.dumps(dict(task=None, events=[], after=opts.get('after', 0), busy=True)))
             return 0
         # Avoid raw transport exception messages, stderr and environment leakage.
-        print(json.dumps(dict(error=type(exc).__name__, message='Action failed; inspect owned task status before retrying')))
+        message = str(exc) if isinstance(exc, ModelSelectionError) else 'Action failed; inspect owned task status before retrying'
+        print(json.dumps(dict(error=type(exc).__name__, message=message)))
         return 1
     finally:
         _wait_deadline.reset(deadline_token)

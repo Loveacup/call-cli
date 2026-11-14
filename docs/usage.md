@@ -1,6 +1,6 @@
 # 给 AI：在线协作手册
 
-本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。源码通用入口支持 `connect/start/list/status/events/wait/reply/dialogue/intervene/cancel/close`；`dialogue` 仅适用于有输入能力的 AGY native 原 owner。Hermes 候选另有受控 `reconcile`，实际调用以当前加载 schema 为准，不把源码动作当成现役已安装。
+本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。源码通用入口支持 `connect/start/list/status/events/wait/reply/dialogue/permission/intervene/cancel/close`；`dialogue` 仅适用于有输入能力的 AGY native 原 owner。Hermes 候选另有受控 `reconcile` 与原始且当前 controller 专用 `release_only`；后者要求 expected_turn、unknown/HOLD、已结算非 native runner 和本地 exact record，只释放资源，business_state 保留 unknown，已有 fence 不重复 close。实际调用以当前加载 schema 为准，不把源码动作当成现役已安装。
 
 ## 调用约定
 
@@ -18,8 +18,8 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 跨设备使用协调主机已有 SSH 别名。Windows 目标增加 `--remote-shell powershell`，cwd 使用该设备上的绝对盘符路径。发起端的路径不会自动映射到目标；不要把损坏的盘符或引号“修好”后悄悄继续。
 
-- `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。
-- `--agent` 取 omp/codex/pi/agy。AGY 未指定模型用 G4C，G4C 默认 native swarm；G4A 文字／知识默认 off，可显式 native 开启，G4C 可显式 off。worker 默认 G4H，模型覆盖保留。路由随任务持久化，旧任务及其他 CLI 不变。
+- `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。AGY 仅作执行端，不作为发起端或待验入口。
+- `--agent` 仍取 omp/codex/pi/agy。新 AGY 默认 `ocs`，不按任务自动换模型；小写 `oc/oa/4c/4a/4h` 裸简称全部 off，加 s 为 native Swarm，加 t 当前 unsupported、零业务 prompt 拒绝。简称与显式 `agy_swarm` 冲突拒绝，完整 advertised ID/family 保持兼容；worker 仍用广告 ID/family。详见[简称与模型合同](../skill/references/agy-models.md)。旧任务不回填、其他 CLI 不变。零 prompt 配置已验，OCS 模型/Swarm、OA/off 业务与部署未验。
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
@@ -27,6 +27,14 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
+
+## Dynamic Workflows 源码候选
+
+CLI start 显式传 `--agy-mode dynamic --model <完整广告ID或family>`；Hermes/OMP 用 `agy_mode: "dynamic"`。无Dynamic简称；旧 `agy_swarm` 是兼容路由，若显式给出须为native。`agy_worker_model`不适用，子模型tier属于审核Script。`single/swarm`可用同一模式字段表达，省略不改旧默认。
+
+收到 `permission` 事件后读取完整 `script` 和 `script_sha256`，由原发起方按已授权范围审核，再提交 `permission` 动作：`task_id/expected_turn/command_id/permission_id/script_sha256/decision`，decision仅allow_once或reject_once。CLI对应 `permission --task ... --expected-turn ... --command-id ... --permission-id ... --script-sha256 ... --decision allow_once|reject_once`。稳定command_id重复同意图不重发；approve-all不自动批workflow脚本。脚本可能包含任务敏感信息，仅回原来源，不向无关会话转发。
+
+正常读取父工具状态和父公开答案；`native_observation.child_events/phase_logs=unavailable`，不推造子事件。首end_turn仍需完整load与工具完成、审批hash和精确卸载。dialogue只排队到前台返回后发送，非热改脚本/子agent。取消、断连或证据缺失保unknown/HOLD，不能自动cancel+resume；close不补造Swarm kill证明。详见[唯一合同](../skill/references/core-requirements.md)。这是源码候选，不是实装/真实用户闭环验收。
 
 ## 观察、提问与回复
 

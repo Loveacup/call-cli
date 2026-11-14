@@ -20,6 +20,28 @@ function fixture(override) {
   return {adapter,ctx,sent,timers,calls,setPacket:p=>packet=p,switch:()=>{sid='host-b';adapter.detach();}};
 }
 
+test('real bridge wrapper preserves safe model rejection without exposing provider errors', async () => {
+  const {mkdtemp,writeFile,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os');
+  const {join}=await import('node:path');
+  const root=await mkdtemp(join(tmpdir(),'callcli-bridge-error-'));
+  const previous=process.env.CALL_CLI_PYTHON;
+  try {
+    const executable=join(root,'fake-python');
+    await writeFile(executable,`#!${process.execPath}\nlet data='';for await(const chunk of process.stdin)data+=chunk;const r=JSON.parse(data);if(r.action==='bind'){console.log(JSON.stringify({capability:'test-only'}));}else{console.log(JSON.stringify(r.args.model==='oct'?{error:'ModelSelectionError',message:'Teamwork intent is unsupported; no business prompt submitted'}:{error:'RuntimeError',message:'PRIVATE_PROVIDER_BODY'}));process.exitCode=1;}\n`,{mode:0o700});
+    process.env.CALL_CLI_PYTHON=executable;
+    const f=fixture();
+    const adapter=createAdapter({sendMessage:()=>{}},{db:join(root,'unused.db')});
+    await assert.rejects(adapter.execute({action:'start',agent:'agy',model:'oct',cwd:root,prompt:'never send'},f.ctx),/Teamwork intent is unsupported/);
+    await assert.rejects(adapter.execute({action:'start',agent:'agy',model:'exact',cwd:root,prompt:'never send'},f.ctx),error=>!error.message.includes('PRIVATE_PROVIDER_BODY') && error.message.includes('RuntimeError'));
+    assert.deepEqual(f.timers,[]);
+    adapter.detach();
+  } finally {
+    if(previous===undefined)delete process.env.CALL_CLI_PYTHON;else process.env.CALL_CLI_PYTHON=previous;
+    await rm(root,{recursive:true,force:true});
+  }
+});
+
 test('dialogue keeps native owner polling and requires explicit stable intent', async () => {
   const f=fixture();
   await f.adapter.execute({action:'start',agent:'agy',cwd:'/work',prompt:'owned'},f.ctx);
@@ -76,6 +98,19 @@ test('stage and question wake correct session once and never expose capability',
   await f.timers.shift()();
   assert.equal(f.sent.length,1);
   assert.equal(f.calls.at(-1).args.after,7);
+});
+
+test('Dynamic permission wakes origin with exact script and decision retains polling', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'agy',agy_mode:'dynamic',model:'gemini-4-argon',cwd:'/work',prompt:'workflow'},f.ctx);
+  f.setPacket({task:{id:'task-a',state:'running',turn:1},events:[{seq:1,kind:'permission',permission_id:'exact',script:'print(5)',script_sha256:'hash',turn:1}]});
+  await f.timers.shift()();
+  assert.equal(JSON.parse(f.sent[0].message.content).events[0].script,'print(5)');
+  await f.adapter.execute({action:'permission',task_id:'task-a',permission_id:'exact',script_sha256:'hash',decision:'allow_once',expected_turn:1,command_id:'once'},f.ctx);
+  assert.equal(f.calls.at(-1).args.action,'permission');
+  assert.equal(f.timers.length,1);
+  assert.ok(!f.calls.some(c=>['cancel','close'].includes(c.args?.action)));
+  f.adapter.detach();
 });
 
 test('quiet and active review requests survive stage coalescing without automatic control', async () => {

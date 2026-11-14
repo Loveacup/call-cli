@@ -2,11 +2,11 @@
 
 在执行设备上使用已安装的原生 `agy acp`，不下载第三方 antigravity adapter，也不改默认 provider。
 
-## 按模型默认的 native swarm
+## 简称、默认与原生 Swarm
 
-未指定模型沿用 G4C；新 G4C 任务默认 `agy_swarm: native`，G4A 文字／知识任务默认单代理 `off`，可按任务显式 `native` 开启。G4C 可显式 off；worker 默认 G4H，覆盖保留。CLI `--agy-swarm native|off`／宿主同名字段持久化路由；旧任务不重新计算默认，其他 backend 不变。native 从实时目录解析并读回精确模型，显式覆盖必须广告，无静默替换。
+唯一需求正本见[AGY 合同](core-requirements.md#agy-native-swarm-target-and-acceptance-boundary)。新 AGY 未指定模型默认 `ocs`，不按任务自动换模型。小写简称 `oc/oa/4c/4a/4h` 分别映射 Orchestrator Carbon/Argon、Gemini 4 Carbon/Argon/Hydrogen；裸简称全部单代理 off，后缀 s 为 native Swarm（`ocs/oas/4cs/4as/4hs`）。后缀 t 是 Teamwork 意图，当前 unsupported，零业务 prompt 拒绝，不降级。简称与显式 agy_swarm 冲突拒绝，重复／混合后缀、组合或大小写变体不猜测。Alex 纯文字／感性工作偏好显式 `4a/4as`，未指定仍 `ocs`。完整 advertised ID/family 及显式路由保持兼容；旧任务不回填、其他 CLI 不变。worker 参数仍用广告 ID/family，默认 G4H。
 
-native 源码候选先匹配本次 advertised exact ID；否则只接受本次 model.options 的 family，按显式 effort 或本次 thought_level.currentValue 唯一映射到 availableModels。worker family 使用目录当前 effort，不暗继承主模型新 effort。未知／歧义／exact-effort 冲突在 prompt 前拒绝；set 后读回协调者 exact/config，保存 native_selection.requested/resolved/readback_verified。readback_verified 只表示协调者运行配置读回，worker 仅目录解析及后续 add/model 证据，不表示独立 worker runtime 读回。off 路径未因此改变，也不升级为真实兼容已验。
+native 从当次 ACP 目录解析：exact ID 同时是 model.config 选项时直接设置该精确值；OC/OA 已在 AGY 1.5.8 零 prompt 选中并读回，不拼 family/tier，其选中态无 thought_level，显式 effort 拒绝。其他 family/exact 继续使用广告 thought_level 唯一映射，歧义/未知/readback 错误在 prompt 前失败。worker family 按本次目录当前 effort；恢复的 orchestrator 元数据缺 effort 时，原连接临时选择已广告 worker config、load 其公开 effort 目录，再恢复协调者并精确读回，不猜 tier。保存 requested/resolved/readback_verified；worker 仍仅目录解析，不是独立 worker runtime 读回。元数据验证不证明 OCS 模型执行或 Swarm 行为；off 的 ACPX 路径不冒充已实测。
 
 
 `agy_native.py` 在同一 `agy acp` 连接执行 new／设置／读回／首部 `/swarm` prompt。首轮 end_turn 后保持 running、原 owner 与占用，串行完整 load 观察 native board 自动唤醒后的结果，不发送定时 prompt、不读私有 DB。首回放按已发布工具 ID／消息逐次对齐，后续完整 load 共同前缀对账；失败或变更保 unknown。thought 丢弃，公开工具只留安全字段。
@@ -28,11 +28,9 @@ cleanup 可附带确认为原生 swarm status 的只读观察：原始 call 的�
 ## 发起端 Core CLI 负责选择
 
 1. 先读当前 `agy models`，再在执行设备的 Call CLI 检出目录运行 `node models.cjs /absolute/workdir`。后者通过 ACPX 公共 `inspectAgentModels` 读取本次 ACP 模型元数据，无业务 prompt、文件或终端能力；可能留下原生 metadata session 历史，探测连接会关闭。
-2. 从返回的 `availableModelIds` 选择一个精确 ID。用户明确选择优先；未指定时由发起端根据任务复杂度、延迟、成本选择，并说明理由。简单探测优先轻量模型，复杂实现/审查按需求选择能力更强的当前候选，不永久绑定历史型号。
+2. 用户显式模型优先，从当次目录选择 exact/config 值。省略模型沿本文件 OCS 默认，不由协调者静默改成其他“便宜”模型；缺 OC、未知 effort 或控制失败明确拒绝，不换 provider。
 3. 可选 JEV 只比较本次实际候选及脱敏任务摘要，不接收凭据、私有任务正文；结果必须属于候选集。不在集合内就拒绝该建议，由发起端在原集合选择。JEV 不是必需依赖，不自动安装，不替代用户选择。
-4. 未指定模型采用 G4C；off 路径使用对应 G4C 广告 family，显式模型按本次目录选择。模型不可用或控制失败停下报告，不换模型/provider，不重复业务任务。
-
-未指定模型而显式 off 当前持久化 G4C family，由旧 ACPX 设置／读回路径处理；该组合未在 AGY 1.5.7 真 adapter 验证，family 与 current_model_id 的 tier-ID 差异可能使读回拒绝，拒绝时不提交 prompt。需要当前已核选择时显式传发现的精确 G4C ID 再 off；不把该未验组合写成真实执行通过。
+4. 完整 ID/family 沿既有路由；省略 model 而显式 off 保留 OC/off 兼容。简称则已编码路由，如 `oc`＋native、`ocs`＋off 均拒绝，不能悄悄覆盖。原生零 prompt OC/OA 选择成功不等于 ACPX off 业务兼容已验。G4C/off 建议使用当次广告 exact ID；family 与 tier-ID 差异的旧兼容限制不因简称支持消失。旧任务不重解析。
 
 ## ACPX 0.22 / AGY 元数据差异
 

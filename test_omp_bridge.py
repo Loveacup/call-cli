@@ -23,6 +23,36 @@ class HostBridgeTests(unittest.TestCase):
     def call(self, action, **args):
         return self.bridge.handle(self.a, self.key, dict(action=action, **args))
 
+    def test_json_bridge_explains_unsupported_teamwork_without_launch(self):
+        import omp_bridge
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        request=dict(db=str(self.bridge.store.path),host=self.a,capability=self.key,
+                     args=dict(action='start',agent='agy',cwd=self.tmp.name,prompt='never send',model='oat'))
+        output=StringIO()
+        with patch.object(omp_bridge,'HostBridge',return_value=self.bridge), \
+                patch.object(omp_bridge.sys,'stdin',StringIO(json.dumps(request))),redirect_stdout(output):
+            rc=omp_bridge.main()
+        self.assertEqual(rc,1)
+        self.assertIn('Teamwork',json.loads(output.getvalue())['message'])
+        self.assertEqual(self.call('list')['tasks'],[])
+        self.assertEqual(self.launches,[])
+
+    def test_omp_shorthand_resolves_and_rejects_before_launch(self):
+        for model,mode,reason in (('ocs','off','conflict'),('4a','native','conflict'),
+                                  ('4ct',None,'unsupported'),('ocss',None,'Invalid AGY shorthand')):
+            with self.assertRaisesRegex(ValueError,reason):
+                self.call('start',agent='agy',cwd=self.tmp.name,prompt='never send',model=model,agy_swarm=mode)
+        self.assertEqual(self.call('list')['tasks'],[])
+        self.assertEqual(self.launches,[])
+        for model,expected,mode in ((None,'gemini-pro-orchestrator','native'),
+                ('oc','gemini-pro-orchestrator','off'),('oas','gemini-pro-orchestrator-argon','native'),
+                ('4a','gemini-4-argon','off'),('4as','gemini-4-argon','native')):
+            task=self.call('start',agent='agy',cwd=self.tmp.name,prompt='synthetic',model=model)['task']
+            self.assertEqual((task['model'],task['agy_swarm']),(expected,mode))
+            self.assertEqual((self.launches[-1]['model'],self.launches[-1]['agy_swarm']),(expected,mode))
+
     def test_dialogue_queues_on_bound_owner_without_cancel_or_relaunch(self):
         task = self.call('start', agent='agy', prompt='owned', cwd=self.tmp.name)['task']
         self.bridge.store.update(task['id'], state='running', runner_pid=123)

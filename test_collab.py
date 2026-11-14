@@ -19,6 +19,41 @@ class CollaborationTests(unittest.TestCase):
                 returncode=0, stdout=b'{"action":"status_snapshot","status":"no-session","summary":"no active session"}'),
             lock=lambda task, **kw: nullcontext(True))
 
+    def test_cli_shorthand_rejection_explains_conflict_or_unsupported_without_launch(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        client=self.c.connect('omp')['client_id']
+        for args,reason in ((['--model','ocs','--agy-swarm','off'],'conflict'),
+                            (['--model','oct'],'unsupported'),(['--model','ocss'],'Invalid AGY shorthand')):
+            with self.subTest(args=args):
+                output=StringIO()
+                with patch.object(collab,'Collaboration',return_value=self.c),redirect_stdout(output):
+                    rc=collab.main(['--db',str(self.db),'--client',client,'start','--agent','agy',
+                                    '--cwd',self.tmp.name,'--prompt','never send',*args])
+                self.assertEqual(rc,1)
+                self.assertIn(reason,json.loads(output.getvalue())['message'])
+        self.assertEqual(self.c.list(client),[])
+        self.assertEqual(self.launches,[])
+
+    def test_cli_shorthand_start_persists_resolved_selection(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        client=self.c.connect('omp')['client_id']
+        for model,expected,mode in ((None,'gemini-pro-orchestrator','native'),
+                ('oc','gemini-pro-orchestrator','off'),('oas','gemini-pro-orchestrator-argon','native'),
+                ('4a','gemini-4-argon','off'),('4as','gemini-4-argon','native')):
+            output=StringIO()
+            args=[] if model is None else ['--model',model]
+            with patch.object(collab,'Collaboration',return_value=self.c),redirect_stdout(output):
+                rc=collab.main(['--db',str(self.db),'--client',client,'start','--agent','agy',
+                                '--cwd',self.tmp.name,'--prompt','synthetic',*args])
+            self.assertEqual(rc,0,output.getvalue())
+            task=json.loads(output.getvalue())
+            self.assertEqual((task['model'],task['agy_swarm']),(expected,mode))
+            self.assertEqual((self.launches[-1]['model'],self.launches[-1]['agy_swarm']),(expected,mode))
+
     def test_cli_dialogue_uses_same_turn_without_launch_or_cancel(self):
         from unittest.mock import patch
         from contextlib import redirect_stdout

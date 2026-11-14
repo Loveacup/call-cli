@@ -7,6 +7,7 @@ import sys
 import time
 from bridge import Origin
 from collab import Collaboration, DEFAULT_DB, _polling, _wait_deadline
+from backends import ModelSelectionError
 
 
 class HostBridge(Collaboration):
@@ -57,10 +58,11 @@ class HostBridge(Collaboration):
         self.binding = self.identity(host)
         self.origin(capability)
         allowed = {
-            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'skills'},
+            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'skills'},
             'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
             'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout', 'expected_turn', 'command_id'},
             'dialogue': {'task_id', 'prompt', 'command_id', 'expected_turn', 'question_id'},
+            'permission': {'task_id', 'expected_turn', 'command_id', 'permission_id', 'script_sha256', 'decision'},
             'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},
         }
         args = dict(args)
@@ -105,7 +107,8 @@ def main():
             print(json.dumps(dict(task=None, events=[], after=args.get('after', 0), busy=True)))
             return 0
         # Do not expose host input, capabilities, paths or provider exception bodies.
-        print(json.dumps({'error': type(exc).__name__, 'message': 'OMP bridge action failed; reconcile exact task before retrying'}))
+        message = str(exc) if isinstance(exc, ModelSelectionError) else 'OMP bridge action failed; reconcile exact task before retrying'
+        print(json.dumps({'error': type(exc).__name__, 'message': message}))
         return 1
     finally:
         if deadline_token is not None:

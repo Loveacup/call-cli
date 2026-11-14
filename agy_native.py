@@ -4,6 +4,7 @@ import os
 import selectors
 import subprocess
 import time
+import hashlib
 
 try:
     from .events import EventDecoder, safe_tool_id, safe_tool_name, safe_tool_kind
@@ -32,6 +33,12 @@ class NativeOwner:
         self.serial = 0
         self.buffer = b''
         self.permission_decisions = []
+        self.review = None
+        self.review_blocked = False
+        self.available_commands = set()
+        self.permission_handler = None
+        self.workflow_identity = {}
+        self.approval_wait_seconds = 0.0
         self.proc = subprocess.Popen(command(task['device'], task.get('shell', 'posix'),
             ['agy', 'acp', '--disable-telemetry']), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
@@ -49,21 +56,36 @@ class NativeOwner:
     def request(self, method, params, *, timeout=60, check_cancel=None, on_update=None):
         self.serial += 1
         ident = self.serial
-        self.send(dict(id=ident, method=method, params=params))
+        if method is not None:
+            self.send(dict(id=ident, method=method, params=params))
         updates = []
+        workflow_calls = set()
+        try:
+            from .agy import fatal_error
+        except ImportError:
+            from agy import fatal_error
+        public_text = ''
+        def review():
+            if not cancel_sent and not getattr(self, 'review_blocked', False) and self.review is not None:
+                self.review()
         deadline = time.monotonic()+timeout if timeout is not None else None
         cancel_sent = False
         self.request_cancel_sent = False
         while True:
+            if method is None and params['command'] in self.available_commands:
+                return {}, updates
             if check_cancel and check_cancel() and not cancel_sent:
                 self.notify_cancel()
                 cancel_sent = True
                 self.request_cancel_sent = True
                 deadline = time.monotonic()+25
             if deadline is not None and time.monotonic() >= deadline:
+                if method is None:
+                    return {}, updates
                 raise ProtocolError('Native ACP control did not settle; effects unknown')
             if b'\n' not in self.buffer:
                 if not self.poller.select(.1):
+                    review()
                     continue
                 chunk = os.read(self.proc.stdout.fileno(), 65536)
                 if not chunk:
@@ -76,13 +98,33 @@ class NativeOwner:
             except (ValueError, UnicodeError):
                 raise ProtocolError('Invalid native ACP frame') from None
             if frame.get('method') and 'id' in frame:
+                if method is None:
+                    self.send(dict(id=frame['id'],result=dict(outcome=dict(outcome='cancelled'))))
+                    raise ProtocolError('Unexpected callback during capability observation; no prompt')
+                waited = getattr(self,'approval_wait_seconds',0.0)
                 self._callback(frame)
+                if deadline is not None:
+                    deadline += getattr(self,'approval_wait_seconds',0.0)-waited
             elif frame.get('method') == 'session/update':
                 if self.session_id and frame.get('params', {}).get('sessionId') != self.session_id:
                     raise ProtocolError('Native update session mismatch')
+                raw = frame.get('params', {}).get('update', {})
+                if (self.task.get('agy_mode')=='dynamic' and getattr(self,'close_attempted',False)
+                        and raw.get('sessionUpdate')!='available_commands_update'):
+                    raise ProtocolError('Dynamic activity during unload; retain HOLD')
+                if raw.get('sessionUpdate') == 'available_commands_update':
+                    self.available_commands = {entry['name'] for entry in raw.get('availableCommands', [])
+                        if isinstance(entry, dict) and isinstance(entry.get('name'), str)}
+                if self.task.get('agy_mode')=='dynamic':
+                    self.validate_workflow_update(raw, workflow_calls)
                 update = normalize(frame.get('params', {}).get('update', {}))
                 if update is not None:
                     updates.append(update)
+                    if update['sessionUpdate'] == 'agent_message_chunk':
+                        public_text = (public_text+update['content']['text'])[-64000:]
+                        if fatal_error(public_text):
+                            # Suppress ordinary reminders without publishing unverified load history.
+                            self.review_blocked = True
                     if on_update is not None:
                         on_update(update)
             elif frame.get('id') == ident and not frame.get('method'):
@@ -99,6 +141,37 @@ class NativeOwner:
                 if method == 'session/prompt':
                     self.prompt_returned = True
                 return frame['result'], updates
+            review()
+
+    def validate_workflow_update(self, raw, calls):
+        if raw.get('sessionUpdate') not in {'tool_call','tool_call_update'}:
+            return
+        ident = safe_tool_id(raw.get('toolCallId'))
+        title = raw.get('name') or raw.get('title')
+        known = self.workflow_identity.get(ident)
+        if title!='run_workflow' and known is None:
+            return
+        if not ident or (title is not None and title!='run_workflow'):
+            raise ProtocolError('Dynamic workflow identity conflict; retain HOLD')
+        if raw['sessionUpdate']=='tool_call':
+            if ident in calls:
+                raise ProtocolError('Dynamic repeated workflow creation; retain HOLD')
+            calls.add(ident)
+        hashes = []
+        for key in ('args','rawInput'):
+            if key not in raw:
+                continue
+            value = raw[key]
+            if not isinstance(value,dict):
+                raise ProtocolError('Dynamic argument evidence type unsupported; script identity unverified, retain HOLD')
+            if 'Script' in value:
+                if not isinstance(value['Script'],str):
+                    raise ProtocolError('Dynamic Script type conflict; retain HOLD')
+                hashes.append(hashlib.sha256(value['Script'].encode()).hexdigest())
+        if len(set(hashes))>1 or (known is not None and hashes and known!=hashes[0]):
+            raise ProtocolError('Dynamic raw Script changed or conflicted; retain HOLD')
+        if hashes:
+            self.workflow_identity[ident] = hashes[0]
 
     def _callback(self, frame):
         if frame['method'] != 'session/request_permission':
@@ -107,6 +180,13 @@ class NativeOwner:
         params = frame.get('params', {})
         root = params.get('sessionId') == self.session_id
         tool = params.get('toolCall', {})
+        if self.task.get('agy_mode')=='dynamic' and getattr(self,'close_attempted',False):
+            self.send(dict(id=frame['id'],result=dict(outcome=dict(outcome='cancelled'))))
+            raise ProtocolError('Dynamic permission during unload rejected; retain HOLD')
+        if (root and self.task.get('agy_mode') == 'dynamic' and self.permission_handler is not None
+                and (tool.get('name') or tool.get('title'))=='run_workflow'):
+            self.permission_handler(frame)
+            return
         allow = root and (self.task.get('agy_approval') == 'approve-all' or tool.get('kind') in {'read', 'search'})
         wanted = 'allow_once' if allow else 'reject_once'
         kinds = {'allow_once','allow_always','reject_once','reject_always'}
@@ -165,6 +245,10 @@ class NativeOwner:
         current_effort = config.get('thought_level', {}).get('currentValue')
         def resolve(requested, intent, effort=None):
             if requested in catalog:
+                if requested in families:
+                    if effort is not None:
+                        raise ProtocolError('Standalone advertised model has no effort mapping; no prompt')
+                    return requested, requested, None
                 pairs = [(family, level) for family in families for level in efforts
                          if family+'-'+level == requested]
                 if len(pairs) != 1:
@@ -187,18 +271,60 @@ class NativeOwner:
                 raise ProtocolError('Exact model has no unambiguous advertised config mapping')
             return exact, family, level
         requested = {key:self.task.get(key) for key in ('model', 'effort', 'agy_worker_model')}
+        coordinator = self.task.get('model')
+        if not efforts and not (coordinator in catalog and coordinator in families):
+            if coordinator in catalog:
+                candidates = [candidate for candidate in families if coordinator.startswith(candidate+'-')]
+                if len(candidates) != 1:
+                    raise ProtocolError('Coordinator exact model has ambiguous advertised config family; no prompt')
+                coordinator_family = candidates[0]
+            else:
+                coordinator_family = coordinator if coordinator is not None else 'gemini-4-carbon'
+            if coordinator_family not in families:
+                raise ProtocolError('Coordinator family is not advertised; no fallback or prompt')
+            self.model_config_value = coordinator_family
+            self.request('session/set_config_option', dict(sessionId=self.session_id, configId='model', value=coordinator_family))
+            coordinator_metadata, _ = self.load()
+            coordinator_config = {option['id']: option for option in coordinator_metadata.get('configOptions', [])}
+            if coordinator_config.get('model', {}).get('currentValue') != coordinator_family:
+                raise ProtocolError('Coordinator catalog configuration readback mismatch; no prompt')
+            efforts = {option.get('value') for option in coordinator_config.get('thought_level', {}).get('options', [])}
+            current_effort = coordinator_config.get('thought_level', {}).get('currentValue')
         model, family, effort = resolve(self.task.get('model'), 'gemini-4-carbon', self.task.get('effort'))
-        worker, _, _ = resolve(self.task.get('agy_worker_model'), 'gemini-4-hydrogen')
+        if not efforts and self.task.get('agy_mode') != 'dynamic':
+            worker_requested=self.task.get('agy_worker_model')
+            if worker_requested in catalog and worker_requested not in families:
+                candidates=[f for f in families if worker_requested.startswith(f+'-')]
+                if len(candidates)!=1:
+                    raise ProtocolError('Worker exact model has ambiguous advertised config family; no prompt')
+                worker_family=candidates[0]
+            else:
+                worker_family=worker_requested or 'gemini-4-hydrogen'
+            if worker_family not in families:
+                raise ProtocolError('Worker family is not advertised; no fallback or prompt')
+            self.model_config_value=worker_family
+            self.request('session/set_config_option',dict(sessionId=self.session_id,configId='model',value=worker_family))
+            worker_metadata, _ = self.load()
+            worker_config={o['id']:o for o in worker_metadata.get('configOptions',[])}
+            if worker_config.get('model',{}).get('currentValue')!=worker_family:
+                raise ProtocolError('Worker catalog configuration readback mismatch; no prompt')
+            efforts={o.get('value') for o in worker_config.get('thought_level',{}).get('options',[])}
+            current_effort=worker_config.get('thought_level',{}).get('currentValue')
+        worker = None if self.task.get('agy_mode') == 'dynamic' else resolve(self.task.get('agy_worker_model'), 'gemini-4-hydrogen')[0]
         self.model_config_value = family
         self.request('session/set_config_option', dict(sessionId=self.session_id, configId='model', value=family))
-        self.request('session/set_config_option', dict(sessionId=self.session_id, configId='thought_level', value=effort))
+        if effort is not None:
+            self.request('session/set_config_option', dict(sessionId=self.session_id, configId='thought_level', value=effort))
         readback, _ = self.load()
         actual = {o['id']: o for o in readback.get('configOptions', [])}
         if (readback.get('models', {}).get('currentModelId') != model
                 or actual.get('model', {}).get('currentValue') != family
-                or actual.get('thought_level', {}).get('currentValue') != effort):
+                or (effort is not None and actual.get('thought_level', {}).get('currentValue') != effort)):
             raise ProtocolError('Native exact coordinator selection readback mismatch')
         self.task.update(model=model, effort=effort, agy_worker_model=worker)
+        if self.task.get('agy_mode') == 'dynamic':
+            return dict(model=model, effort=effort, native_selection=dict(requested=requested,
+                resolved=dict(model=model, effort=effort), readback_verified=True))
         return dict(model=model, effort=effort, agy_worker_model=worker,
                     native_selection=dict(requested=requested,
                         resolved=dict(model=model, effort=effort, agy_worker_model=worker), readback_verified=True))
@@ -259,6 +385,8 @@ def normalize(update):
         if key in update:
             value[key] = update[key]
     args = update.get('args', update.get('rawInput', {}))
+    if value.get('title')=='run_workflow' and isinstance(args,dict) and isinstance(args.get('Script'),str):
+        value['workflow_script_sha256'] = hashlib.sha256(args['Script'].encode()).hexdigest()
     if value.get('title')=='swarm' or kind=='tool_call_update':
         value['status_args_invalid'] = (not isinstance(args,dict) or
             any(k not in {'action','name'} or not isinstance(v,str) for k,v in args.items()))
@@ -622,6 +750,10 @@ def run_native(store, task, emit, policy):
                 metadata = owner.new()
                 store.update(task['id'], native_session_id=owner.session_id, needs_session=False)
                 _, baseline = owner.load()
+            if task.get('agy_mode') == 'dynamic' and 'run-workflow' not in owner.available_commands:
+                owner.request(None, dict(command='run-workflow'), timeout=1)
+            if task.get('agy_mode') == 'dynamic' and 'run-workflow' not in owner.available_commands:
+                raise ProtocolError('Dynamic run-workflow command not advertised; no prompt or fallback')
             selected = owner.select(metadata)
             task = store.update(task['id'], **selected)
             if owner.created_session:
@@ -645,12 +777,30 @@ def run_native(store, task, emit, policy):
                     fresh=True,baseline_empty=True,no_prompt=True,workers=[],session_unloaded=True,
                     all_descendants_proven_stopped=False))
                 return TurnResult('cancelled',0,'cancelled')
+            if task.get('agy_mode') == 'dynamic':
+                try:
+                    from .agy_dynamic import run_dynamic
+                except ImportError:
+                    from agy_dynamic import run_dynamic
+                submitted = True
+                cancellation_unverified = True
+                return run_dynamic(store, task, owner, emit, policy, binding, cleanup_token, baseline, unload, check_cancel)
             decoder = EventDecoder()
             live_updates = []
             def publish_update(entry):
                 live_updates.append(entry)
                 for kind, text in decoder.feed(dict(params=dict(update=entry))):
                     emit(kind, text)
+            last_notice = time.monotonic()
+            def review():
+                nonlocal last_notice
+                now = time.monotonic()
+                if (not owner.review_blocked and now-last_notice >= 600
+                        and store.get(task['id'])['state'] == 'running'):
+                    emit('stage', 'Coordinator review requested: native work pending; no cancellation or prompt sent.', quiet_notice=True)
+                    last_notice = now
+            # One cooldown across foreground, dialogue and passive observation requests.
+            owner.review = review
             submitted = True
             response, _ = owner.request('session/prompt', dict(sessionId=owner.session_id,
                 prompt=[dict(type='text', text=brief(task, policy))]), timeout=None,
@@ -672,7 +822,6 @@ def run_native(store, task, emit, policy):
                 raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
             previous_public = snapshot([e for e in live_updates if e['sessionUpdate'] != 'user_message_chunk'])
             previous = None
-            last_notice = time.monotonic()
             last_semantic_change = None
             dialogue_public = None
             deferred_questions = []
@@ -806,9 +955,7 @@ def run_native(store, task, emit, policy):
                     for kind, text in decoder.finish():
                         emit(kind, text)
                     return TurnResult('completed', 0, 'end_turn')
-                if time.monotonic()-last_notice >= 600:
-                    emit('stage', 'Coordinator review requested: native background pending; no cancellation or prompt sent.', quiet_notice=True)
-                    last_notice = time.monotonic()
+                review()
                 # Observation interval, never an execution deadline or generation prompt.
                 for _ in range(20):
                     current = store.get(task['id'])

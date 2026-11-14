@@ -9,6 +9,10 @@
 - 不为刷新技能重启 gateway 或强改当前工具快照；现有对话与新会话可见工具分别说明。保留既有模型、认证与宿主设置。
 - 既有 CLI 损坏与协作包部署分开报告：例如 pnpm shim 指向缺失 codex.js 时，不因安装了技能就标健康，也不擅自重装整套 CLI。部署回执保留设备、角色、SHA、入口、哈希、实测范围和未决项，不另建长期库存。
 
+Hermes 多工具链宿主的 native 安装适配必须随代码交付保留 `plugins.entries.call-cli.settings.local_toolchain_bin`：由部署者将同目录 node/npm/acpx 的已核验绝对 bin 路径传入现有 plugin settings。local start/续轮和 native close/reconcile/release_only 共用，不能仅保留旧 release.py 本机硬编码，也不能只要求用户改全局 PATH。配置传递模板见[集成手册](../../docs/integrations.md)。空值和其他设备原默认不变，远端不覆盖；独立 dashboard release 无 ctx，不借此宣称同配置覆盖。部署前后均做 bundled-first、零 runtime/模型的 SDK-only 加载并比较 Node/npm root/version；真实任务控制另需授权。当前源码修复不代执行生产设置或安装。
+
+切换先后：新代码/schema 准备就绪 → 写入并读回 local_toolchain_bin → 宿主支持的插件激活/加载 → 实际 ctx 设置与 bundled-first SDK-only 验证。生效前保留当前有效链，不先激活空配置候选；若宿主不接受预先写入新键，停止处理部署门禁，不自动重启或换来源。新会话不是旧任务所有权迁移，宿主实际刷新语义仍需部署时核验。
+
 ## 最小 skill-only 同步候选
 
 不更换运行时：在获准的独立技能位置准备完整 root/references/templates，合并所需个人适配并保留私有设备库存；核链接、文件清单和语义，然后只切消费者的 skill 绑定并用其原生加载器读回。若现有 skill 与 runtime 共用 release/current，优先提出解耦该绑定的精确候选，不默许移动运行时 current。新目标、绑定或登记变更仍属独立安装／暴露授权；本文件只给方案，不执行部署。

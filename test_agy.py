@@ -109,6 +109,123 @@ class AgyTests(unittest.TestCase):
                            agy_worker_model='gemini-4-hydrogen-low', cwd=root, prompt='polish')
             self.assertEqual(task['agy_worker_model'], 'gemini-4-hydrogen-low')
 
+    def test_shorthand_model_and_route_are_persisted_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as root:
+            launched=[]
+            c=Collaboration(Path(root)/'tasks.db',launch=launched.append)
+            client=c.connect('codex')['client_id']
+            cases=((None,'gemini-pro-orchestrator','native'),
+                   ('oc','gemini-pro-orchestrator','off'),('ocs','gemini-pro-orchestrator','native'),
+                   ('oa','gemini-pro-orchestrator-argon','off'),('oas','gemini-pro-orchestrator-argon','native'),
+                   ('4c','gemini-4-carbon','off'),('4cs','gemini-4-carbon','native'),
+                   ('4a','gemini-4-argon','off'),('4as','gemini-4-argon','native'),
+                   ('4h','gemini-4-hydrogen','off'),('4hs','gemini-4-hydrogen','native'))
+            for shorthand,model,mode in cases:
+                with self.subTest(shorthand=shorthand):
+                    task=c.start(client,agent='agy',cwd=root,prompt='synthetic',model=shorthand)
+                    self.assertEqual((task['model'],task['agy_swarm']),(model,mode))
+                    self.assertEqual((launched[-1]['model'],launched[-1]['agy_swarm']),(model,mode))
+                    self.assertEqual(c.status(client,task['id'])['model'],model)
+
+    def test_shorthand_route_conflicts_reject_without_task_or_launch(self):
+        with tempfile.TemporaryDirectory() as root:
+            launched=[]
+            c=Collaboration(Path(root)/'tasks.db',launch=launched.append)
+            client=c.connect('omp')['client_id']
+            for base in ('oc','oa','4c','4a','4h'):
+                for model,mode in ((base,'native'),(base+'s','off'),(base,'typo')):
+                    with self.subTest(model=model,mode=mode):
+                        with self.assertRaisesRegex(ValueError,'conflict|agy_swarm'):
+                            c.start(client,agent='agy',cwd=root,prompt='never send',model=model,agy_swarm=mode)
+            self.assertEqual(c.list(client),[])
+            self.assertEqual(launched,[])
+
+    def test_teamwork_intent_is_unsupported_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as root:
+            launched=[]
+            c=Collaboration(Path(root)/'tasks.db',launch=launched.append)
+            client=c.connect('omp')['client_id']
+            for model in ('oct','oat','4ct','4at','4ht'):
+                for mode in (None,'native','off'):
+                    with self.subTest(model=model,mode=mode):
+                        with self.assertRaisesRegex(ValueError,'Teamwork.*unsupported'):
+                            c.start(client,agent='agy',cwd=root,prompt='never send',model=model,agy_swarm=mode)
+            self.assertEqual(c.list(client),[])
+            self.assertEqual(launched,[])
+
+    def test_malformed_shorthand_never_dispatches(self):
+        with tempfile.TemporaryDirectory() as root:
+            launched=[]
+            c=Collaboration(Path(root)/'tasks.db',launch=launched.append)
+            client=c.connect('omp')['client_id']
+            for model in ('OC','OCS','4AS','ocss','ocst','oats','4css','4ast','oc/oa','4a+4c',
+                          'oc,oa','oc_oa','oc:oa','4a4c','oc s','ocs-low',' oc','4a ', '',42,True,[],{}):
+                with self.subTest(model=model):
+                    with self.assertRaises(ValueError):
+                        c.start(client,agent='agy',cwd=root,prompt='never send',model=model)
+            self.assertEqual(c.list(client),[])
+            self.assertEqual(launched,[])
+
+    def test_shorthand_matching_options_and_exact_ids_keep_their_contracts(self):
+        from backends import prepare_start
+        for model,mode,expected in (('oc','off','gemini-pro-orchestrator'),
+                ('ocs','native','gemini-pro-orchestrator'),('4a','off','gemini-4-argon'),
+                ('4as','native','gemini-4-argon')):
+            fields=prepare_start('agy',model,agy_swarm=mode)
+            self.assertEqual((fields['model'],fields['agy_swarm']),(expected,mode))
+        for exact,mode in (('gemini-pro-orchestrator','native'),('gemini-pro-orchestrator-argon','off'),
+                ('gemini-4-carbon-low','native'),('gemini-4-argon-medium','off'),
+                ('advertised-model','native'),('ocelot-exact','native'),
+                ('octopus-exact','native'),('oc-special','native')):
+            self.assertEqual(prepare_start('agy',exact)['model'],exact)
+            self.assertEqual(prepare_start('agy',exact)['agy_swarm'],mode)
+            self.assertEqual(prepare_start('agy',exact,agy_swarm='off')['agy_swarm'],'off')
+        fields=prepare_start('agy','4as','low',agy_worker_model='gemini-4-hydrogen-medium')
+        self.assertEqual((fields['effort'],fields['agy_worker_model']),('low','gemini-4-hydrogen-medium'))
+        with self.assertRaisesRegex(ValueError,'requires native'):
+            prepare_start('agy','4a',agy_worker_model='gemini-4-hydrogen-medium')
+        for agent in ('omp','codex','pi'):
+            for model in ('oc','ocs','oct','4as','ocss'):
+                self.assertEqual(prepare_start(agent,model),{'model':model})
+
+    def test_legacy_model_intent_is_not_reparsed_on_continuation(self):
+        with tempfile.TemporaryDirectory() as root:
+            c=Collaboration(Path(root)/'tasks.db',launch=lambda task:None)
+            client=c.connect('omp')['client_id']
+            for fields in ({},{'model':'oc','agy_swarm':'native'},
+                           {'model':'gemini-4-carbon','agy_swarm':'native'},
+                           {'model':'gemini-pro-orchestrator','agy_swarm':'off'}):
+                old=c.store.create(c.origin(client),'local','agy',root,'old',False)
+                c.store.update(old['id'],state='completed',**fields)
+                before=c.store.get(old['id'])
+                c.list(client); c.status(client,old['id'])
+                self.assertEqual(c.store.get(old['id']),before)
+                continued=c.intervene(client,old['id'],'continue')
+                for key in ('model','agy_swarm'):
+                    self.assertEqual(continued.get(key),before.get(key))
+
+    def test_ocs_default_and_orchestrator_overrides_do_not_migrate_old_tasks(self):
+        from backends import prepare_start
+        with tempfile.TemporaryDirectory() as root:
+            c=Collaboration(Path(root)/'tasks.db',launch=lambda task:None)
+            client=c.connect('omp')['client_id']
+            for model,mode,expected_model,expected_mode in (
+                (None,None,'gemini-pro-orchestrator','native'),
+                (None,'off','gemini-pro-orchestrator','off'),
+                ('gemini-pro-orchestrator',None,'gemini-pro-orchestrator','native'),
+                ('gemini-pro-orchestrator-argon',None,'gemini-pro-orchestrator-argon','off'),
+                ('gemini-pro-orchestrator-argon','native','gemini-pro-orchestrator-argon','native'),
+                ('gemini-4-carbon',None,'gemini-4-carbon','native'),
+                ('gemini-4-argon',None,'gemini-4-argon','off')):
+                task=c.start(client,agent='agy',cwd=root,prompt='synthetic',model=model,agy_swarm=mode)
+                self.assertEqual((task.get('model'),task['agy_swarm']),(expected_model,expected_mode))
+            old=c.store.create(c.origin(client),'local','agy',root,'old',False)
+            before=c.store.get(old['id'])
+            c.list(client); c.status(client,old['id'])
+            self.assertEqual(c.store.get(old['id']),before)
+            for agent in ('omp','codex','pi'):
+                self.assertEqual(prepare_start(agent),{})
+
     def test_fatal_without_structured_auth_and_late_results_do_not_gain_auth_cause(self):
         from events import EventDecoder
         from agy import AGY_FATAL_LINE, outcome_note

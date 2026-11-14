@@ -56,6 +56,23 @@ class HostTimeoutTests(unittest.TestCase):
             self.assertNotIn('timeout', ctx.called[1])
 
 class PluginTests(unittest.TestCase):
+    def test_hermes_shorthand_resolves_and_rejects_before_launch(self):
+        mod=load_plugin()
+        with tempfile.TemporaryDirectory() as root:
+            env={'HERMES_SESSION_ID':'s1','HERMES_SESSION_KEY':'key'}
+            ctx=Ctx(); c=mod.Coordinator(ctx,Path(root),lambda k,x='':env.get(k,x))
+            for model,mode,reason in (('ocs','off','conflict'),('4a','native','conflict'),
+                                      ('oct',None,'unsupported'),('4ast',None,'Invalid AGY shorthand')):
+                with self.assertRaisesRegex(ValueError,reason):
+                    c.handle(dict(action='start',agent='agy',cwd=root,prompt='never send',model=model,agy_swarm=mode))
+            self.assertEqual(c.handle({'action':'list'})['tasks'],[])
+            self.assertFalse(hasattr(ctx,'calls'))
+            for model,expected,mode in ((None,'gemini-pro-orchestrator','native'),
+                    ('oc','gemini-pro-orchestrator','off'),('oas','gemini-pro-orchestrator-argon','native'),
+                    ('4a','gemini-4-argon','off'),('4as','gemini-4-argon','native')):
+                task=c.handle(dict(action='start',agent='agy',cwd=root,prompt='synthetic',model=model))['task']
+                self.assertEqual((task['model'],task['agy_swarm']),(expected,mode))
+
     def test_repeated_plugin_load_retains_patchable_native_submodule(self):
         import sys
         first = load_plugin()

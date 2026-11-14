@@ -11,3 +11,7 @@ config_schema:
     type: bool
     default: false
     description: Enable this profile's call_cli tool. Does not start background work at load time.
+  local_toolchain_bin:
+    type: string
+    default: ""
+    description: Optional absolute bin directory of the verified local Node/npm/ACPX toolchain. Shared by local runner launch and native release; empty preserves inherited discovery. No remote override.

@@ -2,7 +2,7 @@
 
 ## 已确认范围
 
-支持跨 CLI 新建协作会话，以 OMP、Codex、Pi 为主，可通过现有 SSH 跨设备。发起方不限定为 Hermes；不接管已手动打开的交互会话。
+支持跨 CLI 新建协作会话，发起端为 OMP、Codex、Pi 或 Hermes，可通过现有 SSH 跨设备；AGY 仅作执行端，用户已取消其发起端需求。不接管已手动打开的交互会话。
 
 ## 当前交付：可监控、可介入的在线双向协作（通用入口已实现并验证）
 
@@ -30,6 +30,49 @@
 以上均须真实运行取证；不得以人工在两端搬运消息、预制回答、单次短请求或任务结束后的补发消息替代。人工介入测试中的用户输入是测试输入，不是让用户替桥搬运消息。
 
 复用现有 ACPX／SSH、事件与问答处理、会话定位及并发修复。通用逻辑不依赖 Hermes 会话变量；Hermes 旧插件仍作为独立宿主适配保留，不会自动同步本轮源码。当前完成声明限于上面的通用入口及真实场景，不扩张为 Telegram 多 topic 异步回注、任意安装组合或跨重启恢复通过。
+
+## 可信运行中协调切片（2026-11-14，源码候选）
+
+本切片仅修正 live AGY probe 的精确 launch argv，以及原 native owner request loop 与后台观察共享的 600s 发起方复核冷却；不新增 watchdog、默认硬超时或自动取消／关闭／业务 prompt。原需求与四模式范围以 [唯一正本](skill/references/core-requirements.md) 为准，验证见 [当前记录](VERIFICATION.md#trusted-running-coordination)。现有修改与 fixture 保留，简称候选仍未独审。
+
+可接续顺序：
+
+1. Hermes 对本切片源码与隔离回归独立验收；不把源码冻结当安装／加载或用户收到证明。
+2. 在对应授权内核验真实 Hermes／OMP 原来源消费复核事件、主动纠偏、效果与用户回流；真实模型、安装／重启及生产副作用不由本切片授权。
+3. 继续本轮整体四模式工作：公开能力事实先行，再按真实差异补最小 Teamwork／Dynamic adapter；二者当前未支持，不套用 Swarm 清理证明。单代理与 Swarm 仍需真实执行期调整、正常验收和取消清理闭环。
+4. 原来源身份／发起适配、跨设备 exact close 和既有缺口按整体审查计划续办；不复活旧任务、不绕 writer 锁、不关闭整体验收门禁。
+
+本切片交付后停止写入，等待 Hermes 验收；不等于总项目完成。
+
+## Dynamic 原生接入候选（2026-11-14）
+
+可信运行中协调三项返工由协调者报告独立复审PASS。本轮新增显式agy_mode与原来源精确permission；Dynamic复用原ACP owner，完整load对账、父工具/父输出与可信mode receipt，不借Swarm kill。隔离源码回归与边界见 [验证记录](VERIFICATION.md#dynamic-native-candidate)。Teamwork独立实测并行且仍属本轮范围，本源码没有Teamwork adapter。
+
+交独审核对精确脚本审批、来源隔离、排队dialogue、正常/失败卸载和取消HOLD；通过后，真实宿主消费、用户执行期变更效果、取消级联及子agent/phase/log能力仍需对应授权事实，不因源码通过宣称全闭环。若公开ACP仍不提供子事件，最简当前替代是诚实展示父公开报告并由发起者独立验结果，不读取私有子DB或伪造事件；取消缺证保HOLD，不能自动续作。冻结后停写等验收，不部署、不复活旧任务、不缩四模式总目标。
+
+一次明确授权的真实源码通用入口Dynamic正常样本已走通：默认launcher、同来源阶段/脚本审批/父JSON独立核值、精确unload与自然exit0、public close及重复回执一致，工作目录为空。未改运行源码，无额外框架或重试；见 [真实样本记录](VERIFICATION.md)。下一缺口仍是宿主原生消费/用户执行期调整、取消级联及子事件，不借正常样本升级。Teamwork原生UI有子审批入口，但本ACP链未收到子许可；保持原生路径，待公开转发/作用域证据，不造替代调度器或盲改权限。四模式整体目标不变。
+
+## Teamwork：下一单次原生验证方案（离线准备，未执行）
+
+不是永久禁用：既有AGY 1.5.8样本已真实启动/teamwork、访谈、ask_question、send_message修订、brief落盘与明确批准；失败局限于本次子许可/结果链。现有call-cli仍未宣称Teamwork执行adapter，不能仅换slash并沿用Dynamic工具终态或Swarm kill条件。最小共享接入仍为agy_mode、一个NativeOwner、公开session/update/load与原来源输入；不映射到ACP的default/auto/plan权限mode，不建替代scheduler。
+
+下一实验需另行授权，一次新session/独立scratch项目，父Argon/low/default，不用skip-permissions/auto或预置grants。目标只有一个development演示milestone：在唯一项目目录写result.json（sum=5,difference=3,label=revised），原生最小必要团队/审核，不强造产品不支持的角色数。项目brief写与子写分开逐次审；若需命令，只批准实际呈现的精确读取/核值命令，不准python/sh全前缀。AGY自身ledger可能写app-data任务目录，必须在实验授权前明确接受或说明不可满足；不承诺scratch限制能约束原生ledger。
+
+1. 启动：新单owner初始化/new/load核teamwork广告，发送一次/teamwork，要求保留原生访谈与brief执行门；首次end_turn只记父返回，不能当项目完成。
+2. 查看与调整：原session公开update/load观察；必要时仅一次明确的访谈接续，不做周期模型status。回答已知问题并把initial改revised，核完整brief实际采用及精确目录/hash；不把send_message completed当接收或结果采用。
+3. 许可与执行：复核brief后一次明确批准；记录真实到达owner的RPC ID、session/tool归属、完整实际参数与offered单次选项，再精准回答。不能根据猜测的child ID批准；若原生公开请求重映射到root，须依实际参数证明归属，不人为要求child一定不同sessionId。未到达的许可不能在客户端补造。不得以approve-all或新hook掩盖问题。
+4. 限量观察：最多6个父业务prompt（含启动/访谈/修订/执行批准及必要的一次控制核对；明确记录成本，达到上限不重试）。无新事件时保持非生成式观察；在执行批准后一个5分钟人工复核点判断继续或走下面取消，不把该点实现成任务硬截止。原生UI的/agents A/D只作为已有文档支持的另一入口，不在同样本中悄悄切过去；本方案首选验证公开ACP原owner。
+5. 验收或取消：正常分支独立读唯一结果JSON并严格核值，再核原生公开coordinator/子终态证据、精确父unload/not-found与自然exit；只见父乐观文本或end_turn不称全员完成。若子许可未达/范围越界/结果阻塞，停止新的业务prompt；在该新样本上一次session/cancel可作为另行明确允许的停止动作，公开子终态缺失就记录unknown/HOLD，不自动重试/恢复或强杀。正常与取消是不同结局，一个样本不冒充两种都验。
+
+停止条件与产物：任何要求访问秘密、旧任务、其他目录业务文件或改grants立即停止审批并报告；未证子停止保留责任，不重复close。保留公开请求/响应投影、brief/hash、精确决策、产物比对与父/子证据等级，不读thought/transcript/私有IPC。若结果仍只有root回流而没有nested终态，先取得AGY公开支持的转发/停止合同再写自动结算；不因此判Teamwork整体不可用。当前离线无法证明该接口足以正常/取消闭环，故本轮不发送新模型请求或伪实现。
+
+## 范围收口与已证修复归入源码（2026-11-14）
+
+AGY 仅作执行端，撤回其通用发起端 runtime/test 增量；保留 Dynamic agy_mode/permission、OCS 默认、简称与已有协调改动。原发起者继续承担阶段消费、主动调整、结果验收与最终收尾，不把子切片冻结当总项目完成。
+
+Hermes 显式 release_only 与 Node/npm 子进程解析修复已归入源码；沿用现有 principal、snapshot、fence/attempt 和 exact proof，不扩大 resolver。独审发现 PATH-only 在 bundled-first 宿主仍失败，已改为现有 plugin settings 的显式 local_toolchain_bin，由 local start/续轮和 native release 共用；未配置及远端默认不变，不复制生产 Homebrew 绝对路径。定向36项与 bundled-first 真实 SDK-only 同链加载通过，见验证记录；生产仍需另准的精确代码/schema安装、设置传递和实际加载读回，本轮不落地。已由原 controller 收尾的旧 writer 不重开、不再操作。
+
+剩余门禁：真实 Hermes／OMP 原来源消费、用户在原会话执行期修订及结果采用；单代理／Swarm 正常与取消闭环的未覆盖组合；Dynamic 原生宿主回流、执行期调整、取消级联及子事件。Teamwork 当前仍预派发拒绝，需新的公开 nested permission／终态合同或另行明确原生 UI surface 后再做有信息增量的单次验收，不重复同路试错。发布由后续集中处理：干净提交的完整资源闭包、哈希、各安装副本／schema 加载与真实宿主验收分别核验；本轮不暂存、提交、推送、安装、部署或重启。
 
 ## 路线图：通用异步接收与自动唤醒
 

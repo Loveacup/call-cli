@@ -27,7 +27,7 @@ Call CLI 通过轻量 POSIX 协调层连接 **OMP、Codex、Pi 和 AGY**。新�
 | :-- | :-- | :-- |
 | 🔄 | **持续跨 CLI 协作与回流** | 在发起端持续跟进可续读的阶段进展、待答问题与最终结果，用 600 秒协调者复核检查点代替僵硬的模型执行超时。 |
 | 🧭 | **单次控制与 `cancel+resume` 改向** | 用 `reply` 按编号回答问题，或用 `intervene` 在同一目标会话内取消当前轮、确认结算后按新要求续轮（绝不冒充执行期热插 `steer`）。 |
-| 🤖 | **原生 AGY 与按模型默认 Swarm** | AGY 默认 **G4C** 开启 native Swarm 与 **G4H** worker，**G4A** 针对文字与知识任务默认单代理 `off`；支持按任务显式覆盖与持久工具审批配置。 |
+| 🤖 | **原生 AGY 与显式模型模式** | 新 AGY 默认 **ocs**（Orchestrator Carbon＋native Swarm）。裸简称 **oc/oa/4c/4a/4h** 全部单代理 `off`；后缀 **s** 为原生 Swarm，**t**（Teamwork）当前 unsupported，不静默降级。 |
 | 🤝 | **多 CLI 并行协作与写隔离** | 让 OMP、Codex、Pi、AGY 在各自隔离的会话中并行工作，由单写者工作区锁防止并发写冲突。 |
 | 📦 | **按任务固定传递技能** | 为任务附加协调端或执行端技能（`required`、`optional`、`reference`），跨轮复用不可变快照并记录每轮采用回执。 |
 | 🔌 | **多入口接入与可选宿主桥** | 支持从任意 POSIX 终端、SSH 客户端或 CLI 技能发起协调，并提供单次加载的实验性 OMP RPC 扩展、可选 Hermes 插件及独立未应用的 Hermes 静默兼容补丁。 |
@@ -135,7 +135,7 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
       intervene --task "$TASK_ID" --command-id rev-1 --prompt '修订后的范围'
     ```
     随后继续短 `wait`（同步更新 `WAIT_JSON` 与 `AFTER`），由协调端取消旧轮、确认权威结算并在同一原生会话启动第 2 轮。
-- **调用 AGY（按模型默认 Swarm 与只读审批）或传递技能：** AGY 省略 `--model` 时默认使用 **G4C**，默认开启 **native Swarm**（`--agy-swarm native`）并从实时目录解析 **G4H** worker（可用 `--agy-worker-model` 覆盖）。**G4A** 文字／知识任务默认单代理 **`off`**（`--agy-swarm off`），可显式传 `--agy-swarm native` 开启；G4C 也可在通过 `models.cjs` 发现精确广告 ID 后显式传 `--agy-swarm off`。新 AGY 任务即使在 `write` 为 `false` 时也默认持久化 `approve-all`；严格只读工具审批请显式传 `--agy-approval approve-reads`（审批模式与 `write: false` 都不是操作系统或文件系统沙箱；`--write` 独立声明编辑授权并占用工作区）：
+- **调用 AGY（模型简称与只读审批）或传递技能：** 新 AGY 默认 **ocs**，不按任务内容自动换模型。小写 **oc/oa/4c/4a/4h** 裸简称全部单代理 `off`，后缀 **s** 为原生 Swarm；后缀 **t** 当前 unsupported，在派发前拒绝。显式 `--agy-swarm` 必须与简称一致；完整广告 ID 保留原路由／覆盖兼容，详见[模型合同](skill/references/agy-models.md)。新 AGY 任务即使在 `write` 为 `false` 时也默认持久化 `approve-all`；严格只读工具审批请显式传 `--agy-approval approve-reads`（审批模式与 `write: false` 都不是操作系统或文件系统沙箱；`--write` 独立声明编辑授权并占用工作区）：
   ```sh
   # 1. 发现本执行设备当前广告的精确 ACP 模型 ID 与 thought_level.options
   node "$CALL_CLI_HOME/models.cjs" "$CALL_CLI_HOME"
@@ -188,6 +188,8 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
 
 **终端安装与 CLI 内加载属于同一条配置路径的先后步骤。** 各入口运行时依赖闭包与加载方式详见[集成手册（`docs/integrations.md`，简体中文）](docs/integrations.md)。
 
+发起端为 OMP、Codex、Pi 与 Hermes。AGY 仅作执行端；AGY 发起能力不再属于实现或验收缺口。
+
 <a id="核心能力"></a>
 <a id="capabilities"></a>
 ## 核心能力
@@ -203,12 +205,14 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
   - 全部公开 `close` 入口（`collab.py`、OMP、Hermes）共用 `release.close_task` 与持久 SQLite 释放围栏（`release_fences`）。本地 ACPX 任务在调用外部关闭前先提交围栏与尝试记录，并要求核验精确 closed 记录读回与同作用域 `no-session`（`findSession(...) === undefined`）。对 `unknown` 任务，`close`（CLI/OMP）与 `reconcile`（Hermes）一律走**只读探测模式（`probeTarget`，零次外部 `close` 调用）**，绝不盲目重复发送关闭请求。CLI/OMP 返回白名单过滤后的 `close_receipt`（`state`、`phase`、`stage`、`reason_code`、`external_close_attempted`）；缺记录或远端设备的任务保守保留 `unknown`（`exact_record_unavailable`）与写占用锁。
 - **轮转压缩同源续办与已结束 owner 恢复（Hermes 原生源码能力）：** `native_continuity.py` 在同一可信 Hermes profile 与原路由下，通过只读校验已提交的 `state.db`（schema 32）`compression` 父链，允许轮转压缩后的新 SID 继续访问原任务而不改写 `Origin`。当原 owner 会话已有明确提交的结束原因（`agent_close`、`cli_close`、`tui_close`）时，同 profile/route 的当前会话可只读查看 `list`/`status`/`events`（不推进 pending 介入），或凭 `expected_turn` + `command_id` 显式接续已结算任务（递增 `control_epoch`）。另有面向操作者的固定目标释放路由（`/api/plugins/call-cli/release/*`），要求宿主敏感 HTTP 认证与本地私有 `0600` 的 `release-policy.json`。
 
+Hermes 另提供显式 `release_only`：仅 unknown 本地 exact-record 任务的原始且当前 controller，要求已结算非 native runner 与 observed expected_turn。先围栏后至多一次 close，再严格 probe；已有 fence 不重复 close。receipt 保留 business_state=unknown，资源释放不是业务完成；CLI/OMP 动作不扩展。
+
 ### 2. 原生 AGY 支持、按模型默认 Swarm 与持久工具放行（`agy.py`、`agy_native.py`、`models.cjs`）
 
-- **按模型区分的 Swarm 默认策略（`G4C` 默认 native / `G4H` worker，`G4A` 默认 off）：**
-  - AGY 省略 `--model`（`model`）时使用 **G4C（`gemini-4-carbon`）**，默认开启 **native Swarm（`agy_swarm: "native"`）**，worker 默认从实时目录解析 **G4H（`gemini-4-hydrogen`）**（可用 `--agy-worker-model` / `agy_worker_model` 覆盖）。
-  - 选择 **G4A（`gemini-4-argon`）** 时，针对文字与知识任务默认采用单代理 **`off`（`agy_swarm: "off"`）**；可按任务显式传 `--agy-swarm native`（`agy_swarm: "native"`）开启。
-  - G4C 也可按任务传 `--agy-swarm off` 覆盖。使用 `--agy-swarm off` 时，请先运行 `node models.cjs /absolute/workdir` 发现当前设备广告的精确模型 ID 并显式传入 `--model`（若省略 `--model` 仅传 `--agy-swarm off`，会沿旧 ACPX 路径保存 G4C family，该组合尚未在 AGY 1.5.7 实测，tier-ID 读回差异可能在提交 prompt 前拒绝）。存量任务保留原持久路由，其他 CLI 不变。详见 [AGY 模型与审批合同（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
+- **显式模型模式（默认 ocs / G4H worker）：**
+  - `oc/oa` 映射 Orchestrator Carbon/Argon，`4c/4a/4h` 映射 Gemini 4 Carbon/Argon/Hydrogen。裸简称全部 off；`ocs/oas/4cs/4as/4hs` 为 native Swarm。重复／混合后缀、简称与路由冲突拒绝。t 是当前 unsupported 的 Teamwork 意图，不是 Swarm 或普通 prompt。
+  - 新任务经单一公共入口解析后持久化型号／路由。旧任务、其他 CLI 不迁移；完整广告 ID/family 保持既有行为。worker 仍用广告 ID/family、默认 G4H。纯文字／感性工作可显式选择 `4a/4as`；未指定仍 `ocs`。
+  - 原生 OC/OA 零 prompt 配置／读回已验，不是 OCS 模型／Swarm 或 ACPX off 业务验收。不猜 effort tier、不静默降级。详见 [AGY 合同（`skill/references/agy-models.md`）](skill/references/agy-models.md)。
 - **单 owner AGY native Swarm 生命周期与结算（`agy_native.py`）：** 由于 ACPX 公共 Shared Runtime 不提供 `session/load`，`--agy-swarm native` 由单一 ACP owner 直接通过 `agy acp --disable-telemetry` 连接，现场解析广告模型/effort 并读回 `models.currentModelId`。首个 `end_turn` 仅结束前台 RPC，任务保持 `running` 与写占用，由同一 owner 串行执行完整 `session/load` 快照回放以观察原生留言板唤醒，期间不发送定时驱动 prompt。正常完成与 `close` 释放要求同时具备：本任务当前轮的最终 `native_result`、对应原生 worker `add`/`kill` completed 事件以及会话卸载（`native-add-kill-completed-and-session-unload`；不因 ACP 回放缺少 `rawOutput` 而强制 HOLD，也不宣称所有任意后代进程均已退出）。跨轮推进会清空旧轮 result/cleanup/roster。遇到致命错误行（`⚠ Agent execution terminated due to error.`）、断线、缺少必要清理事件或取消结果不明时，保守结算为 `unknown` / HOLD（`native_workers_unproven`），并生成带 `attention_required: true` 的原子事件经 runner stdout、OMP `followUp` 或 Hermes terminal 通知主动提醒发起端，绝不自动重放或借 ACPX 记录关闭释放。
 - **取消使用独立证明路径：** 原 owner 仅在已 end_turn、可信 roster 且无活动工具的边界发送一次 cleanup-only prompt，kill 精确 worker，允许严格确认的原生 swarm status 观察。匹配 task/session/turn/launch/epoch/cancel 的可信 receipt、completed kills 与精确 unload 才允许 cancelled，不要求 native_result；缺证/歧义仍 HOLD。取消清理未证时关 stdio、不 terminate/kill，不承诺原 owner 可恢复；成功路径仍保留已说明的默认退出 fallback。AGY 1.5.8 v3 候选单样本（G4C low、一个 G4H medium、approve-reads）已观察此链路、unload/not-found、重复 close 相等和 natural exit 0；使用线程 launcher/观测 wrapper，非已部署/默认宿主或任意后代全停证明。见[当前证据索引](VERIFICATION.md#current-acceptance-index)。
 - **默认 `approve-all` 审批与工作区写占用分离：** 新建 AGY 任务默认持久化 `agy_approval: "approve-all"`（即使 `write` 为 `false`），放行任务授权范围内的 shell 与原生工具，同时提示词优先引导使用原生 read/search 工具。若需严格只读审批，显式传入 `--agy-approval approve-reads`（Hermes：`agy_approval: "approve-reads"`），此时 shell/写请求会被非交互拒绝。**工具审批策略与 `write: false` 都不是操作系统或文件系统沙箱；** 获授权编辑文件仍须另传 `--write` 以声明写权限并占用工作区。`reply`/`intervene` 续轮保留该策略；缺省该字段的旧任务仍按原 `write` 映射，OMP/Codex/Pi 的默认策略（缺省 `approve-reads`，`--write` 选 `approve-all`）保持不变。
@@ -312,7 +316,7 @@ RUN_NATIVE_ACPX_TESTS=1 python3 -B -m unittest test_native_skills test_native_sh
 | [在线协作（`docs/usage.md`）](docs/usage.md) | `seq` 游标续读、编号问题 `CALLCLI_QUESTION` 身份、`reply`、`intervene` 取消续轮、600 秒复核检查点、`--clear-timeout` 与 `close`。 | 简体中文 |
 | [当前核心需求（`skill/references/core-requirements.md`）](skill/references/core-requirements.md) | 持续双向协作、AGY native Swarm、已结束 owner 恢复与分层证据核验的唯一维护正本。 | 简体中文 |
 | [任务技能传递（`skill/references/skill-passing.md`）](skill/references/skill-passing.md) | 本地优先选择、公开仓库线索、`required`/`optional`/`reference` 模式、暂存限制与 `CALLCLI_SKILL` 回执。 | 简体中文 |
-| [AGY 模型、Swarm 与审批（`skill/references/agy-models.md`）](skill/references/agy-models.md) | G4C 默认 native Swarm / G4H worker 与 G4A 默认 off、单 owner `agy_native.py` 结算、`models.cjs` 模型发现、持久 `approve-all` 与 `unknown` 诊断。 | 简体中文 |
+| [AGY 模型、Swarm 与审批（`skill/references/agy-models.md`）](skill/references/agy-models.md) | 默认 ocs、裸/s/t 简称、冲突拒绝、精确 ID 兼容、单 owner 结算与验证边界。 | 简体中文 |
 | [Hermes 宿主与连续性（`skill/references/hermes-host.md`）](skill/references/hermes-host.md) | 原生来源捕获、P1 轮转压缩同源续办、已结束 owner 恢复/对账与 `[SILENT]` 机器通知轮指导。 | 简体中文 |
 | [维护源与安装检查（`skill/references/maintenance.md`）](skill/references/maintenance.md) | 每次逻辑启动的维护源/安装检查与空闲设备 ACPX 升级边界。 | 简体中文 |
 | [Windows Codex SSH（`CODEX_SSH.md`）](CODEX_SSH.md) | 桌面上下文 `codex-ssh.cjs` 启动入口与原生 PowerShell 客户端（`remote-client.ps1`）。 | 简体中文 |

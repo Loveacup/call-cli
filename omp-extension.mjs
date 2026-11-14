@@ -1,10 +1,10 @@
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
-const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'intervene', 'cancel', 'close']);
-const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after']);
+const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close']);
+const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
-const visible = new Set(['stage', 'question', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
+const visible = new Set(['stage', 'question', 'permission', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
 
 function bridgeRequest(request) {
   return new Promise((resolve, reject) => {
@@ -19,7 +19,8 @@ function bridgeRequest(request) {
       clearTimeout(timer);
       try {
         const value = JSON.parse(output);
-        if (code || value.error) reject(new Error(`OMP bridge action failed (${value.error || 'process_exit'}); reconcile exact task`));
+        if (value.error === 'ModelSelectionError' && typeof value.message === 'string') reject(new Error(value.message));
+        else if (code || value.error) reject(new Error(`OMP bridge action failed (${value.error || 'process_exit'}); reconcile exact task`));
         else resolve(value);
       } catch {reject(new Error('OMP bridge response unavailable; do not replay start'));}
     });
@@ -139,7 +140,7 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
             binding.timer = undefined;
           }
         }
-        else if (['start', 'reply', 'dialogue', 'intervene', 'cancel', 'status'].includes(args.action)) {
+        else if (['start', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'status'].includes(args.action)) {
           const track = binding.tasks.get(id) || {cursor: 0, active: false, answers: [], revision: 0, attentionTurns: new Set()};
           track.revision++;
           track.active = true;
@@ -172,8 +173,10 @@ export default function register(pi) {
     parameters: z.object({action: z.enum([...actions]), task_id: z.string().optional(), agent: z.enum(['omp', 'codex', 'pi', 'agy']).optional(),
       device: z.string().optional(), cwd: z.string().optional(), prompt: z.string().optional(), write: z.boolean().optional(), resource: z.string().optional(),
       clear_timeout: z.boolean().optional().describe('reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'),
-      model: z.string().optional(), effort: z.string().optional(), agy_approval: z.enum(['approve-all', 'approve-reads']).optional(), remote_shell: z.enum(['posix', 'powershell']).optional(),
-      agy_swarm: z.enum(['native', 'off']).optional(), agy_worker_model: z.string().optional(),
+      model: z.string().optional().describe('AGY oc/oa/4c/4a/4h: bare=off, s=native, t=unsupported; omitted=ocs, never task-selected. Advertised IDs supported; shorthand/agy_swarm conflict rejects'), effort: z.string().optional(), agy_approval: z.enum(['approve-all', 'approve-reads']).optional(), remote_shell: z.enum(['posix', 'powershell']).optional(),
+      agy_swarm: z.enum(['native', 'off']).optional().describe('AGY route override for advertised IDs; must match shorthand: bare=off, s=native'), agy_worker_model: z.string().optional(),
+      agy_mode: z.enum(['single', 'swarm', 'dynamic']).optional().describe('Explicit execution mode; Dynamic uses advertised model IDs and exact script approval'),
+      permission_id: z.string().optional(), script_sha256: z.string().optional(), decision: z.enum(['allow_once', 'reject_once']).optional(),
       skills: z.array(z.object({path: z.string(), mode: z.enum(['required', 'optional', 'reference']), location: z.enum(['origin', 'target']).optional()})).optional(),
       question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'), expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue'), after: z.number().optional()}).strict(),
     async execute(_id, args, _signal, _onUpdate, ctx) {
