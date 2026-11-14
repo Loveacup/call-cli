@@ -986,7 +986,7 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 self.store.update(task['id'], agent=agent, write=True)
                 with patch.dict(os.environ, {'ACPX_FAKE_CHUNKS':json.dumps([
                         'CALLCLI_STA', 'GE checking version and protocol support'])}), \
-                        contextlib.redirect_stdout(io.StringIO()):
+                        contextlib.redirect_stdout(io.StringIO()) as output:
                     rc = __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
                 result = self.store.get(task['id'], self.origin)
                 events = self.store.events(task['id'], self.origin)
@@ -997,6 +997,20 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 self.assertEqual(events[-1]['kind'], 'unknown')
                 self.assertEqual(events[-1]['answer_tail'], '')
                 self.assertIn('no final answer', result['settlement_note'])
+                if agent=='omp':
+                    terminal=events[-1]
+                    self.assertTrue(terminal['attention_required'])
+                    self.assertEqual(terminal['notification_scope'],'originating-session')
+                    self.assertIn('Do not replay',terminal['next_action'])
+                    frames=[json.loads(line) for line in output.getvalue().splitlines()]
+                    published=[f for f in frames if f['event']=='unknown']
+                    self.assertEqual(len(published),1)
+                    self.assertEqual((published[0]['text'],published[0]['turn'],published[0]['seq']),
+                        (terminal['text'],result['turn'],terminal['seq']))
+                    self.assertIn(task['id'],terminal['text'])
+                    self.assertIn('needs initiator attention',terminal['text'])
+                    self.assertFalse(self.store.finish_turn(task['id'],result['turn'],'unknown',0,'end_turn'))
+                    self.assertEqual(len([e for e in self.store.events(task['id'],self.origin) if e['kind']=='unknown']),1)
                 with self.assertRaises(ValueError):
                     self.store.create(self.origin, 'local', agent, str(self.root), 'conflict', True)
                 before = (self.root/'calls.jsonl').read_text()
@@ -1227,7 +1241,13 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                 rc, state, events = self.run_agy(['CALLCLI_STAGE attempting shell\n'])
                 self.assertEqual((rc, state['state']), (1, 'unknown'))
                 self.assertIsNone(state.get('settlement_note'))
-                self.assertEqual(events[-1]['text'], 'Prompt exited '+str(state['exit_code']))
+                terminal = events[-1]
+                self.assertEqual(terminal['text'], 'AGY task '+state['id']+' turn '+str(state['turn'])+
+                    ' needs initiator attention: Prompt exited '+str(state['exit_code']))
+                self.assertEqual((terminal['kind'], terminal['turn']), ('unknown', state['turn']))
+                self.assertTrue(terminal['attention_required'])
+                self.assertEqual(terminal['notification_scope'], 'originating-session')
+                self.assertIn('Do not replay', terminal['next_action'])
                 self.assertNotIn('permission', events[-1]['text'])
 
     def test_agy_fatal_line_retains_precedence_on_nonzero_transport_exit(self):

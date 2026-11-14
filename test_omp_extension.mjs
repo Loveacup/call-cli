@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createAdapter} from './omp-extension.mjs';
+import register, {createAdapter} from './omp-extension.mjs';
 
 function fixture(override) {
   const sent=[], timers=[], calls=[];
@@ -19,6 +19,35 @@ function fixture(override) {
   const adapter=createAdapter(pi,{request,pollMs:1});
   return {adapter,ctx,sent,timers,calls,setPacket:p=>packet=p,switch:()=>{sid='host-b';adapter.detach();}};
 }
+
+test('dialogue keeps native owner polling and requires explicit stable intent', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'agy',cwd:'/work',prompt:'owned'},f.ctx);
+  f.setPacket({task:{id:'task-a',state:'running',turn:1},events:[]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',prompt:'revise',command_id:'d1',expected_turn:1},f.ctx);
+  assert.equal(f.calls.at(-1).args.action,'dialogue');
+  assert.equal(f.timers.length,1);
+  for (const missing of ['expected_turn','command_id']) {
+    const args={action:'dialogue',task_id:'task-a',prompt:'revise',command_id:'d1',expected_turn:1};
+    delete args[missing];
+    await assert.rejects(f.adapter.execute(args,f.ctx),/dialogue requires/);
+  }
+  assert.ok(!f.calls.some(c=>c.args?.action==='cancel'));
+  f.adapter.detach();
+});
+
+test('registered OMP tool advertises dialogue without host identity fields', () => {
+  const enums=[];
+  const chain=new Proxy({}, {get:()=>()=>chain});
+  const z=new Proxy({}, {get:(_target,name)=>(...args)=>{
+    if(name==='enum') enums.push(args[0]);
+    return chain;
+  }});
+  let registered;
+  register({zod:z,registerTool:tool=>{registered=tool;},on:()=>{}});
+  assert.equal(registered.name,'call_cli_omp');
+  assert.ok(enums.some(values=>values.includes('dialogue')));
+});
 
 test('model timeout is refused before binding and continuation clear remains available', async () => {
   const f=fixture();
@@ -282,4 +311,148 @@ test('AGY unknown snapshot without terminal event still raises one origin attent
   assert.equal(f.sent[0].options.triggerTurn,true);
   assert.equal(f.timers.length,0);
   assert.ok(!f.calls.some(c=>['intervene','cancel'].includes(c.args?.action)));
+});
+
+test('OMP unknown snapshot wakes once per turn and preserves actionable HOLD', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',turn:1,state:'unknown',settlement_note:'no final answer'};
+  f.setPacket({task,events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  let notice=JSON.parse(f.sent[0].message.content);
+  assert.equal(notice.task_id,'task-a');
+  assert.equal(notice.events[0].turn,1);
+  assert.equal(notice.events[0].attention_required,true);
+  assert.match(notice.events[0].next_action,/Do not replay/);
+  assert.equal(notice.events[0].notification_scope,'originating-session');
+  assert.deepEqual(f.sent[0].options,{deliverAs:'followUp',triggerTurn:true});
+  assert.equal(f.calls.at(-1).host.session_id,'host-a');
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task,events:[{seq:7,kind:'unknown',turn:1,text:'no final answer',attention_required:true}]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1,'late terminal event must not repeat snapshot attention');
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task:{...task,turn:2},events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,2,'a different execution turn has a new obligation');
+  assert.equal(JSON.parse(f.sent[1].message.content).events[0].turn,2);
+  assert.ok(!f.calls.some(c=>['intervene','cancel','close','reply'].includes(c.args?.action)));
+});
+
+test('OMP terminal attention is deduplicated without hiding legacy unknown events', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',turn:1,state:'unknown'};
+  f.setPacket({task,events:[{seq:1,kind:'unknown',turn:1,attention_required:true,text:'inspect exact task'}]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task,events:[{seq:2,kind:'unknown',turn:1,attention_required:true,text:'same obligation'}]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  const legacy=fixture();
+  await legacy.adapter.execute({action:'start',cwd:'/work',prompt:'owned'},legacy.ctx);
+  legacy.setPacket({task:{id:'task-a',state:'unknown'},events:[{seq:1,kind:'unknown',text:'legacy unknown'}]});
+  await legacy.timers.shift()();
+  assert.equal(legacy.sent.length,1);
+  assert.match(legacy.sent[0].message.content,/legacy unknown/);
+});
+
+test('late prior-turn unknown cannot block current-turn snapshot attention', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',turn:1,state:'unknown'};
+  f.setPacket({task,events:[]});
+  await f.timers.shift()();
+  f.setPacket({task:{...task,turn:2},events:[
+    {seq:1,kind:'unknown',turn:1,text:'late old unknown'},
+    {seq:2,kind:'stage',turn:2,text:'progress'},
+    {seq:3,kind:'question',turn:2,text:'question'},
+    {seq:4,kind:'answer',turn:2,text:'answer'},
+    {seq:5,kind:'skill',turn:2,text:'skill'}]});
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  await f.timers.shift()();
+  assert.equal(f.sent.length,2);
+  const events=JSON.parse(f.sent[1].message.content).events;
+  assert.deepEqual(events.map(e=>e.kind),['stage','question','answer','skill','unknown']);
+  assert.equal(events.at(-1).turn,2);
+  assert.equal(events.at(-1).source,'task_snapshot');
+  assert.equal(f.timers.length,0);
+});
+
+test('unknown event with running snapshot is not repeated by next snapshot', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',turn:1,state:'running'};
+  f.setPacket({task,events:[{seq:1,kind:'unknown',turn:1,text:'settled between reads'}]});
+  await f.timers.shift()();
+  f.setPacket({task:{...task,state:'unknown'},events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  assert.equal(f.timers.length,0);
+});
+
+test('legacy unknown without turn uses current task turn without duplicate fallback', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',turn:2,state:'unknown'};
+  f.setPacket({task,events:[{seq:1,kind:'unknown',text:'legacy terminal'},
+    {seq:2,kind:'question',text:'keep this question'}]});
+  await f.timers.shift()();
+  assert.deepEqual(JSON.parse(f.sent[0].message.content).events.map(e=>e.kind),['unknown','question']);
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task,events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  assert.equal(f.timers.length,0);
+});
+
+for (const previouslyNotified of [true,false]) test(`historical turn attention ${previouslyNotified ? 'does not repeat' : 'is delivered when first late'}`, async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',state:'unknown'};
+  if (previouslyNotified) {
+    f.setPacket({task:{...task,turn:1},events:[]});
+    await f.timers.shift()();
+    await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  }
+  f.setPacket({task:{...task,turn:2},events:[]});
+  await f.timers.shift()();
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task:{...task,turn:3,state:'running'},events:[
+    {seq:1,kind:'unknown',turn:1,text:'late turn one'},
+    {seq:2,kind:'stage',turn:3,text:'progress'},
+    {seq:3,kind:'question',turn:3,text:'question'},
+    {seq:4,kind:'answer',turn:3,text:'answer'},
+    {seq:5,kind:'skill',turn:3,text:'skill'}]});
+  await f.timers.shift()();
+  const delivered=f.sent.flatMap(s=>JSON.parse(s.message.content).events);
+  assert.deepEqual(delivered.filter(e=>e.kind==='unknown').map(e=>e.turn),previouslyNotified ? [1,2] : [2,1]);
+  assert.deepEqual(JSON.parse(f.sent.at(-1).message.content).events.filter(e=>e.kind!=='unknown').map(e=>e.kind),
+    ['stage','question','answer','skill']);
+  f.setPacket({task:{...task,turn:3,state:'running'},events:[{seq:6,kind:'unknown',turn:1,text:'repeat late turn one'}]});
+  const count=f.sent.length;
+  await f.timers.shift()();
+  assert.equal(f.sent.length,count,'a delivered old turn is now remembered too');
+  f.adapter.detach();
+});
+
+test('unattributed legacy unknown events stay visible without repeated snapshot attention', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'omp',cwd:'/work',prompt:'owned'},f.ctx);
+  const task={id:'task-a',agent:'omp',state:'unknown'};
+  f.setPacket({task,events:[]});
+  await f.timers.shift()();
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1,'a no-turn snapshot still has a remembered fallback obligation');
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task,events:[{seq:1,kind:'unknown',text:'unattributed legacy terminal'}]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,2,'unknown-turn events remain cursor-visible');
+  await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  f.setPacket({task,events:[]});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,2);
 });

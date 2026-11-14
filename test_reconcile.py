@@ -75,4 +75,46 @@ class ReconcileTests(unittest.TestCase):
                              ('unknown','probe','record_binding_mismatch'))
             self.assertEqual(receipt['attempts'][0]['reason_code'],'close_uncertain')
 
+    def test_probe_does_not_overwrite_first_failure_and_keeps_latest_probe_separate(self):
+        from release import BackendFailure
+        with tempfile.TemporaryDirectory() as td:
+            release,_,backend=fixture(Path(td),Backend(fail=True))
+            release.release(release.prepare()['nonce'])
+            def probe(policy): raise BackendFailure('load','backend_unavailable',dict(substep='load_runtime'))
+            backend.probe=probe
+            receipt=release.reconcile()
+            self.assertEqual(receipt['first_failure']['reason_code'],'close_uncertain')
+            self.assertEqual(receipt['latest_probe']['stage'],'load')
+            self.assertEqual(receipt['latest_probe']['substep'],'load_runtime')
+            self.assertEqual(backend.calls,1)
+
+    def test_release_and_probe_consume_only_typed_safe_diagnostic_fields(self):
+        from release import BackendFailure, recover_native
+        import json
+        payload=dict(operation='close',substep='status_after',error_name='Error',returncode=2,
+            message='PRIVATE_SENTINEL',stack='PRIVATE_SENTINEL',raw_stderr='PRIVATE_SENTINEL',
+            state='released',phase='verified',stderr_length='PRIVATE_SENTINEL',timeout='yes')
+        with tempfile.TemporaryDirectory() as td:
+            release,owner,backend=fixture(Path(td))
+            def fail(policy): raise BackendFailure('verify','backend_unavailable',payload)
+            backend.close=fail; backend.probe=fail
+            receipt=release.release(release.prepare()['nonce'])
+            self.assertNotIn('PRIVATE_SENTINEL',json.dumps(receipt))
+            receipt=release.reconcile()
+            self.assertNotIn('PRIVATE_SENTINEL',json.dumps(receipt))
+            self.assertNotIn('timeout',receipt['latest_probe'])
+            self.assertEqual(receipt['state'],'unknown')
+        from bridge import Origin,Store
+        with tempfile.TemporaryDirectory() as td:
+            store=Store(Path(td)/'tasks.db'); owner=Origin('fixture','owner','owner')
+            task=store.create(owner,'local','omp',td,'owned',False)
+            store.update(task['id'],state='completed',acpx_record_id='record')
+            class Backend:
+                def resolve(self,policy):return dict(acp='acp')
+                close=staticmethod(fail); probe=staticmethod(fail)
+            receipt=recover_native(store,owner,task['id'],1,'close',Backend())
+            self.assertNotIn('PRIVATE_SENTINEL',json.dumps(receipt))
+            self.assertEqual(receipt['state'],'unknown')
+
+
 if __name__ == '__main__': unittest.main()

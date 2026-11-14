@@ -50,5 +50,22 @@ function adapter({badReadback=false,replacement=false,badBefore}={}) {
     else await assert.rejects(probeTarget(target,deps), error=>error.stage==='probe');
     assert.equal(closes,0);
   }
+  const dual=adapter();
+  const originalRuntime=dual.deps.loadRuntime;
+  dual.deps.loadRuntime=async()=>{
+    const sdk=await originalRuntime();
+    const create=sdk.createSharedAcpRuntime;
+    sdk.createSharedAcpRuntime=()=>{
+      const runtime=create();
+      runtime.getStatus=async()=>{throw Object.assign(Error('PRIVATE_ORIGINAL'),{code:'EIO'});};
+      runtime.shutdown=async()=>{throw Error('PRIVATE_SHUTDOWN');};
+      return runtime;
+    };
+    return sdk;
+  };
+  await assert.rejects(closeTarget(target,dual.deps),e=>e.stage==='resolve' && e.substep==='status_before'
+    && e.code==='EIO' && e.shutdownFailure?.name==='Error');
+  await assert.rejects(closeTarget(target,{loadRuntime:async()=>{throw Error('PRIVATE_LOAD');}}),
+    e=>e.stage==='load' && e.substep==='load_runtime');
   console.log('STRICT_NATIVE_RELEASE_PROOF_OK');
 })().catch(error=>{console.error(error);process.exitCode=1;});

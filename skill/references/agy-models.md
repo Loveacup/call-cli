@@ -6,11 +6,20 @@
 
 未指定模型沿用 G4C；新 G4C 任务默认 `agy_swarm: native`，G4A 文字／知识任务默认单代理 `off`，可按任务显式 `native` 开启。G4C 可显式 off；worker 默认 G4H，覆盖保留。CLI `--agy-swarm native|off`／宿主同名字段持久化路由；旧任务不重新计算默认，其他 backend 不变。native 从实时目录解析并读回精确模型，显式覆盖必须广告，无静默替换。
 
+native 源码候选先匹配本次 advertised exact ID；否则只接受本次 model.options 的 family，按显式 effort 或本次 thought_level.currentValue 唯一映射到 availableModels。worker family 使用目录当前 effort，不暗继承主模型新 effort。未知／歧义／exact-effort 冲突在 prompt 前拒绝；set 后读回协调者 exact/config，保存 native_selection.requested/resolved/readback_verified。readback_verified 只表示协调者运行配置读回，worker 仅目录解析及后续 add/model 证据，不表示独立 worker runtime 读回。off 路径未因此改变，也不升级为真实兼容已验。
+
+
 `agy_native.py` 在同一 `agy acp` 连接执行 new／设置／读回／首部 `/swarm` prompt。首轮 end_turn 后保持 running、原 owner 与占用，串行完整 load 观察 native board 自动唤醒后的结果，不发送定时 prompt、不读私有 DB。首回放按已发布工具 ID／消息逐次对齐，后续完整 load 共同前缀对账；失败或变更保 unknown。thought 丢弃，公开工具只留安全字段。
 
 `native_snapshot` 是内部对账副本；Hermes／OMP 宿主 status/list/wait 投影排除它，仍公开 `native_result` 与安全权限决定。通用本地 CLI 记录可保留 snapshot 供授权对账，不把它作为宿主周期通知载荷。
 
-正常结算按本 task/turn 的最终结果、对应 worker 原生 add/kill completed 和 session unload；ACP 缺 rawOutput 不再单独导致 HOLD。这是可观察生命周期结算与释放，不宣称所有后代进程死亡。新轮清除旧 result/cleanup/roster，恢复完整历史只作为边界，本轮结果不使用旧工具或 envelope。fatal_error、异常退出、断线、缺必要事件和不确定取消保 unknown/HOLD，不自动重放。AGY unknown 原子事件标 attention_required，runner stdout 主动回报；OMP 现有轮询发送 triggerTurn follow-up，缺终态事件时以 unknown task snapshot 提醒，Hermes 沿既有 notify terminal 返回。事件生成、宿主接收、模型实际消费分别核验；真实宿主端到端仍未验。复用 AGY 1.5.7 单 worker active-load 证据，不追加付费 swarm／取消专项；真实取消全停未验。native 不接受硬执行 timeout。
+正常结算按本 task/turn 的最终结果、对应 worker 原生 add/kill completed 和 session unload；ACP 缺 rawOutput 不单独导致 HOLD，不宣称所有后代进程死亡。新轮清除旧 result/cleanup/roster。fatal、断线、缺必要事件或不确定取消仍 unknown/HOLD，不自动重放。OMP/AGY unknown 经既有 runner attention 与宿主回流路径提示；通知产生/排队、模型消费与真人收到分层，真实宿主端到端未验。AGY 1.5.7 的 active-load 历史证据保留；另获授权的 AGY 1.5.8 v3 单 worker 样本已验证 end_turn 后一次公开 cancel、原 owner cleanup、completed kill+status、精确 unload/not-found、可信 cancelled、重复 close 相等及 natural exit 0。v3 使用候选线程 launcher/观测 wrapper，非部署/默认 launcher 或 active-tool 热取消验收，也不证明全部后代全停；旧 HOLD 不追溯结算。详见[当前验收索引](../../VERIFICATION.md#current-acceptance-index)。native 不接受硬执行 timeout，后续付费调用仍需明确授权。
+
+取消不等于自动结束 worker。候选仅在原 owner 已 end_turn、完整历史对账、已知 roster 且无 pending/in_progress 工具的边界，封普通 dialogue 后发送一次绑定 cancel_id/turn/launch/epoch 的 cleanup-only prompt，撤销旧业务要求，仅 kill 精确已知 worker；不重复 /swarm，不 add/readd/替换，不新开业务。cleanup 不带普通 check_cancel；send_started 先持久化，超时、发送未知或拒绝不重试。最后完整 load 对账所有 completed kill 才 unload 并提交取消 receipt；缺证/新 worker/历史变化不提前 session unload，仍 unknown/HOLD。前台/工具活跃时不发送该 cleanup，不宣称无损热取消。既有 owner 退出策略不等于会话可自动恢复，unknown 不授予第二 owner。
+
+cleanup 可附带确认为原生 swarm status 的只读观察：原始 call 的安全 ID、swarm 名称、精确 status action 与最终 completed/read-or-other 证据均校验；若带 worker 名须属于冻结 roster，不接受 model 参数。不是仅凭展示标题放行；未知/伪装工具、新 worker、新业务、失败 kill 仍 HOLD，status 不代替 kill/unload/receipt。
+
+取消清理 unknown 的退出只关闭原 owner stdio 并有界观察自然退出，不发送 terminate/kill；未观察到退出时记录 PID、exit-unverified，worker fate 仍 unknown。此路径不保活、不创建接管 owner；原 owner 退出后的持续协调/恢复 unsupported，不能宣称 HOLD 是可恢复的活现场。正常完成/其他正常 stop 沿用原策略。原始 tool_call_update 与新建 tool_call 分开计 generation，合法同 ID 更新及 title 展示刷新不当作 readd；action/worker/model/kind 变化仍拒绝。
 
 生产 prompt 仍强制 turn。仅同一 owner 新建精确 session、task 第 1 轮、提交前 load 为空且 prompt 已返回时，兼容缺 turn 的旧 envelope；仍要求 task 和本轮 add/kill 对账。保存 owner 推定的 turn_attribution 与未改动 original_envelope，不伪称模型回传 turn。恢复会话／第 2 轮起／无 owner 上下文均不适用，继续严格 turn 校验。
 
@@ -46,6 +55,9 @@ ACPX Shared Runtime 的 `setModel`/`setConfigOption` 需要已经运行的 owner
 ## 持久审批与结果诊断
 
 `--agy-approval approve-all|approve-reads`（Hermes `agy_approval`）仅适用于 AGY。新任务省略时持久化 `approve-all`，本次任务须已有相应工具授权；显式只读审批选 `approve-reads`，shell／写入请求非交互 deny。`write` 独立表示编辑授权和工作区占用，获授权编辑仍须设 true。审批不是 OS／文件沙箱，不能靠 `write: false` 限制真实文件访问。reply/intervene 保留策略，旧 JSON 缺字段继续按原 `write` 映射，OMP/Codex/Pi 的默认值不变。原生 read/search 优先提示不禁用已授权 shell。
+
+native callback 的 native_permission_decisions 仅保数值 RPC ID、root/foreign 归属、安全 tool ID/kind、option kinds、choice/reason、response_sent_at/send_error。approve-all 仅选 root 的 allow_once；缺该选项明确 allow_once_unavailable，foreign/child 返回 cancelled 并报 scope mismatch，不放行、不加 skip-permissions。approve-reads execute 仍拒绝。完整 worker 审批继承／真实 60s 等待根因未证，本片不改网络配置或编造 swarm 审批参数。
+
 
 AGY 专属策略在 `agy.py`；任务生命周期、SQLite、runner、Shared Runtime 与 OMP/Codex/Pi 共用。不要另建协调栈。`end_turn`／exit 0 只证明协议结束：工具 failed 且最后工具事件后无最终回答、也无待答问题，或既有 fatal 精确最终行，结算 `unknown`，不自动续轮／重放。stage 不算回答；正常提问保留 `waiting_reply` 可回复，fatal 最终行仍覆盖提问。失败后恢复并给最终回答可完成。
 

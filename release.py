@@ -30,9 +30,30 @@ class _ExistingStore(Store):
         self.path = path
 
 
+def safe_diagnostic(value):
+    if not isinstance(value,dict): return {}
+    result={}
+    for key in ('operation','substep','error_name','error_code'):
+        entry=value.get(key)
+        if (isinstance(entry,str) and 0<len(entry)<=80 and entry.isascii()
+                and all(c.isalnum() or c=='_' for c in entry)):
+            if key!='operation' or entry in {'resolve','close','probe','reconcile'}: result[key]=entry
+    for key in ('returncode','signal','stderr_length'):
+        entry=value.get(key)
+        if type(entry) is int and (key!='stderr_length' or entry>=0): result[key]=entry
+    for key in ('timeout','stderr_present'):
+        if type(value.get(key)) is bool: result[key]=value[key]
+    shutdown=value.get('shutdown_failure')
+    if isinstance(shutdown,dict):
+        projected=safe_diagnostic({'error_name':shutdown.get('error_name')})
+        if projected: result['shutdown_failure']=projected
+    return result
+
+
 class BackendFailure(RuntimeError):
-    def __init__(self, stage, reason_code):
+    def __init__(self, stage, reason_code, diagnostic=None):
         self.stage, self.reason_code = stage, reason_code
+        self.diagnostic = diagnostic or {}
         super().__init__(reason_code)
 
 
@@ -236,6 +257,8 @@ class Release:
             reason = exc.reason_code if isinstance(exc, BackendFailure) else 'close_uncertain'
             receipt.update(stage=stage, reason_code=reason)
             receipt['attempts'][-1].update(stage=stage, reason_code=reason, finished_at=self.clock())
+            if isinstance(exc,BackendFailure): receipt['attempts'][-1].update(safe_diagnostic(exc.diagnostic))
+            receipt.setdefault('first_failure',dict(receipt['attempts'][-1]))
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             latest = json.loads(db.execute('SELECT receipt FROM release_fences WHERE task=?', (task['id'],)).fetchone()[0])
@@ -280,6 +303,7 @@ class Release:
             verified = False
             reason = exc.reason_code if isinstance(exc, BackendFailure) else 'probe_unavailable'
             stage = exc.stage if isinstance(exc, BackendFailure) else 'probe'
+            attempt.update(safe_diagnostic(exc.diagnostic) if isinstance(exc,BackendFailure) else {})
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             current = db.execute('SELECT epoch,data,receipt FROM release_fences WHERE task=?',
@@ -288,6 +312,8 @@ class Release:
                     or json.loads(current['data']) != task):
                 raise ValueError('Reconciliation settlement conflict')
             attempt.update(stage=stage, reason_code=reason, finished_at=self.clock())
+            receipt['latest_probe']=dict(attempt)
+            if not verified: receipt.setdefault('first_failure',dict(attempt))
             receipt.update(phase='verified' if verified else 'hold', stage=stage, reason_code=reason)
             if verified:
                 receipt.update(state='released', reconciliation=proof, reconciled_at=self.clock())
@@ -307,24 +333,40 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
         expected_turn = task['turn']  # Legacy close has no business continuation intent.
     if type(expected_turn) is not int or expected_turn != task['turn']:
         raise ValueError('Close requires the observed expected_turn')
+    receipt = dict(state='released', phase='verified', operation='close', task=task_id)
+    if task.get('agy_swarm') == 'native':
+        receipt.update(source='native-single-owner-cleanup', external_close_attempted=False)
     if task['state'] == 'closed':
-        return dict(state='released', phase='verified', operation='close', task=task_id)
+        return receipt
     if task.get('agy_swarm') == 'native':
         # The ACP owner records this turn's observable worker/session settlement,
         # not proof that arbitrary descendant processes died.
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             current = store._owned(db, task_id, origin)
+            if (current['state']=='closed' and current.get('agy_swarm')=='native'
+                    and store._native_binding(current)==store._native_binding(task)
+                    and current.get('controller',current['origin'])==task.get('controller',task['origin'])
+                    and current.get('native_cleanup')==task.get('native_cleanup')
+                    and store.native_cleanup_verified(db,current)):
+                return receipt
             if current != task:
                 raise ValueError('Native close snapshot changed')
             if current['state'] not in {'completed', 'cancelled', 'unknown'}:
                 raise ValueError('Native owner must settle before close')
             cleanup = current.get('native_cleanup', {})
-            verified = (current['state'] in {'completed', 'cancelled'} and cleanup.get('session_unloaded') is True
+            verified = (current['state'] == 'completed' and cleanup.get('session_unloaded') is True
                         and cleanup.get('turn') == current['turn'] and isinstance(cleanup.get('workers'), list)
-                        and ((bool(cleanup['workers']) and current.get('native_result', {}).get('turn') == current['turn']
-                              and cleanup.get('evidence') == 'native-add-kill-completed-and-session-unload')
-                             or cleanup.get('no_prompt') is True))
+                        and bool(cleanup['workers']) and current.get('native_result', {}).get('turn') == current['turn']
+                        and cleanup.get('evidence') == 'native-add-kill-completed-and-session-unload')
+            trusted = store.native_cleanup_verified(db, current)
+            verified = verified or bool(trusted and trusted.get('kind')=='verified-cancellation'
+                and trusted.get('cancel_id')==current.get('native_cancel_id')
+                and current['state'] in {'cancelled','unknown'} and not current.get('runner_pid'))
+            verified = verified or bool(trusted and trusted.get('kind')=='fresh-no-prompt'
+                and trusted.get('fresh') is True and trusted.get('baseline_empty') is True
+                and trusted.get('no_prompt') is True and not current.get('native_prompt_submitted')
+                and not current.get('runner_pid') and current['state'] in {'cancelled','unknown'})
             verified = verified or (current['state'] == 'cancelled'
                         and current.get('session_creation_attempted') is False
                         and not current.get('native_session_id') and not current.get('native_prompt_submitted'))
@@ -336,8 +378,6 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                             reason_code='native_workers_unproven', external_close_attempted=False)
             current.update(state='closed', prompt='', release_epoch=1)
             Release.install(db)
-            receipt = dict(state='released', phase='verified', operation='close', task=task_id,
-                           source='native-single-owner-cleanup', external_close_attempted=False)
             db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
                        (task_id, 1, json.dumps(current), canonical(receipt)))
             Release._publish(db, current, receipt)
@@ -377,8 +417,15 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
 
 def recover_native(store, origin, task_id, expected_turn, operation, backend=None):
     """Host-authenticated exact-task recovery; no policy file or model identity."""
-    if store.get(task_id, origin).get('agy_swarm') == 'native':
-        raise ValueError('Native swarm cannot use ACPX exact-record recovery; retain native worker HOLD')
+    native = store.get(task_id, origin)
+    if native.get('agy_swarm') == 'native':
+        if type(expected_turn) is not int or native['turn']!=expected_turn:
+            raise ValueError('Native recovery requires observed expected_turn')
+        if operation not in {'close','reconcile'}:
+            raise ValueError('Unsupported native recovery operation')
+        if operation=='reconcile' and native['state'] not in {'unknown','closed'}:
+            raise ValueError('Native reconcile requires unknown/HOLD')
+        return close_task(store, origin, task_id, expected_turn)
     backend = backend or NativeBackend()
     task = store.get(task_id, origin)
     if expected_turn is None or type(expected_turn) is not int or task['turn'] != expected_turn:
@@ -404,7 +451,21 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
     if existing:
         policy = json.loads(existing[0])['target']
     else:
-        policy['acp'] = backend.resolve(policy)['acp']
+        try:
+            policy['acp'] = backend.resolve(policy)['acp']
+        except Exception as exc:
+            failure = exc if isinstance(exc, BackendFailure) else BackendFailure('resolve','backend_unavailable')
+            diagnostic = safe_diagnostic(failure.diagnostic)
+            diagnostic.update(operation=diagnostic.get('operation','resolve'), requested_action=operation,
+                stage=failure.stage, reason_code=failure.reason_code,
+                external_close_attempted=False, turn=task['turn'], epoch=task.get('control_epoch',1), request_id=policy['request_id'])
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                current=store._owned(db,task_id,origin)
+                if current!=task: raise ValueError('Pre-fence resolution snapshot changed')
+                current['close_diagnostic']=diagnostic
+                store._save(db,current)
+            return dict(state='unknown',phase='hold',**diagnostic)
     recovery = object.__new__(Release)
     recovery.home, recovery.policy, recovery.backend, recovery.clock = store.path.parent, policy, backend, time.time
     recovery.store = store
@@ -449,18 +510,22 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
                                            reason_code='in_progress',started_at=time.time()))
             Release._publish(db,reserved,receipt)
             close_snapshot = canonical(receipt)
+        close_diagnostic={}
         try:
             backend.close(policy)
             reason, stage = 'close_returned', 'verify'
         except Exception as exc:
             reason = exc.reason_code if isinstance(exc,BackendFailure) else 'close_uncertain'
             stage = exc.stage if isinstance(exc,BackendFailure) else 'close'
+            close_diagnostic=safe_diagnostic(exc.diagnostic) if isinstance(exc,BackendFailure) else {}
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             latest = json.loads(db.execute('SELECT receipt FROM release_fences WHERE task=?',(task_id,)).fetchone()[0])
             if canonical(latest) != close_snapshot:
                 return latest
             receipt['attempts'][-1].update(stage=stage,reason_code=reason,finished_at=time.time())
+            receipt['attempts'][-1].update(close_diagnostic)
+            if reason!='close_returned': receipt.setdefault('first_failure',dict(receipt['attempts'][-1]))
             Release._publish(db,reserved,receipt)
     return recovery.reconcile()
 
@@ -482,19 +547,34 @@ class NativeBackend:
         except ImportError:
             from updates import device_lock
         task = dict(device='local')
+        operation = probe if isinstance(probe, str) else 'probe' if probe else 'close'
         with device_lock(task):
-            operation = probe if isinstance(probe, str) else 'probe' if probe else 'close'
-            result = subprocess.run(['node', str(Path(__file__).with_name('release-backend.cjs')), operation],
-                                    input=canonical(policy).encode(), capture_output=True, timeout=45)
+            try:
+                result = subprocess.run(['node', str(Path(__file__).with_name('release-backend.cjs')), operation],
+                                        input=canonical(policy).encode(), capture_output=True, timeout=45)
+            except subprocess.TimeoutExpired as exc:
+                raise BackendFailure('timeout','backend_timeout',dict(operation=operation,timeout=True,
+                    stderr_present=bool(exc.stderr),stderr_length=len(exc.stderr or b''))) from None
+            except OSError:
+                raise BackendFailure('spawn','backend_unavailable',dict(operation=operation,error_name='OSError')) from None
+        diagnostic=dict(operation=operation,returncode=result.returncode,
+            signal=-result.returncode if result.returncode<0 else None,
+            stderr_present=bool(result.stderr),stderr_length=len(result.stderr or b''))
         try:
             value = json.loads(result.stdout)
+            if not isinstance(value,dict): raise ValueError('object required')
         except (ValueError, UnicodeError):
-            raise BackendFailure('probe' if probe else 'close', 'invalid_backend_response') from None
+            raise BackendFailure('parse', 'invalid_backend_response',diagnostic) from None
         if result.returncode != 0:
             allowed = {'record_binding_mismatch','name_scope_mismatch',
                        'name_scope_replaced_or_reopened','backend_unavailable'}
-            reason = value.get('reason_code') if isinstance(value, dict) else None
-            stage = value.get('stage') if isinstance(value, dict) else None
-            raise BackendFailure(stage if stage in {'resolve','close','verify','probe'} else 'verify',
-                                 reason if reason in allowed else 'backend_unavailable')
+            reason = value.get('reason_code')
+            stage = value.get('stage')
+            for key in ('substep','error_name','error_code'):
+                entry=value.get(key)
+                if isinstance(entry,str) and entry.replace('_','').isalnum() and len(entry)<=80: diagnostic[key]=entry
+            if isinstance(value.get('shutdown_failure'),dict):
+                diagnostic['shutdown_failure']={'error_name':'Error'}
+            raise BackendFailure(stage if stage in {'load','registry','create','resolve','close','verify','probe','shutdown'} else operation,
+                                 reason if reason in allowed else 'backend_unavailable',diagnostic)
         return value

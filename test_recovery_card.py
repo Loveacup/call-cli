@@ -9,6 +9,15 @@ from unittest.mock import patch
 
 
 class RecoveryCardTests(unittest.TestCase):
+    def test_native_unknown_card_offers_receipt_only_recovery_without_second_owner(self):
+        task=dict(id='native',device='local',state='unknown',agy_swarm='native',turn=1,session='logical',
+            origin={},write=True,cwd='/work',native_cleanup=dict(kind='verified-cancellation',session_unloaded=True))
+        card=recovery_card(task,host='hermes-native')
+        self.assertIn('receipt',card['next_action'])
+        self.assertIn('reconcile',card['next_action'])
+        self.assertIn('no new owner',card['next_action'])
+        self.assertFalse(card['capabilities']['exact_record_reconcile'])
+
     def test_unknown_cards_distinguish_missing_remote_and_available_exact_record(self):
         with tempfile.TemporaryDirectory() as td:
             for mode in ('missing','remote','exact'):

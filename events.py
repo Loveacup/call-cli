@@ -9,6 +9,11 @@ def safe_tool_name(value):
 def safe_tool_id(value):
     return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.:-]{0,159}', value) else ''
 
+
+def safe_tool_kind(value):
+    return value if isinstance(value, str) and value in {
+        'read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other'} else ''
+
 class IncompleteQuestion(str):
     """Bounded public prefix whose full body was not retained."""
     identity_complete = False
@@ -75,7 +80,7 @@ class EventDecoder:
             return None
         return {'params': {'update': update}}
 
-    def feed(self, event):
+    def feed(self, event, *, text_boundary=True):
         if self.shared_request_id is not None:
             message = self._shared_message(event)
             if message is None:
@@ -88,16 +93,16 @@ class EventDecoder:
         if kind in {'tool_call','tool_call_update'}:
             # Text blocks often omit a trailing newline. A tool boundary ends
             # the preceding public block; publish it before the tool runs.
-            out = self.finish()
+            out = self.finish() if text_boundary else []
             self.final_answer = ''
             self.tool_failed |= update.get('status') == 'failed'
             tool_id = safe_tool_id(update.get('toolCallId', ''))
             details = self.tool_details.setdefault(tool_id, {}) if tool_id else {}
             name = safe_tool_name(update.get('title', ''))
-            category = update.get('kind')
+            category = safe_tool_kind(update.get('kind'))
             if name:
                 details['name'] = name
-            if category in {'read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other'}:
+            if category:
                 details['kind'] = category
             status = update.get('status') if update.get('status') in {'pending', 'in_progress', 'completed', 'failed'} else ''
             summary = ' '.join(filter(None, [tool_id, details.get('name'), details.get('kind'), status]))
@@ -106,6 +111,8 @@ class EventDecoder:
             if tool_id:
                 self.tool_summaries[tool_id] = summary
             return out + [('tool', summary)]
+        if kind == 'user_message_chunk':
+            return self.finish() if text_boundary else []
         if kind != 'agent_message_chunk':
             return []
         content = update.get('content', {})

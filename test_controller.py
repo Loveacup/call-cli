@@ -185,5 +185,39 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.action('close',task,expected_turn=1)
         self.assertNotIn('release_epoch',self.store.get(task['id']))
 
+    def test_prefence_resolution_failure_preserves_completed_and_records_safe_diagnostic(self):
+        task = self.start()
+        self.store.update(task['id'],state='completed',acpx_record_id='fixture-record')
+        import callcli_plugin.release as release
+        class Backend:
+            def resolve(self,policy): raise release.BackendFailure('load','backend_unavailable',dict(operation='resolve',substep='load_runtime',error_name='Error'))
+        with patch.object(release,'NativeBackend',return_value=Backend()):
+            result=self.action('close',task)
+        self.assertEqual(result['task']['state'],'completed')
+        self.assertFalse(result['receipt']['external_close_attempted'])
+        self.assertEqual(result['receipt']['stage'],'load')
+        self.assertEqual(self.store.get(task['id'])['close_diagnostic']['substep'],'load_runtime')
+        self.assertEqual(self.store.get(task['id'])['close_diagnostic']['operation'],'resolve')
+        self.assertEqual(self.store.get(task['id'])['close_diagnostic']['requested_action'],'close')
+        self.assertNotIn('release_epoch',self.store.get(task['id']))
+
+    def test_prefence_backend_diagnostic_drops_private_and_control_fields(self):
+        task=self.start()
+        self.store.update(task['id'],state='completed',acpx_record_id='record')
+        import callcli_plugin.release as release
+        payload=dict(operation='resolve',substep='load_runtime',error_name='Error',returncode=1,
+            message='PRIVATE_SENTINEL',stack='PRIVATE_SENTINEL',raw_stderr='PRIVATE_SENTINEL',
+            state='released',phase='verified',stderr_length='PRIVATE_SENTINEL',timeout='yes')
+        class Backend:
+            def resolve(self,policy): raise release.BackendFailure('load','backend_unavailable',payload)
+        with patch.object(release,'NativeBackend',return_value=Backend()): result=self.action('close',task)
+        self.assertEqual((result['receipt']['state'],result['receipt']['phase']),('unknown','hold'))
+        self.assertEqual(result['task']['state'],'completed')
+        diagnostic=self.store.get(task['id'])['close_diagnostic']
+        self.assertEqual((diagnostic['operation'],diagnostic['requested_action']),('resolve','close'))
+        self.assertNotIn('PRIVATE_SENTINEL',json.dumps(result)+json.dumps(diagnostic))
+        self.assertNotIn('timeout',diagnostic)
+
+
 if __name__ == '__main__':
     unittest.main()

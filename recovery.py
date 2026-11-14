@@ -17,7 +17,9 @@ def recovery_card(task, db_path=None, seq=0, host=None):
         else:
             next_action = 'retain HOLD pending exact-record probe-only reconciliation through an authorized available entry point; no replay'
         if task.get('agy_swarm') == 'native':
-            next_action = 'retain native worker HOLD; inspect recovered native_result and owned public evidence; ACPX record close cannot release'
+            action = 'reconcile' if host=='hermes-native' else 'close (receipt-only)'
+            next_action = ('retain native worker HOLD; '+action+' validates an existing owner cleanup receipt only; '
+                'no new owner, load or repeated close; missing receipt requires authorized native evidence, not ACPX')
     else:
         next_action = 'inspect exact task before explicit control'
     return dict(task_id=task['id'], device=task['device'],

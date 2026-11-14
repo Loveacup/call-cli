@@ -23,6 +23,239 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.store.get(x['id'], self.b)
 
+    def test_dialogue_is_bound_idempotent_and_never_cancels(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123,
+            native_input=dict(turn=1, launch_id='launch', epoch=1, accepting=True), interaction_seq=0)
+        admitted = self.store.dialogue(task['id'], self.a, 'revise', expected_turn=1, command_id='d1')
+        self.assertEqual((admitted['state'], admitted['turn']), ('running', 1))
+        self.assertEqual(admitted['commands']['d1']['interaction_seq'], 1)
+        self.assertEqual(self.store.dialogue(task['id'], self.a, 'revise', expected_turn=1, command_id='d1'), admitted)
+        for changes in (dict(prompt='different'), dict(expected_turn=2)):
+            args = dict(prompt='revise', expected_turn=1, command_id='d1', **{})
+            args.update(changes)
+            with self.assertRaises(ValueError):
+                self.store.dialogue(task['id'], self.a, **args)
+        with self.assertRaises(PermissionError):
+            self.store.dialogue(task['id'], self.b, 'foreign', expected_turn=1, command_id='d2')
+
+    def test_dialogue_rejects_missing_stale_or_inactive_owner_capability(self):
+        for changes in ({}, dict(native_input=dict(turn=1, launch_id='old', epoch=1, accepting=True)),
+                        dict(native_input=dict(turn=1, launch_id='launch', epoch=2, accepting=True)),
+                        dict(state='unknown'), dict(release_epoch=1)):
+            task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+            fields = dict(state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+            fields.update(changes)
+            self.store.update(task['id'], **fields)
+            with self.assertRaisesRegex(ValueError, 'unsupported|unavailable|fenced'):
+                self.store.dialogue(task['id'], self.a, 'revise', expected_turn=1, command_id='d')
+
+    def test_native_dialogue_claim_send_return_and_question_binding(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        task = self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.event(task['id'], '1:q', 'question', 'Q1 Format?', turn=1, interaction_seq=0)
+        self.store.dialogue(task['id'], self.a, 'JSON', expected_turn=1, command_id='answer', question_id='1:q')
+        bound = self.store.get(task['id'])['commands']['answer']['question']
+        self.assertEqual((bound['id'], bound['label'], bound['interaction_seq'], bound['text']),
+                         ('1:q', 'Q1', 0, 'Q1 Format?'))
+        claimed = self.store.native_dialogue_claim(task['id'], 1, 'launch', 1)
+        self.assertEqual(claimed['status'], 'claimed')
+        self.assertEqual(self.store.get(task['id'])['questions'], ['1:q'])
+        self.assertIsNone(self.store.native_dialogue_claim(task['id'], 1, 'launch', 1))
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'answer', 'send_started')
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'answer', 'returned')
+        result = self.store.get(task['id'])
+        self.assertEqual((result['turn'], result['interaction_seq'], result['questions']), (1, 1, []))
+        self.assertTrue(self.store.native_input_seal(task['id'], 1, 'launch', 1, 1))
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'late', expected_turn=1, command_id='late')
+
+    def test_native_send_uncertainty_is_never_reclaimed(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'once', expected_turn=1, command_id='once')
+        self.store.native_dialogue_claim(task['id'], 1, 'launch', 1)
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'once', 'send_started')
+        self.store.native_input_end(task['id'], 1, 'launch', 1)
+        self.assertEqual(self.store.get(task['id'])['commands']['once']['status'], 'unknown')
+        self.assertIsNone(self.store.native_dialogue_claim(task['id'], 1, 'launch', 1))
+
+    def test_native_question_labels_are_scoped_to_interaction(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.assertTrue(self.store.event(task['id'], '1:q0', 'question', 'Q1 Same?', turn=1, interaction_seq=0))
+        self.assertTrue(self.store.event(task['id'], '1:q1', 'question', 'Q1 Same?', turn=1, interaction_seq=1))
+        self.assertFalse(self.store.event(task['id'], '1:q1again', 'question', 'Q1 Same?', turn=1, interaction_seq=1))
+
+    def test_cancellation_after_dialogue_claim_prevents_new_prompt_send(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'once', expected_turn=1, command_id='once')
+        self.store.native_dialogue_claim(task['id'], 1, 'launch', 1)
+        self.store.request_cancel(task['id'], self.a)
+        with self.assertRaises(ValueError):
+            self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'once', 'send_started')
+
+    def test_dialogue_command_id_cannot_be_reused_as_cancel_resume(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'once', expected_turn=1, command_id='once')
+        with self.assertRaises(ValueError):
+            self.store.intervene(task['id'], self.a, 'once', expected_turn=1, command_id='once')
+
+    def test_native_cleanup_commit_requires_private_owner_token_and_exact_binding(self):
+        task = self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=123,native_session_id='session')
+        token = self.store.native_cleanup_owner(task['id'],1,'launch',1)
+        self.store.native_input_open(task['id'],1,'launch',1)
+        self.store.dialogue(task['id'],self.a,'queued',expected_turn=1,command_id='queued')
+        self.store.request_cancel(task['id'],self.a)
+        sealed = self.store.native_cancel_seal(task['id'],1,'launch',1)
+        self.assertFalse(sealed['native_input']['accepting'])
+        self.assertIsNone(self.store.native_dialogue_claim(task['id'],1,'launch',1))
+        self.assertEqual(sealed['commands']['queued']['status'],'not_sent')
+        receipt = dict(kind='verified-cancellation',task=task['id'],turn=1,launch_id='launch',epoch=1,
+            session_id='session',cancel_id=sealed['native_cancel_id'],session_unloaded=True,workers=['worker'])
+        for key, value in [('task','other'),('turn',2),('launch_id','stale'),('epoch',2),('session_id','other'),('cancel_id','other')]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.store.native_cleanup_commit(task['id'],1,'launch',1,token,dict(receipt,**{key:value}))
+        with self.assertRaises(ValueError): self.store.native_cleanup_commit(task['id'],1,'launch',1,'forged',receipt)
+        self.store.native_cleanup_commit(task['id'],1,'launch',1,token,receipt)
+        with self.store.connect() as db:
+            self.assertEqual(self.store.native_cleanup_verified(db,self.store.get(task['id'])),receipt)
+        settled=self.store.get(task['id'])
+        self.assertEqual((settled['state'],settled['runner_pid']),('cancelled',0))
+        self.assertEqual(len([e for e in self.store.events(task['id'],self.a) if e['kind']=='cancelled']),1)
+        self.assertFalse(self.store.finish_turn(task['id'],1,'cancelled',0,'cancelled'))
+        notice=self.store.native_cancel_notice(task['id'],1,'launch',1)
+        self.assertEqual(notice['kind'],'cancelled')
+        self.assertIsNone(self.store.native_cancel_notice(task['id'],1,'launch',1))
+
+    def test_cancel_cleanup_send_is_bound_once_and_seals_concurrent_dialogue(self):
+        import concurrent.futures
+        task=self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=1,native_session_id='session')
+        self.store.native_input_open(task['id'],1,'launch',1)
+        self.store.request_cancel(task['id'],self.a)
+        sealed=self.store.native_cancel_seal(task['id'],1,'launch',1)
+        cancel_id=sealed['native_cancel_id']
+        for args in ((2,'launch',1,cancel_id),(1,'stale',1,cancel_id),(1,'launch',2,cancel_id),(1,'launch',1,'other')):
+            with self.assertRaises(ValueError):self.store.native_cancel_cleanup_state(task['id'],*args,'send_started',['a'])
+        def claim(_):
+            try:self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'send_started',['a']); return True
+            except ValueError:return False
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            self.assertEqual(sorted(pool.map(claim,range(2))),[False,True])
+        with self.assertRaises(ValueError):self.store.dialogue(task['id'],self.a,'late',expected_turn=1,command_id='late')
+        self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'unknown',['a'])
+        self.store.request_cancel(task['id'],self.a)
+        with self.assertRaises(ValueError):self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'send_started',['a'])
+        self.assertEqual(self.store.get(task['id'])['native_cancel_cleanup']['status'],'unknown')
+
+    def test_atomic_cancel_receipt_preserves_pending_intervention_until_controller_advances(self):
+        task=self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=123,native_session_id='session')
+        token=self.store.native_cleanup_owner(task['id'],1,'launch',1)
+        self.store.native_input_open(task['id'],1,'launch',1)
+        self.store.intervene(task['id'],self.a,'revision','revision')
+        sealed=self.store.native_cancel_seal(task['id'],1,'launch',1)
+        receipt=dict(kind='verified-cancellation',task=task['id'],turn=1,launch_id='launch',epoch=1,
+            session_id='session',cancel_id=sealed['native_cancel_id'],session_unloaded=True,workers=['worker'])
+        self.store.native_cleanup_commit(task['id'],1,'launch',1,token,receipt)
+        current=self.store.get(task['id'])
+        self.assertEqual((current['state'],current['turn'],current['commands']['revision']['status']),('cancelled',1,'pending'))
+        successor,launch=self.store.advance_intervention(task['id'],self.a)
+        self.assertTrue(launch)
+        self.assertEqual(successor['turn'],2)
+        self.assertFalse(self.store.advance_intervention(task['id'],self.a)[1])
+        self.assertFalse(self.store.finish_turn(task['id'],1,'cancelled',0,'cancelled'))
+        self.assertFalse(self.store.native_owner_diagnostics(task['id'],1,'launch',1,native_owner_exit={'kind':'stale'}))
+        self.assertNotIn('native_owner_exit',self.store.get(task['id']))
+
+    def test_atomic_cancel_receipt_allows_concurrent_close_without_protocol_replay(self):
+        from release import close_task
+        import concurrent.futures
+        task=self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=123,native_session_id='session')
+        token=self.store.native_cleanup_owner(task['id'],1,'launch',1)
+        self.store.request_cancel(task['id'],self.a)
+        sealed=self.store.native_cancel_seal(task['id'],1,'launch',1)
+        receipt=dict(kind='verified-cancellation',task=task['id'],turn=1,launch_id='launch',epoch=1,
+            session_id='session',cancel_id=sealed['native_cancel_id'],session_unloaded=True,workers=['worker'])
+        self.store.native_cleanup_commit(task['id'],1,'launch',1,token,receipt)
+        with self.assertRaises(PermissionError): close_task(self.store,self.b,task['id'],1)
+        with self.assertRaises(ValueError): close_task(self.store,self.a,task['id'],2)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results=list(pool.map(lambda _:close_task(self.store,self.a,task['id'],1),range(2)))
+        self.assertEqual([r['state'] for r in results],['released','released'])
+        self.assertEqual(results[0],results[1])
+        self.assertEqual(close_task(self.store,self.a,task['id'],1),results[0])
+        with self.assertRaises(PermissionError): close_task(self.store,self.b,task['id'],1)
+        with self.assertRaises(ValueError): close_task(self.store,self.a,task['id'],2)
+        self.assertEqual(len([e for e in self.store.events(task['id'],self.a) if e['kind']=='cancelled']),1)
+
+    def test_native_cleanup_close_receipt_matches_concurrent_late_read(self):
+        from release import close_task
+        import concurrent.futures
+        import threading
+        from unittest.mock import patch
+        task=self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=123,native_session_id='session')
+        token=self.store.native_cleanup_owner(task['id'],1,'launch',1)
+        self.store.request_cancel(task['id'],self.a)
+        sealed=self.store.native_cancel_seal(task['id'],1,'launch',1)
+        receipt=dict(kind='verified-cancellation',task=task['id'],turn=1,launch_id='launch',epoch=1,
+            session_id='session',cancel_id=sealed['native_cancel_id'],session_unloaded=True,workers=['worker'])
+        self.store.native_cleanup_commit(task['id'],1,'launch',1,token,receipt)
+        started=threading.Event(); committed=threading.Event(); original=self.store.get
+        def delayed_get(task_id,origin=None):
+            if threading.current_thread().name.startswith('late-close'):
+                started.set()
+                if not committed.wait(5): raise AssertionError('First close did not finish')
+            return original(task_id,origin)
+        with patch.object(self.store,'get',side_effect=delayed_get), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=1,thread_name_prefix='late-close') as pool:
+            late=pool.submit(close_task,self.store,self.a,task['id'],1)
+            try:
+                self.assertTrue(started.wait(5))
+                first=close_task(self.store,self.a,task['id'],1)
+            finally:
+                committed.set()
+            self.assertEqual(late.result(timeout=5),first)
+        self.assertEqual(len([e for e in self.store.events(task['id'],self.a) if e['kind']=='cancelled']),1)
+
+
+    def test_all_turn_changes_clear_latest_close_diagnostic_but_keep_history(self):
+        for agent in ('omp','agy'):
+            for action in ('reply','intervene'):
+                with self.subTest(agent=agent,action=action):
+                    task=self.store.create(self.a,'local',agent,'/one','owned',False)
+                    self.store.update(task['id'],agy_swarm='native' if agent=='agy' else 'off',state='completed',
+                        close_diagnostic=dict(turn=1,stage='load'))
+                    self.store.event(task['id'],'1:diagnostic','stage','close failed',turn=1)
+                    if action=='reply': successor=self.store.reply(task['id'],self.a,'','next')
+                    else: successor=self.store.intervene(task['id'],self.a,'next','next')[0]
+                    self.assertEqual(successor['turn'],2)
+                    self.assertNotIn('close_diagnostic',successor)
+                    self.assertEqual(self.store.events(task['id'],self.a)[0]['text'],'close failed')
+
+
+    def test_native_completion_seal_rejects_late_cancellation_and_keeps_result_path(self):
+        task=self.store.create(self.a,'local','agy','/one','owned',True)
+        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=123)
+        self.store.native_input_open(task['id'],1,'launch',1)
+        self.assertTrue(self.store.native_input_seal(task['id'],1,'launch',1,0))
+        with self.assertRaisesRegex(ValueError,'settling'):
+            self.store.request_cancel(task['id'],self.a)
+        self.assertEqual(self.store.get(task['id'])['state'],'running')
+        with self.assertRaisesRegex(ValueError,'settling'):
+            self.store.intervene(task['id'],self.a,'late','late')
+
+
+
     def test_overlapping_writers_and_shared_resources_are_rejected(self):
         self.store.create(self.a, 'local', 'omp', '/one', 'write', True)
         with self.assertRaises(ValueError):

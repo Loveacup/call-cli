@@ -106,9 +106,17 @@ class Store:
         current = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task['id'],)).fetchone()[0])
         if current['state'] == 'closed' or current.get('release_epoch'):
             raise ValueError('Task is permanently fenced')
+        if current['turn'] != task['turn']:
+            task.pop('close_diagnostic',None)
         if task.get('agy_swarm') == 'native' and current['turn'] != task['turn']:
+            if current.get('native_cleanup', {}).get('session_unloaded') is True:
+                task['native_predecessor_session_id'] = current.get('native_session_id')
+                task.pop('native_session_id', None)
+                task['needs_session'] = True
             for key in ('native_result', 'native_cleanup', 'native_cancel', 'native_snapshot',
-                        'native_workers', 'native_roster', 'native_prompt_submitted', 'native_phase'):
+                        'native_workers', 'native_roster', 'native_prompt_submitted', 'native_phase', 'native_observation',
+                        'native_input', 'interaction_seq', 'native_interaction_next', 'native_cancel_id',
+                        'native_unload_observation', 'native_owner_exit', 'native_cancel_cleanup'):
                 task.pop(key, None)
         db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(task), task['id']))
 
@@ -173,7 +181,8 @@ class Store:
                     prior = [json.loads(row[0]) for row in db.execute(
                         "SELECT data FROM events WHERE task=? AND json_extract(data,'$.turn')=? "
                         "AND json_extract(data,'$.question_label')=? AND json_extract(data,'$.kind')='question'",
-                        (task_id, task['turn'], label[1]))]
+                        (task_id, task['turn'], label[1]))
+                        if json.loads(row[0]).get('interaction_seq', 0) == metadata.get('interaction_seq', 0)]
                     if any(event.get('question_sha256') == fingerprint and
                            event.get('question_length') == len(text) for event in prior):
                         return False
@@ -199,6 +208,257 @@ class Store:
                     task['state'] = 'waiting_reply'
                 self._save(db, task)
         return inserted.lastrowid
+
+    @staticmethod
+    def _native_binding(task):
+        return dict(turn=task['turn'], launch_id=task.get('launch_id'), epoch=task.get('control_epoch', 1))
+
+    def dialogue(self, task_id, origin, prompt, *, expected_turn, command_id, question_id=None):
+        if type(expected_turn) is not int or expected_turn < 1 or not isinstance(command_id, str) or not command_id.strip():
+            raise ValueError('dialogue requires expected_turn and stable command_id')
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError('dialogue requires nonempty prompt')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._owned(db, task_id, origin)
+            # Dialogue never admits a new controller, including ended-owner transfer.
+            controller = Origin(**task.get('controller', task['origin'])).key()
+            same = getattr(self, '_same_principal', self._allows)
+            if not same(controller, origin):
+                raise PermissionError('Dialogue belongs to the current controller')
+            intent = dict(prompt=prompt, expected_turn=expected_turn, question_id=question_id)
+            commands = task.setdefault('commands', {})
+            old = commands.get(command_id)
+            if old is not None:
+                if old.get('kind') != 'dialogue' or old.get('intent') != intent:
+                    raise ValueError('command_id already used with different parameters')
+                return task
+            self._check_intent(task, expected_turn)
+            cap = task.get('native_input', {})
+            binding = self._native_binding(task)
+            if (task.get('release_epoch') or task['state'] != 'running'):
+                raise ValueError('Native dialogue unavailable or fenced; retain HOLD')
+            if (task['agent'] != 'agy' or task.get('agy_swarm') != 'native'
+                    or not task.get('runner_pid') or not binding['launch_id']
+                    or not cap.get('accepting') or any(cap.get(k) != v for k,v in binding.items())):
+                raise ValueError('Native dialogue unsupported: no live bound owner input capability')
+            question = None
+            if question_id is not None:
+                if question_id not in task.get('questions', []):
+                    raise ValueError('dialogue requires an unanswered question_id')
+                row = db.execute('SELECT data FROM events WHERE task=? AND token=?', (task_id, question_id)).fetchone()
+                event = json.loads(row[0]) if row else {}
+                if event.get('kind') != 'question' or event.get('turn', task['turn']) != task['turn']:
+                    raise ValueError('Original question event unavailable; do not guess answer binding')
+                question = dict(id=question_id, label=event.get('question_label'),
+                    interaction_seq=event.get('interaction_seq', 0), text=event['text'],
+                    sha256=event.get('question_sha256'), length=event.get('question_length'))
+                if any(c.get('kind') == 'dialogue' and c.get('question_id') == question_id
+                       and c.get('status') in {'accepted', 'claimed', 'send_started', 'returned'} for c in commands.values()):
+                    raise ValueError('Question already has an admitted answer')
+            seq = task.get('native_interaction_next', task.get('interaction_seq', 0))+1
+            task['native_interaction_next'] = seq
+            commands[command_id] = dict(kind='dialogue', command_id=command_id, intent=intent,
+                prompt=prompt, question_id=question_id, question=question, status='accepted', interaction_seq=seq, **binding)
+            self._save(db, task)
+        return task
+
+    def _native_owned(self, db, task_id, turn, launch_id, epoch):
+        task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
+        if (self._native_binding(task) != dict(turn=turn, launch_id=launch_id, epoch=epoch)
+                or task.get('release_epoch') or task['state'] not in {'running', 'cancelling'}):
+            raise ValueError('Native owner identity is stale or fenced')
+        return task
+
+    def native_prompt_begin(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task=self._native_owned(db,task_id,turn,launch_id,epoch)
+            if task['state']!='running': return False
+            task.update(native_phase='foreground',native_prompt_submitted=True)
+            self._save(db,task)
+            return True
+
+    def native_cleanup_owner(self, task_id, turn, launch_id, epoch):
+        token = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            db.execute('CREATE TABLE IF NOT EXISTS native_cleanup_receipts (task TEXT, turn INTEGER, launch TEXT, epoch INTEGER, token_hash TEXT, receipt TEXT, PRIMARY KEY(task,turn,launch,epoch))')
+            db.execute('INSERT INTO native_cleanup_receipts VALUES (?,?,?,?,?,?)',
+                (task_id, turn, launch_id, epoch, hashlib.sha256(token.encode()).hexdigest(), '{}'))
+        return token
+
+    def native_cancel_seal(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            if task['state'] != 'cancelling':
+                raise ValueError('Native cancellation not requested')
+            task.setdefault('native_input', {})['accepting'] = False
+            task.setdefault('native_cancel_id', uuid.uuid4().hex)
+            for entry in task.get('commands', {}).values():
+                if entry.get('kind')=='dialogue' and entry.get('status')=='accepted':
+                    entry['status']='not_sent'
+            self._save(db, task)
+        return task
+
+    def native_cancel_cleanup_state(self, task_id, turn, launch_id, epoch, cancel_id, status, workers):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task=self._native_owned(db,task_id,turn,launch_id,epoch)
+            if task['state']!='cancelling' or task.get('native_cancel_id')!=cancel_id:
+                raise ValueError('Native cleanup cancellation identity changed')
+            previous=task.get('native_cancel_cleanup')
+            if status=='send_started':
+                if previous: raise ValueError('Native cancellation cleanup already attempted; no replay')
+            elif (status not in {'returned','unknown'} or not previous or previous['status']!='send_started'
+                    or previous['cancel_id']!=cancel_id or previous['workers']!=workers):
+                raise ValueError('Native cleanup send transition invalid')
+            task['native_cancel_cleanup']=dict(task=task_id,session_id=task.get('native_session_id'),
+                turn=turn,launch_id=launch_id,epoch=epoch,cancel_id=cancel_id,status=status,workers=workers)
+            self._save(db,task)
+
+    def native_cleanup_commit(self, task_id, turn, launch_id, epoch, token, receipt):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            row = db.execute('SELECT token_hash,receipt FROM native_cleanup_receipts WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                (task_id,turn,launch_id,epoch)).fetchone()
+            if (not row or row['token_hash'] != hashlib.sha256(token.encode()).hexdigest() or row['receipt'] != '{}'
+                    or any(receipt.get(k)!=v for k,v in dict(task=task_id,turn=turn,launch_id=launch_id,epoch=epoch,
+                        session_id=task.get('native_session_id')).items()) or receipt.get('session_unloaded') is not True):
+                raise ValueError('Native cleanup owner evidence mismatch')
+            if receipt.get('kind')=='verified-cancellation' and (task['state']!='cancelling'
+                    or task.get('native_cancel_id')!=receipt.get('cancel_id')):
+                raise ValueError('Native cleanup cancel intent mismatch')
+            task['native_cleanup'] = receipt
+            db.execute('UPDATE native_cleanup_receipts SET receipt=? WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                (json.dumps(receipt),task_id,turn,launch_id,epoch))
+            self._save(db, task)
+            if receipt.get('kind')=='verified-cancellation':
+                task.setdefault('native_input',{})['accepting']=False
+                if task.get('native_observation'): task['native_observation']['input_available']=False
+                task['native_phase']='cancelled'
+            if receipt.get('kind')=='verified-cancellation':
+                self._finish_turn(db,task,'cancelled',0,'cancelled',
+                    'Cancellation cleanup verified; business result not claimed')
+
+    def native_owner_diagnostics(self, task_id, turn, launch_id, epoch, **diagnostic):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
+            if (self._native_binding(task)!=dict(turn=turn,launch_id=launch_id,epoch=epoch)
+                    or task['state']=='closed' or task.get('release_epoch')): return False
+            task.update(diagnostic)
+            self._save(db,task)
+            return True
+
+    def native_cancel_notice(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_cleanup_receipts'").fetchone(): return None
+            row=db.execute('SELECT receipt FROM native_cleanup_receipts WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                (task_id,turn,launch_id,epoch)).fetchone()
+            if not row or json.loads(row[0]).get('kind')!='verified-cancellation': return None
+            event_row=db.execute('SELECT rowid,data FROM events WHERE task=? AND token=?',
+                (task_id,str(turn)+':settled')).fetchone()
+            if not event_row: return None
+            event=json.loads(event_row['data'])
+            if event.get('kind')!='cancelled': return None
+            db.execute('CREATE TABLE IF NOT EXISTS native_cancel_notices (task TEXT, turn INTEGER, launch TEXT, epoch INTEGER, PRIMARY KEY(task,turn,launch,epoch))')
+            claimed=db.execute('INSERT OR IGNORE INTO native_cancel_notices VALUES (?,?,?,?)',(task_id,turn,launch_id,epoch))
+            if not claimed.rowcount: return None
+            return dict(seq=event_row['rowid'],**event)
+
+    @staticmethod
+    def native_cleanup_verified(db, task):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_cleanup_receipts'").fetchone():
+            return None
+        row = db.execute('SELECT receipt FROM native_cleanup_receipts WHERE task=? AND turn=? AND launch=? AND epoch=?',
+            (task['id'],task['turn'],task.get('launch_id'),task.get('control_epoch',1))).fetchone()
+        receipt = json.loads(row[0]) if row else {}
+        if (not receipt or receipt != task.get('native_cleanup') or receipt.get('session_id')!=task.get('native_session_id')
+                or receipt.get('session_unloaded') is not True):
+            return None
+        return receipt
+
+    def native_input_open(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            if task['state']=='cancelling':
+                return
+            if task.get('native_input'):
+                raise ValueError('Native input owner already registered; do not replay')
+            task.update(native_input=dict(accepting=True, **self._native_binding(task)), interaction_seq=0, native_interaction_next=0)
+            self._save(db, task)
+
+    def native_dialogue_claim(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            if task['state'] != 'running' or not task.get('native_input', {}).get('accepting'):
+                return None
+            commands = [c for c in task.get('commands', {}).values() if c.get('kind') == 'dialogue'
+                        and all(c.get(k) == v for k,v in self._native_binding(task).items())]
+            if any(c['status'] in {'claimed', 'send_started', 'unknown'} for c in commands):
+                return None
+            entry = next((c for c in commands if c['status'] == 'accepted'), None)
+            if entry is None:
+                return None
+            entry['status'] = 'claimed'
+            task['interaction_seq'] = entry['interaction_seq']
+            task.pop('native_result', None)
+            self._save(db, task)
+            return dict(entry)
+
+    def native_dialogue_state(self, task_id, turn, launch_id, epoch, command_id, status):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            entry = task['commands'][command_id]
+            expected = {'send_started':'claimed', 'returned':'send_started', 'cancelled':'send_started'}
+            if (status not in expected or entry['status'] != expected[status]
+                    or (status == 'send_started' and task['state'] != 'running')
+                    or any(entry.get(k) != v for k,v in self._native_binding(task).items())):
+                raise ValueError('Native dialogue transition is stale')
+            entry['status'] = status
+            if status == 'returned' and entry.get('question_id') in task.get('questions', []):
+                question = entry['question_id']
+                task.setdefault('answers', {})[question] = entry['prompt']
+                task['questions'].remove(question)
+                task['question_id'] = task['questions'][0] if task['questions'] else ''
+            self._save(db, task)
+
+    def native_input_seal(self, task_id, turn, launch_id, epoch, interaction_seq):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            if (task['state'] != 'running' or task.get('interaction_seq', 0) != interaction_seq
+                    or task.get('questions') or any(c.get('kind') == 'dialogue'
+                        and c.get('turn') == turn and c['status'] in {'accepted','claimed','send_started','unknown'}
+                        for c in task.get('commands', {}).values())):
+                return False
+            task['native_input']['accepting'] = False
+            task['native_input']['settling'] = True
+            self._save(db, task)
+            return True
+
+    def native_input_end(self, task_id, turn, launch_id, epoch):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            task.setdefault('native_input', {})['accepting'] = False
+            if task.get('native_observation'):
+                task['native_observation']['input_available'] = False
+            for entry in task.get('commands', {}).values():
+                if entry.get('kind') == 'dialogue' and all(entry.get(k) == v for k,v in self._native_binding(task).items()):
+                    if entry['status'] in {'claimed','send_started'}:
+                        entry['status'] = 'unknown'
+                    elif entry['status'] == 'accepted':
+                        entry['status'] = 'not_sent'
+            self._save(db, task)
 
     def reply(self, task_id, origin, question_id, prompt, *, clear_timeout=False, require_question=False,
               expected_turn=None, command_id=None):
@@ -305,6 +565,8 @@ class Store:
                         or commands[command_id].get('expected_turn') != expected_turn):
                     raise ValueError('command_id already used with different parameters')
                 return task, False
+            if task.get('agy_swarm')=='native' and task['state']=='running' and task.get('native_input',{}).get('settling'):
+                raise ValueError('Native owner is settling; inspect final outcome before intervention')
             self._check_intent(task, expected_turn)
             self._admit_controller(task, origin, expected_turn, command_id)
             if task.get('intervention', {}).get('status') == 'pending':
@@ -361,6 +623,8 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=self._owned(db,task_id,origin)
+            if task.get('agy_swarm')=='native' and task['state']=='running' and task.get('native_input',{}).get('settling'):
+                raise ValueError('Native owner is settling; inspect final outcome before cancellation')
             entry = task.get('intervention', {})
             if entry.get('status') in {'pending', 'queued'}:
                 entry['status'] = 'withdrawn'
@@ -368,6 +632,9 @@ class Store:
             task.pop('clear_timeout_pending', None)
             if task['state']=='queued':task.update(state='cancelled',prompt='')
             elif task['state']=='running':task['state']='cancelling'
+            if task.get('agy_swarm')=='native' and task['state']=='cancelling':
+                task.setdefault('native_input', {})['accepting']=False
+                task.setdefault('native_cancel_id',uuid.uuid4().hex)
             self._save(db,task)
         return task
 
@@ -402,41 +669,42 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
             if task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
-            if state=='completed' and task['question_id']:state='waiting_reply'
-            task.update(state=state,exit_code=rc,stop_reason=stop_reason,runner_pid=0,prompt='')
-            status = ('target_completed' if state in {'completed', 'waiting_reply'}
-                      and rc == 0 and stop_reason == 'end_turn' else
-                      'target_cancelled' if state == 'cancelled' else 'target_unknown')
-            self._target_commands(task, status)
-            if task.get('skills'):
-                reports = task.get('skill_reports', {}).get(str(turn), {})
-                task['skill_report_missing'] = [s['id'] for s in task['skills']
-                                                if s['mode'] == 'required' and s['id'] not in reports]
-                task['skill_verification'] = 'unverified' if task['skill_report_missing'] else 'reported'
-            # Per-turn: never carry an earlier turn's diagnosis forward.
-            task.pop('settlement_note',None)
-            if note:task['settlement_note']=note
-            # Persist before another caller can advance the turn or close the task.
-            event = dict(token=str(turn)+':settled', kind=state,
-                         text=(text if text is not None else note or 'Prompt exited '+str(rc))[:8000],
-                         turn=turn, question_ids=task.get('questions', []), answer_tail=answer_tail)
-            try:
-                from .recovery import recovery_card
-            except ImportError:
-                from recovery import recovery_card
-            event['recovery'] = recovery_card(task, self.path)
-            if task.get('intervention', {}).get('status') == 'pending':
-                event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
-            if state == 'unknown' and task['agent'] == 'agy':
-                event.update(attention_required=True, notification_scope='originating-session',
-                             next_action='AGY outcome unknown. Inspect this exact task and artifacts now; preserve HOLD. '
-                                         'Do not replay automatically; reconcile before any authorized continuation.',
-                             delivery='event-generated; host receipt and consumption unverified')
-            inserted = db.execute('INSERT INTO events VALUES (?,?,?)',
-                                  (task_id, event['token'], json.dumps(event)))
-            event['seq'] = inserted.lastrowid
-            event['recovery']['seq'] = inserted.lastrowid
-            self._save(db,task)
+            return self._finish_turn(db,task,state,rc,stop_reason,note,text=text,answer_tail=answer_tail)
+
+    def _finish_turn(self,db,task,state,rc,stop_reason,note=None,*,text=None,answer_tail=''):
+        task_id,turn=task['id'],task['turn']
+        if state=='completed' and task['question_id']:state='waiting_reply'
+        task.update(state=state,exit_code=rc,stop_reason=stop_reason,runner_pid=0,prompt='')
+        status = ('target_completed' if state in {'completed', 'waiting_reply'}
+                  and rc == 0 and stop_reason == 'end_turn' else
+                  'target_cancelled' if state == 'cancelled' else 'target_unknown')
+        self._target_commands(task, status)
+        if task.get('skills'):
+            reports = task.get('skill_reports', {}).get(str(turn), {})
+            task['skill_report_missing'] = [s['id'] for s in task['skills']
+                                            if s['mode'] == 'required' and s['id'] not in reports]
+            task['skill_verification'] = 'unverified' if task['skill_report_missing'] else 'reported'
+        task.pop('settlement_note',None)
+        if note:task['settlement_note']=note
+        event = dict(token=str(turn)+':settled', kind=state,
+                     text=(text if text is not None else note or 'Prompt exited '+str(rc))[:8000],
+                     turn=turn, question_ids=task.get('questions', []), answer_tail=answer_tail)
+        try:
+            from .recovery import recovery_card
+        except ImportError:
+            from recovery import recovery_card
+        event['recovery'] = recovery_card(task, self.path)
+        if task.get('intervention', {}).get('status') == 'pending':
+            event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
+        if state == 'unknown' and task['agent'] in {'agy','omp'}:
+            event.update(attention_required=True, notification_scope='originating-session',
+                         next_action=task['agent'].upper()+' outcome unknown. Inspect this exact task and artifacts now; preserve HOLD. '
+                                     'Do not replay automatically; reconcile before any authorized continuation.',
+                         delivery='event-generated; host receipt and consumption unverified')
+        inserted = db.execute('INSERT INTO events VALUES (?,?,?)',(task_id,event['token'],json.dumps(event)))
+        event['seq'] = inserted.lastrowid
+        event['recovery']['seq'] = inserted.lastrowid
+        self._save(db,task)
         return event
 
     def events(self, task_id, origin, after=0):

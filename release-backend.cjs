@@ -2,14 +2,34 @@
 // Public Shared Runtime only. Never load authentication or submit/resume a turn.
 const {loadRuntime} = require('./shared-prompt.cjs');
 
+async function withRuntime(target, deps, operation, body) {
+  let runtime, primary;
+  const context = {operation, stage:'load', substep:'load_runtime'};
+  try {
+    const sdk = await (deps.loadRuntime ?? loadRuntime)('0.22.0');
+    context.stage='registry'; context.substep='create_registry';
+    const agentRegistry=sdk.createAgentRegistry({overrides:{omp:'omp acp'}});
+    context.stage='create'; context.substep='create_runtime';
+    runtime=sdk.createSharedAcpRuntime({cwd:target.cwd,agentRegistry,
+      permissionMode:'approve-reads',nonInteractivePermissions:'deny',authCredentials:{},authPolicy:'skip',timeoutMs:15000});
+    return await body(runtime, context);
+  } catch (error) {
+    primary=error instanceof Error ? error : Error('BACKEND_FAILURE');
+    Object.assign(primary,context);
+    throw primary;
+  } finally {
+    if (runtime) {
+      try {await runtime.shutdown();}
+      catch (error) {
+        const failure={name:error instanceof Error ? error.name : 'Error'};
+        if(primary) primary.shutdownFailure=failure;
+        else throw Object.assign(Error('SHUTDOWN_FAILED'),{operation,stage:'shutdown',substep:'shutdown',name:failure.name});
+      }
+    }
+  }
+}
 async function closeTarget(target, deps = {}) {
-  const sdk = await (deps.loadRuntime ?? loadRuntime)('0.22.0');
-  // Shared Runtime does not load CLI agents configuration. Match the documented
-  // OMP entry without reading auth/config or weakening the exact scoped lookup.
-  const agentRegistry = sdk.createAgentRegistry({overrides: {omp: 'omp acp'}});
-  const runtime = sdk.createSharedAcpRuntime({cwd: target.cwd, agentRegistry,
-    permissionMode: 'approve-reads', nonInteractivePermissions: 'deny',
-    authCredentials: {}, authPolicy: 'skip', timeoutMs: 15000});
+  return withRuntime(target,deps,'close',async(runtime,context)=>{
   const handle = {backend: 'acpx-shared', acpxRecordId: target.record,
     runtimeSessionName: target.record, sessionKey: target.session, cwd: target.cwd};
   function exact(status, closed) {
@@ -17,20 +37,22 @@ async function closeTarget(target, deps = {}) {
         status.details?.cwd !== target.cwd || status.details.closed !== closed ||
         status.lastRequestId !== (target.request_id ?? `${target.task}:${target.turn}`)) throw Error('RECORD_BINDING_MISMATCH');
   }
-  let stage = 'resolve';
-  try {
+  context.stage='resolve'; context.substep='status_before';
     const before = await runtime.getStatus({handle});
     exact(before, false);
+    context.substep='find_before';
     const selected = await runtime.findSession({sessionKey: target.session, agent: target.agent, cwd: target.cwd});
     if (selected?.acpxRecordId !== target.record || selected.backendSessionId !== target.acp
         || selected.cwd !== target.cwd || selected.sessionKey !== target.session) throw Error('NAME_SCOPE_MISMATCH');
-    stage = 'close';
+    context.stage='close'; context.substep='close';
     await runtime.close({handle, reason: 'operator-release-only'});
-    stage = 'verify';
+    context.stage='verify'; context.substep='status_after';
     const after = await runtime.getStatus({handle});
     exact(after, true);
+    context.substep='find_after';
     const active = await runtime.findSession({sessionKey: target.session, agent: target.agent, cwd: target.cwd});
     if (active !== undefined) throw Error('NAME_SCOPE_REPLACED_OR_REOPENED');
+    context.substep='status_confirm';
     exact(await runtime.getStatus({handle}), true);
     const binding = {acpxRecordId: target.record, acpxSessionId: target.acp,
       session: target.session, agent: target.agent, cwd: target.cwd};
@@ -41,17 +63,10 @@ async function closeTarget(target, deps = {}) {
         source: 'shared-runtime-findSession-undefined'},
       execution: {source: 'supported-record-close-and-session-turn-lock',
         scope: 'acpx-managed-execution', arbitraryDetachedDescendantsProven: false}};
-  } catch (error) {
-    error.stage = stage;
-    throw error;
-  } finally {await runtime.shutdown();}
+  });
 }
 async function probeTarget(target, deps = {}, resolve = false) {
-  const sdk = await (deps.loadRuntime ?? loadRuntime)('0.22.0');
-  const agentRegistry = sdk.createAgentRegistry({overrides:{omp:'omp acp'}});
-  const runtime = sdk.createSharedAcpRuntime({cwd:target.cwd,agentRegistry,
-    permissionMode:'approve-reads',nonInteractivePermissions:'deny',
-    authCredentials:{},authPolicy:'skip',timeoutMs:15000});
+  return withRuntime(target,deps,resolve ? 'resolve' : 'probe',async(runtime,context)=>{
   const handle = {backend:'acpx-shared',acpxRecordId:target.record,
     runtimeSessionName:target.record,sessionKey:target.session,cwd:target.cwd};
   function exact(status) {
@@ -59,7 +74,7 @@ async function probeTarget(target, deps = {}, resolve = false) {
         status.details?.cwd !== target.cwd || status.details.closed !== true ||
         status.lastRequestId !== (target.request_id ?? `${target.task}:${target.turn}`)) throw Error('RECORD_BINDING_MISMATCH');
   }
-  try {
+  context.stage=resolve ? 'resolve' : 'probe'; context.substep='status';
     if (resolve) {
       const status = await runtime.getStatus({handle});
       if (status?.acpxRecordId !== target.record || status.details?.cwd !== target.cwd ||
@@ -68,17 +83,16 @@ async function probeTarget(target, deps = {}, resolve = false) {
       return {acp:status.backendSessionId};
     }
     exact(await runtime.getStatus({handle}));
+    context.substep='find_session';
     const selected = await runtime.findSession({sessionKey:target.session,agent:target.agent,cwd:target.cwd});
     if (selected !== undefined) throw Error('NAME_SCOPE_REPLACED_OR_REOPENED');
+    context.substep='status_confirm';
     exact(await runtime.getStatus({handle}));
     return {verified:true,binding:{acpxRecordId:target.record,acpxSessionId:target.acp,
       session:target.session,agent:target.agent,cwd:target.cwd},
       record:{closed:true,lastRequestId:(target.request_id ?? `${target.task}:${target.turn}`)},status:'no-session',
       source:'shared-runtime-exact-record-probe',arbitraryDetachedDescendantsProven:false};
-  } catch (error) {
-    error.stage = resolve ? 'resolve' : 'probe';
-    throw error;
-  } finally {await runtime.shutdown();}
+  });
 }
 module.exports = {closeTarget, probeTarget};
 if (require.main === module) {
@@ -91,8 +105,11 @@ if (require.main === module) {
   }).catch(error => {
     const reason = ['RECORD_BINDING_MISMATCH','NAME_SCOPE_MISMATCH','NAME_SCOPE_REPLACED_OR_REOPENED'].includes(error.message)
       ? error.message.toLowerCase() : 'backend_unavailable';
-    const stage = ['resolve','close','verify','probe'].includes(error.stage) ? error.stage : 'resolve';
-    process.stdout.write(JSON.stringify({action:'release_unknown',stage,reason_code:reason})+'\n');
+    const stage = ['load','registry','create','resolve','close','verify','probe','shutdown'].includes(error.stage) ? error.stage : 'resolve';
+    const safe=value=>typeof value==='string' && /^[A-Za-z0-9_]{1,80}$/.test(value) ? value : undefined;
+    process.stdout.write(JSON.stringify({action:'release_unknown',operation,stage,reason_code:reason,
+      substep:safe(error.substep),error_name:safe(error.name),error_code:safe(error.code),
+      shutdown_failure:error.shutdownFailure ? {error_name:safe(error.shutdownFailure.name)} : undefined})+'\n');
     process.exitCode = 1;
   });
 }

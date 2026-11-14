@@ -24,6 +24,24 @@ class ClosedFenceTests(unittest.TestCase):
                 store.update(tid, state='running')
             self.assertEqual(store.get(tid, owner), before)
 
+    def test_native_backend_transport_diagnostics_keep_operation_stage_without_private_text(self):
+        from release import NativeBackend, BackendFailure
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import subprocess
+        cases=[(OSError('PRIVATE'), 'spawn'), (subprocess.TimeoutExpired('PRIVATE',45), 'timeout'),
+            (SimpleNamespace(returncode=2,stdout=b'bad',stderr=b'PRIVATE'), 'parse'),
+            (SimpleNamespace(returncode=1,stdout=b'{"stage":"load","substep":"load_runtime","reason_code":"backend_unavailable","error_name":"Error"}',stderr=b'PRIVATE'), 'load')]
+        for outcome, stage in cases:
+            kwargs={'side_effect':outcome} if isinstance(outcome,Exception) else {'return_value':outcome}
+            with self.subTest(stage=stage), patch('subprocess.run',**kwargs):
+                try: NativeBackend().resolve({})
+                except BackendFailure as exc:
+                    self.assertEqual(exc.stage,stage)
+                    self.assertEqual(exc.diagnostic['operation'],'resolve')
+                    self.assertNotIn('PRIVATE',str(exc.diagnostic))
+                else:self.fail('Backend failure was not classified')
+
 
     def test_durable_release_fence_blocks_preloaded_sql_writer(self):
         import json

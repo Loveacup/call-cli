@@ -32,8 +32,8 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 1. 调用 `wait --task TASK_ID --after CURSOR --timeout 5`，接续返回游标。
 2. 结合 task.state、turn、公开阶段、工具状态和产物判断进展；只向用户汇报实质变化、阻塞或决策。静默不等于失败。
    收到 stage + quiet_notice 的复核请求时读取精确 task/turn/seq 和真实现状，选择继续等待、明确介入或取消；静默/持续活跃共享每 600s 一次冷却。复核供协调者内部判断，不必逐条转给用户；不自动取消/关闭/续跑，事件可读不代表已消费。CLI 依赖活跃 owner 持续 wait，owner 消失不保证及时介入或终止。
-3. 收到问题后使用 `reply --task TASK_ID --question-id TOKEN --prompt ANSWER`。发起 CLI 自行回答或征询用户，再消费后续结果；测试脚本不能绕开发起 CLI 代答。
-4. 发起端依据进展主动纠偏，或消费用户在其自身原生输入通道送入的新要求后，使用 `intervene --task TASK_ID --command-id UNIQUE_ID --prompt REVISION`。
+3. 收到问题后保存完整身份及准确 token；既有 ACPX 路径使用 `reply --task TASK_ID --question-id TOKEN --prompt ANSWER`。native AGY 新 owner 有输入能力时用 `dialogue`，必填 expected_turn、稳定 command_id，回答另传 question_id；原 owner 串行接收，不改变 task.turn。缺能力报告 unsupported 并保留占用，不走取消续轮冒充回答。
+4. 发起端依据进展主动纠偏，或消费用户在其自身原生输入通道送入的新要求后，按真实能力选择动作。既有 `intervene --task TASK_ID --command-id UNIQUE_ID --prompt REVISION` 保持 cancel+resume，不自动转换为 AGY dialogue。
 5. 继续短 wait，区分请求收到、排队与对应轮次已执行。pending／queued 是提交阶段，不是生效证明；重试提交沿用同一个 command_id，不另造一次业务执行。
 
 有界等待必须包含 CLI 初始化、数据库连接与锁竞争，不只限制循环内 sleep。遇锁可明确返回 busy；不可读时返回空状态，不伪造 queued。零等待并发调用可能全部 busy，验收应要求随后一次非竞争有界调用可推进且不重复启动，而不是假定每次探针都取得写锁。
@@ -54,8 +54,12 @@ ACPX 0.22.0 Shared Runtime 的公开 startTurn 明确拒绝 steer；同版 in-pr
 
 当前命令记录的 pending/queued 只证明保存与排队；target_started 只证明 runner 已领取精确 target_turn，target_completed 只证明该轮 exit 0 / end_turn 正常结算（可仍有问题待答），不证明模型理解或业务生效。target_cancelled / target_unknown 不表示成功，后者不自动重放；superseded / withdrawn 分别表示领取前被替换／主动撤回。修订相关回答／产物及独立读回才支持已生效；完整状态合同见[调用手册](../../docs/usage.md#执行中主动改向或传达用户要求)。status/events（Hermes）或 wait（通用）会在旧轮结算后推进已授权介入；不能只收到取消回执就停止消费。问题回复与新 turn 完成监控由原协调者继续承接，同一 controller command_id 不因问题多轮而重派。
 
+AGY native 自动观察仅 load，不发 nudge。源码候选公开 `dialogue`，按实际 launch/turn/epoch 能力准入，前台未返回只排队、完整 load 后串行 prompt，不取消。`task.turn` 不变、interaction_seq 单调递增、session roster 保留，旧输入结果不能结算新输入。accepted/claimed/send_started/returned 分别是受理／领取／可能发送／前台返回，不等于 worker 已采用；unknown 不重放，not_sent 不自动补发。缺能力的旧 owner 明确拒绝；候选不代表现役安装已加载。
+
+
 - 将取消受理与执行终止分开判断：prompt 的成功退出、无协议错误及有效 stopReason 才构成该实现的结算证据。SSH EOF、exit255、缺终止协议不能转成 cancelled 后自动启动下一轮，因为远端旧轮可能仍活着。
 - 以事务和 turn/state 条件保护取消、续轮与关闭；只记录取消期间的问题，不让问题提前开放下一轮。旧轮迟到事件不能覆盖新轮。
+- OMP/AGY unknown 提醒必须按精确 task/turn/seq 读回原事件、settlement_note 和 recovery card，再决定合法对账或升级；stage-only 不是成功，不因提醒自动重放。候选复用原 runner 通知，OMP 发起扩展对同轮 snapshot/迟到终态只提醒一次。Hermes status/events 由当前 controller 消费后才推进已结算的 pending intervene；确认 target_turn 实际启动、结果体现修订，再收尾，unknown/HOLD 不续派。通知生成或 followUp 排队不等于真人收到或模型已经行动。
 - 分别记录会话创建是否尝试和是否成功；只有明确未尝试创建的路径才能跳过远端关闭，不能把“未记录成功”解释成“未发生”。
 - 对需要跨短命 shell 调用继续运行的有界 worker，使用独立进程会话并保留超时与精确清理责任，防止工具回收进程组时让任务永远停在 queued；不要因此创建常驻 daemon 或免除生命周期 owner。
 

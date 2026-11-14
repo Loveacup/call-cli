@@ -6,12 +6,12 @@ import subprocess
 import time
 
 try:
-    from .events import EventDecoder, safe_tool_id, safe_tool_name
+    from .events import EventDecoder, safe_tool_id, safe_tool_name, safe_tool_kind
     from .transport import command, protocol_prompt
     from .skills import stage, guidance
     from .updates import device_lock
 except ImportError:
-    from events import EventDecoder, safe_tool_id, safe_tool_name
+    from events import EventDecoder, safe_tool_id, safe_tool_name, safe_tool_kind
     from transport import command, protocol_prompt
     from skills import stage, guidance
     from updates import device_lock
@@ -53,10 +53,12 @@ class NativeOwner:
         updates = []
         deadline = time.monotonic()+timeout if timeout is not None else None
         cancel_sent = False
+        self.request_cancel_sent = False
         while True:
             if check_cancel and check_cancel() and not cancel_sent:
                 self.notify_cancel()
                 cancel_sent = True
+                self.request_cancel_sent = True
                 deadline = time.monotonic()+25
             if deadline is not None and time.monotonic() >= deadline:
                 raise ProtocolError('Native ACP control did not settle; effects unknown')
@@ -103,15 +105,28 @@ class NativeOwner:
             self.send(dict(id=frame['id'], error=dict(code=-32601, message='Client operation unavailable')))
             return
         params = frame.get('params', {})
-        if params.get('sessionId') != self.session_id:
-            raise ProtocolError('Permission session mismatch')
+        root = params.get('sessionId') == self.session_id
         tool = params.get('toolCall', {})
-        allow = self.task.get('agy_approval') == 'approve-all' or tool.get('kind') in {'read', 'search'}
+        allow = root and (self.task.get('agy_approval') == 'approve-all' or tool.get('kind') in {'read', 'search'})
         wanted = 'allow_once' if allow else 'reject_once'
-        option = next((o.get('optionId') for o in params.get('options', []) if o.get('kind') == wanted), None)
+        kinds = {'allow_once','allow_always','reject_once','reject_always'}
+        option_kinds = sorted({o.get('kind') for o in params.get('options', []) if o.get('kind') in kinds})
+        option = next((o.get('optionId') for o in params.get('options', []) if o.get('kind') == wanted), None) if root else None
         outcome = dict(outcome='selected', optionId=option) if option else dict(outcome='cancelled')
-        self.permission_decisions.append(dict(tool=safe_tool_id(tool.get('toolCallId')), allowed=allow and bool(option)))
-        self.send(dict(id=frame['id'], result=dict(outcome=outcome)))
+        diagnostic = dict(rpc_id=frame['id'] if type(frame.get('id')) is int else None,
+            scope='root' if root else 'foreign', tool=safe_tool_id(tool.get('toolCallId')),
+            kind=safe_tool_kind(tool.get('kind')), option_kinds=option_kinds, allowed=allow and bool(option),
+            choice=wanted if option else 'cancelled', reason=('foreign_session' if not root else
+                'selected' if option else wanted+'_unavailable'), response_sent_at=None)
+        self.permission_decisions.append(diagnostic)
+        try:
+            self.send(dict(id=frame['id'], result=dict(outcome=outcome)))
+            diagnostic['response_sent_at']=time.time()
+        except (OSError, ValueError):
+            diagnostic['send_error']='permission_response_failed'
+            raise ProtocolError('Permission response send failed; effects unknown') from None
+        if not root:
+            raise ProtocolError('Permission session mismatch')
 
     def initialize(self):
         info, _ = self.request('initialize', dict(protocolVersion=1,
@@ -137,6 +152,7 @@ class NativeOwner:
 
     def load(self):
         result, updates = self.request('session/load', dict(sessionId=self.session_id, **self.workspace()))
+        self.last_load_updates = updates
         if result.get('sessionId') != self.session_id:
             raise ProtocolError('Native load identity mismatch')
         return result, snapshot(updates)
@@ -148,23 +164,29 @@ class NativeOwner:
         efforts = {o.get('value') for o in config.get('thought_level', {}).get('options', [])}
         current_effort = config.get('thought_level', {}).get('currentValue')
         def resolve(requested, intent, effort=None):
-            if requested is None:
-                family = intent
-                level = effort or current_effort
-                exact = family+'-'+str(level)
-                if family not in families or exact not in catalog:
-                    raise ProtocolError('Default model intent cannot resolve in advertised catalog')
-                return exact, family, level
-            if requested not in catalog:
-                raise ProtocolError('Explicit model must be an exact advertised ID; no fallback or prompt')
-            pairs = [(family, level) for family in families for level in efforts
-                     if family+'-'+level == requested]
-            if len(pairs) != 1:
+            if requested in catalog:
+                pairs = [(family, level) for family in families for level in efforts
+                         if family+'-'+level == requested]
+                if len(pairs) != 1:
+                    raise ProtocolError('Exact model has no unambiguous advertised config mapping')
+                family, level = pairs[0]
+                if effort is not None and level != effort:
+                    raise ProtocolError('Explicit model and effort disagree')
+                return requested, family, level
+            family = requested if requested is not None else intent
+            level = effort if effort is not None else current_effort
+            if family not in families or level not in efforts:
+                raise ProtocolError('Model family or effort is not advertised; no fallback or prompt')
+            matches = [exact for exact in catalog if exact == family+'-'+str(level)]
+            if len(matches) != 1:
+                raise ProtocolError('Model family cannot resolve uniquely in advertised catalog')
+            exact = matches[0]
+            pairs = [(candidate, effort_value) for candidate in families for effort_value in efforts
+                     if candidate+'-'+effort_value == exact]
+            if pairs != [(family, level)]:
                 raise ProtocolError('Exact model has no unambiguous advertised config mapping')
-            family, level = pairs[0]
-            if effort is not None and level != effort:
-                raise ProtocolError('Explicit model and effort disagree')
-            return requested, family, level
+            return exact, family, level
+        requested = {key:self.task.get(key) for key in ('model', 'effort', 'agy_worker_model')}
         model, family, effort = resolve(self.task.get('model'), 'gemini-4-carbon', self.task.get('effort'))
         worker, _, _ = resolve(self.task.get('agy_worker_model'), 'gemini-4-hydrogen')
         self.model_config_value = family
@@ -177,9 +199,14 @@ class NativeOwner:
                 or actual.get('thought_level', {}).get('currentValue') != effort):
             raise ProtocolError('Native exact coordinator selection readback mismatch')
         self.task.update(model=model, effort=effort, agy_worker_model=worker)
-        return dict(model=model, effort=effort, agy_worker_model=worker)
+        return dict(model=model, effort=effort, agy_worker_model=worker,
+                    native_selection=dict(requested=requested,
+                        resolved=dict(model=model, effort=effort, agy_worker_model=worker), readback_verified=True))
 
     def close_session(self):
+        if getattr(self,'close_attempted',False):
+            raise ProtocolError('Native unload already attempted; reconcile existing evidence, no close replay')
+        self.close_attempted=True
         self.request('session/close', dict(sessionId=self.session_id))
         try:
             self.request('session/set_config_option', dict(sessionId=self.session_id, configId='model', value=self.model_config_value))
@@ -189,19 +216,30 @@ class NativeOwner:
             raise
         raise ProtocolError('Native session unload not independently confirmed')
 
-    def stop(self):
+    def stop(self, *, force=True):
         self.poller.close()
         self.proc.stdin.close()
+        kind = 'natural'
         try:
             self.proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
+            if not force:
+                self.proc.stdout.close()
+                return dict(kind='stdio-closed-exit-unverified',returncode=self.proc.returncode,
+                    pid=self.proc.pid,forced=False,recovery='unsupported-exit-unproven-no-owner',worker_fate='unknown')
+            kind = 'terminate-fallback'
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
+                kind = 'kill-fallback'
                 self.proc.kill()
                 self.proc.wait(timeout=2)
         self.proc.stdout.close()
+        if not force:
+            return dict(kind=kind,returncode=self.proc.returncode,pid=self.proc.pid,
+                forced=False,recovery='unsupported-owner-exited',worker_fate='unknown')
+        return dict(kind=kind, returncode=self.proc.returncode)
 
 
 def normalize(update):
@@ -214,14 +252,20 @@ def normalize(update):
     if kind not in {'tool_call', 'tool_call_update'}:
         return None
     value = dict(sessionUpdate='tool_call', toolCallId=safe_tool_id(update.get('toolCallId')))
+    value['tool_event'] = kind
     if 'name' in update or 'title' in update:
         value['title'] = safe_tool_name(update.get('name') or update.get('title'))
     for key in ('kind', 'status'):
         if key in update:
             value[key] = update[key]
     args = update.get('args', update.get('rawInput', {}))
+    if value.get('title')=='swarm' or kind=='tool_call_update':
+        value['status_args_invalid'] = (not isinstance(args,dict) or
+            any(k not in {'action','name'} or not isinstance(v,str) for k,v in args.items()))
     if value.get('title') == 'swarm' and isinstance(args, dict):
         value['swarm'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
+    elif kind == 'tool_call_update' and isinstance(args, dict):
+        value['swarm_update'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
     return value
 
 
@@ -233,9 +277,17 @@ def snapshot(updates):
             if not key:
                 raise ProtocolError('Tool history omitted identity')
             if key in tools:
-                tools[key].update(value)
+                old=tools[key]
+                if 'kind' in value and 'kind' in old and value['kind']!=old['kind']:
+                    raise ProtocolError('Native tool identity changed; reconciliation required')
+                identity=value.get('swarm',value.get('swarm_update',{}) if 'swarm' in old else {})
+                if any(k in old.get('swarm',{}) and v!=old['swarm'][k] for k,v in identity.items()):
+                    raise ProtocolError('Native tool identity changed; reconciliation required')
+                if identity:
+                    old['swarm']=dict(old.get('swarm',{}),**identity)
+                old.update({k:v for k,v in value.items() if k not in {'tool_event','swarm','swarm_update','status_args_invalid'}})
             else:
-                tools[key] = dict(value)
+                tools[key] = {k:v for k,v in value.items() if k not in {'tool_event','swarm_update','status_args_invalid'}}
                 result.append(tools[key])
         elif result and result[-1]['sessionUpdate'] == value['sessionUpdate']:
             result[-1]['content']['text'] += value['content']['text']
@@ -253,9 +305,10 @@ def additions(previous, current):
         if old == new:
             continue
         if old['sessionUpdate'] == new['sessionUpdate'] == 'tool_call' and old['toolCallId'] == new['toolCallId']:
-            if any(old.get(k) != new.get(k) for k in ('title', 'kind', 'swarm')):
+            if any(old.get(k) != new.get(k) for k in ('kind', 'swarm')):
                 raise ProtocolError('Native tool history changed; reconciliation required')
-            changed.append(new)
+            if old.get('status') != new.get('status'):
+                changed.append(new)
         elif (index == len(previous)-1 and old['sessionUpdate'] == new['sessionUpdate']
               and old['sessionUpdate'] in {'agent_message_chunk', 'user_message_chunk'}
               and new['content']['text'].startswith(old['content']['text'])):
@@ -268,26 +321,43 @@ def additions(previous, current):
 
 def first_replay(published, replay):
     """Live deltas and persisted replay have different chunk/tool metadata shapes."""
-    tools = {e['toolCallId'] for e in published if e['sessionUpdate'] == 'tool_call'}
-    messages = [e['content']['text'] for e in published if e['sessionUpdate'] == 'agent_message_chunk']
+    tools = {e['toolCallId']: e for e in published if e['sessionUpdate'] == 'tool_call'}
+    messages = [e['content']['text'] for e in published
+                if e['sessionUpdate'] == 'agent_message_chunk' and e['content']['text']]
+    message_index, message_offset = 0, 0
     fresh = []
     for entry in replay:
-        if entry['sessionUpdate'] == 'user_message_chunk':
-            continue
         if entry['sessionUpdate'] == 'tool_call' and entry['toolCallId'] in tools:
+            old = tools[entry['toolCallId']]
+            merged = dict(old, **entry)
+            if any(merged.get(key) != old.get(key) for key in ('status', 'kind', 'swarm')):
+                fresh.append(merged)
             continue
         if entry['sessionUpdate'] == 'agent_message_chunk':
             text = entry['content']['text']
-            if text in messages:
-                messages.remove(text)  # One occurrence, never global text-hash dedupe.
+            consumed = 0
+            while consumed < len(text) and message_index < len(messages):
+                old = messages[message_index]
+                count = min(len(text)-consumed, len(old)-message_offset)
+                if text[consumed:consumed+count] != old[message_offset:message_offset+count]:
+                    raise ProtocolError('Native live message history changed; reconciliation required')
+                consumed += count
+                message_offset += count
+                if message_offset == len(old):
+                    message_index += 1
+                    message_offset = 0
+            if consumed == len(text):
                 continue
-            if messages and text.startswith(messages[0]):
-                entry = dict(sessionUpdate=entry['sessionUpdate'], content=dict(type='text', text=text[len(messages.pop(0)):]))
+            entry = dict(sessionUpdate=entry['sessionUpdate'], content=dict(type='text', text=text[consumed:]))
         fresh.append(entry)
+    if message_index != len(messages):
+        raise ProtocolError('Native live message history changed; reconciliation required')
     return fresh
 
 
 def completion(history, task, record_result=None, *, owner=None, baseline=None):
+    if task.get('questions') or task.get('question_id'):
+        return None
     workers, killed = {}, set()
     envelope = None
     legacy_attributed = False
@@ -313,6 +383,8 @@ def completion(history, task, record_result=None, *, owner=None, baseline=None):
                             explicit = candidate.get('turn') == task.get('turn')
                             legacy = 'turn' not in candidate and fresh_first_submission
                             if explicit or legacy:
+                                if task.get('interaction_seq', 0) and candidate.get('interaction_seq') != task['interaction_seq']:
+                                    continue
                                 envelope = candidate
                                 legacy_attributed = legacy
                     except ValueError:
@@ -335,6 +407,12 @@ def completion(history, task, record_result=None, *, owner=None, baseline=None):
     return sorted(workers)
 
 
+def pending_question(decoder):
+    line = decoder.pending.lstrip()
+    marker = 'CALLCLI_QUESTION '
+    return bool(line) and (line.startswith(marker.rstrip()) or marker.startswith(line))
+
+
 def brief(task, policy):
     return ('/swarm\n'+protocol_prompt(policy+guidance(task)+
         'Use native swarm, not another scheduler. You coordinate; explicitly select '+task['agy_worker_model']+
@@ -345,6 +423,47 @@ def brief(task, policy):
         'Only after acceptance and cleanup emit one line CALLCLI_RESULT with JSON fields task="'+task['id']+
         '", turn='+str(task.get('turn', 1))+', status="completed", result=<actual result>, workers=<complete worker name list>. '
         'The envelope is not independent cleanup proof. If blocked, report a numbered question or actual failure.\n\n'+task['prompt']))
+
+
+def cancellation_workers(known, history, model, *, require_kills=True):
+    known_adds = {e['toolCallId'] for e in known if e.get('swarm', {}).get('action')=='add'}
+    projected=snapshot(history)
+    status_ids={e['toolCallId'] for e in projected if e.get('swarm',{}).get('action')=='status'}
+    completed_kills = set()
+    seen_tools = set()
+    for entry in history:
+        if entry.get('sessionUpdate')=='tool_call':
+            ident=entry['toolCallId']
+            if ident in status_ids and entry.get('status_args_invalid'):
+                raise ProtocolError('Native swarm status parameters invalid; retain HOLD')
+            if entry.get('tool_event')=='tool_call_update':
+                if ident not in seen_tools and (entry.get('swarm') or entry.get('swarm_update')):
+                    raise ProtocolError('Cancellation identity update precedes tool call; unsupported ordering, retain HOLD')
+            else:
+                seen_tools.add(ident)
+        action = entry.get('swarm', {})
+        name = action.get('name')
+        if action.get('action')=='kill' and entry.get('status')=='completed':
+            completed_kills.add(name)
+        elif (action.get('action')=='add' and name in completed_kills
+                and entry.get('tool_event')!='tool_call_update'):
+            raise ProtocolError('Cancellation re-add generation ambiguous after kill; retain HOLD')
+    workers, killed = {}, set()
+    for entry in projected:
+        action = entry.get('swarm', {})
+        name = action.get('name')
+        if action.get('action') == 'add':
+            if (entry['toolCallId'] not in known_adds or not name or name in workers
+                    or entry.get('status')!='completed' or action.get('model')!=model):
+                raise ProtocolError('Cancellation roster changed or add/model incomplete; retain HOLD')
+            workers[name] = entry['toolCallId']
+        elif action.get('action') == 'kill':
+            if not name or name not in workers or entry.get('status')!='completed':
+                raise ProtocolError('Cancellation kill missing matching completed worker; retain HOLD')
+            killed.add(name)
+    if not workers or (require_kills and set(workers)!=killed):
+        raise ProtocolError('Cancellation lacks matching completed worker kills; retain HOLD')
+    return sorted(workers)
 
 
 def run_native(store, task, emit, policy):
@@ -365,11 +484,134 @@ def run_native(store, task, emit, policy):
         emit('version', json.dumps(checked))
     owner = None
     submitted = False
+    cleanup_token = None
+    baseline = None
+    foreground_ended = False
+    cancellation_unverified = False
     try:
         with device_lock(task):
             if store.get(task['id'])['state'] == 'cancelling':
                 return TurnResult('cancelled', 0, 'cancelled', 'Cancelled before native owner launch')
             owner = NativeOwner(task)
+            binding = (task['id'], task['turn'], task['launch_id'], task.get('control_epoch', 1))
+            cleanup_token = store.native_cleanup_owner(*binding)
+            def unload(context):
+                if getattr(owner,'close_attempted',False):
+                    raise ProtocolError('Native unload already attempted; retain existing observation, no replay')
+                observation=dict(task=task['id'],session_id=owner.session_id,turn=task['turn'],
+                    launch_id=task['launch_id'],epoch=task.get('control_epoch',1),context=context,
+                    attempted=True,verified=False,reason_code='unload_in_progress')
+                if not store.native_owner_diagnostics(*binding,native_unload_observation=observation):
+                    raise ProtocolError('Native unload owner identity stale; retain HOLD')
+                try:
+                    verified=owner.close_session()
+                except ProtocolError:
+                    observation['reason_code']='unload_unverified'
+                    store.native_owner_diagnostics(*binding,native_unload_observation=observation)
+                    raise
+                observation.update(verified=verified is True,reason_code='unload_verified' if verified is True else 'unload_unverified')
+                store.native_owner_diagnostics(*binding,native_unload_observation=observation)
+                return verified
+            def check_cancel():
+                if store.get(task['id'])['state']=='cancelling':
+                    store.native_cancel_seal(*binding)
+                    return True
+                return False
+            def cancel_cleanup(known, notify=True, first=False):
+                nonlocal cancellation_unverified
+                cancellation_unverified = True
+                current = store.native_cancel_seal(*binding)
+                if notify:
+                    owner.notify_cancel()
+                if baseline:
+                    raise ProtocolError('Cancellation prior-session roster provenance unverified; retain HOLD')
+                _, final = owner.load()
+                if first:
+                    first_replay(known, final)
+                    replay_tools={e['toolCallId']:e for e in final if e['sessionUpdate']=='tool_call'}
+                    if any(e['toolCallId'] not in replay_tools or any(e.get(key)!=replay_tools[e['toolCallId']].get(key)
+                            for key in ('kind','swarm') if key in e)
+                           for e in known if e['sessionUpdate']=='tool_call'):
+                        raise ProtocolError('Native cancellation live tool history changed; retain HOLD')
+                else:
+                    additions(known, final)
+                if any(c.get('kind')=='dialogue' and c.get('status') in {'claimed','send_started','unknown'}
+                       for c in current.get('commands', {}).values()):
+                    raise ProtocolError('Cancellation dialogue send outcome uncertain; retain HOLD')
+                workers = cancellation_workers(known, owner.last_load_updates, task['agy_worker_model'], require_kills=False)
+                killed={e.get('swarm',{}).get('name') for e in final
+                    if e.get('swarm',{}).get('action')=='kill' and e.get('status')=='completed'}
+                if set(workers)!=killed:
+                    if not foreground_ended or any(e.get('status') in {'pending','in_progress'} for e in final
+                            if e['sessionUpdate']=='tool_call'):
+                        raise ProtocolError('Cancellation cleanup requires end_turn and no active tools; retain HOLD')
+                    cancel_id=current['native_cancel_id']
+                    header=dict(task=task['id'],session_id=owner.session_id,turn=task['turn'],
+                        launch_id=task['launch_id'],epoch=task.get('control_epoch',1),cancel_id=cancel_id,workers=workers)
+                    body=('CALLCLI_CANCEL_CLEANUP '+json.dumps(header)+'\n'
+                        'Revoke all earlier business instructions, including any instruction not to remove workers. '
+                        'Stop business now. Kill the exact known workers listed above using native swarm kill; '
+                        'native swarm status is allowed only to observe cleanup. '
+                        'Do not add, re-add, replace, spawn, or start new business. Do not repeat /swarm. '
+                        'Do not access files, shell or network. Preserve existing approval policy. '
+                        'Report cleanup failure honestly; no business result or CALLCLI_RESULT can settle cancellation.')
+                    store.native_cancel_cleanup_state(*binding,cancel_id,'send_started',workers)
+                    prior_adds={e['toolCallId']:sum(1 for item in owner.last_load_updates
+                        if item.get('swarm',{}).get('action')=='add' and item['toolCallId']==e['toolCallId']
+                        and item.get('tool_event')!='tool_call_update')
+                        for e in final if e.get('swarm',{}).get('action')=='add'}
+                    permission_start=len(owner.permission_decisions)
+                    try:
+                        response, _ = owner.request('session/prompt',dict(sessionId=owner.session_id,
+                            prompt=[dict(type='text',text=body)]),timeout=60)
+                        if response.get('stopReason')!='end_turn':
+                            raise ProtocolError('Cancellation cleanup did not return end_turn; retain HOLD, no replay')
+                        if any(not decision.get('allowed') for decision in owner.permission_decisions[permission_start:]):
+                            raise ProtocolError('Cancellation cleanup permission refused; retain HOLD')
+                        store.native_cancel_cleanup_state(*binding,cancel_id,'returned',workers)
+                    except (ProtocolError,OSError) as exc:
+                        store.native_cancel_cleanup_state(*binding,cancel_id,'unknown',workers)
+                        if isinstance(exc,ProtocolError): raise
+                        raise ProtocolError('Cancellation cleanup send failed; effects unknown, no replay') from None
+                    _, cleaned = owner.load()
+                    for ident,count in prior_adds.items():
+                        if sum(1 for e in owner.last_load_updates if e.get('swarm',{}).get('action')=='add'
+                                and e['toolCallId']==ident and e.get('tool_event')!='tool_call_update')!=count:
+                            raise ProtocolError('Cancellation cleanup add/re-add generation changed; retain HOLD')
+                    delta=additions(final,cleaned)
+                    status_ids=set()
+                    seen_ids=set()
+                    for raw in owner.last_load_updates:
+                        if raw['sessionUpdate']!='tool_call' or raw['toolCallId'] in seen_ids:
+                            continue
+                        seen_ids.add(raw['toolCallId'])
+                        action=raw.get('swarm',{})
+                        if (raw.get('tool_event','tool_call')=='tool_call' and raw.get('title')=='swarm'
+                                and safe_tool_id(raw['toolCallId'])==raw['toolCallId'] and raw['toolCallId']
+                                and action.get('action')=='status' and set(action)<= {'action','name'}
+                                and ('name' not in action or action['name'] in workers)):
+                            status_ids.add(raw['toolCallId'])
+                    if any(e['sessionUpdate']=='tool_call' and not (
+                            (e.get('swarm',{}).get('action')=='kill' and e['swarm'].get('name') in workers)
+                            or (e['toolCallId'] in status_ids and e.get('swarm',{}).get('action')=='status'
+                                and set(e['swarm'])<= {'action','name'}
+                                and ('name' not in e['swarm'] or e['swarm']['name'] in workers)
+                                and e.get('kind') in {'other','read'} and e.get('status')=='completed'))
+                            for e in delta):
+                        raise ProtocolError('Cancellation cleanup performed unverified work; retain HOLD')
+                    final=cleaned
+                workers = cancellation_workers(known, owner.last_load_updates, task['agy_worker_model'])
+                store.native_cancel_seal(*binding)
+                unloaded = unload('cancellation')
+                store.update(task['id'], native_cancel=dict(session_unloaded=unloaded, workers=workers))
+                receipt = dict(kind='verified-cancellation', task=task['id'], session_id=owner.session_id,
+                    turn=task['turn'], launch_id=task['launch_id'], epoch=task.get('control_epoch',1),
+                    cancel_id=current['native_cancel_id'], workers=workers, session_unloaded=True,
+                    worker_events=[e for e in snapshot(owner.last_load_updates) if e.get('swarm',{}).get('action') in {'add','kill'}],
+                    all_descendants_proven_stopped=False, evidence='complete-native-add-kill-and-unload')
+                store.native_cleanup_commit(*binding, cleanup_token, receipt)
+                cancellation_unverified = False
+                return TurnResult('cancelled', 0, 'cancelled', 'Cancellation cleanup verified; business result not claimed')
             info = owner.initialize()
             store.update(task['id'], native_agent=info.get('agentInfo', {}), native_phase='initializing')
             if task.get('native_session_id'):
@@ -379,18 +621,30 @@ def run_native(store, task, emit, policy):
                 store.update(task['id'], session_creation_attempted=True)
                 metadata = owner.new()
                 store.update(task['id'], native_session_id=owner.session_id, needs_session=False)
-                baseline = []
+                _, baseline = owner.load()
             selected = owner.select(metadata)
             task = store.update(task['id'], **selected)
             if owner.created_session:
                 _, baseline = owner.load()
             emit('model', json.dumps(selected))
             task = stage(store, task, emit)
-            if store.get(task['id'])['state'] == 'cancelling':
-                owner.close_session()
-                store.update(task['id'], native_cleanup=dict(turn=task['turn'], workers=[], session_unloaded=True, no_prompt=True))
-                return TurnResult('cancelled', 0, 'cancelled')
-            store.update(task['id'], native_phase='foreground', native_prompt_submitted=True)
+            binding = (task['id'], task['turn'], task['launch_id'], task.get('control_epoch', 1))
+            store.native_input_open(*binding)
+            current_interaction = 0
+            public_emit = emit
+            def emit(kind, text, **extra):
+                interaction = extra.pop('interaction_seq', current_interaction)
+                public_emit(kind, text, interaction_seq=interaction, **extra)
+            if not store.native_prompt_begin(*binding):
+                store.native_cancel_seal(*binding)
+                unload('preprompt-cancellation')
+                if not owner.created_session or baseline != []:
+                    raise ProtocolError('Preprompt cancellation prior roster unverified; retain HOLD')
+                store.native_cleanup_commit(*binding,cleanup_token,dict(kind='fresh-no-prompt',task=task['id'],
+                    session_id=owner.session_id,turn=task['turn'],launch_id=task['launch_id'],epoch=task.get('control_epoch',1),
+                    fresh=True,baseline_empty=True,no_prompt=True,workers=[],session_unloaded=True,
+                    all_descendants_proven_stopped=False))
+                return TurnResult('cancelled',0,'cancelled')
             decoder = EventDecoder()
             live_updates = []
             def publish_update(entry):
@@ -400,11 +654,14 @@ def run_native(store, task, emit, policy):
             submitted = True
             response, _ = owner.request('session/prompt', dict(sessionId=owner.session_id,
                 prompt=[dict(type='text', text=brief(task, policy))]), timeout=None,
-                check_cancel=lambda: store.get(task['id'])['state'] == 'cancelling', on_update=publish_update)
+                check_cancel=check_cancel, on_update=publish_update)
+            foreground_ended = response.get('stopReason')=='end_turn' and not owner.request_cancel_sent
+            if check_cancel():
+                return cancel_cleanup(snapshot(live_updates), notify=not owner.request_cancel_sent, first=True)
             if response.get('stopReason') != 'end_turn':
                 for kind, text in decoder.finish():
                     emit(kind, text)
-                unloaded = owner.close_session()
+                unloaded = unload('foreground-abnormal')
                 store.update(task['id'], native_cancel=dict(foreground=response.get('stopReason'),
                              session_unloaded=unloaded, workers='unknown'))
                 raise ProtocolError('Native foreground settled '+str(response.get('stopReason'))+'; whole-swarm fate unknown')
@@ -413,39 +670,136 @@ def run_native(store, task, emit, policy):
                 emit(kind, text)
             if fatal_error(decoder.text):
                 raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
-            if store.get(task['id'])['question_id']:
-                raise ProtocolError('Native question recovered; worker settlement unproven; occupancy retained, no automatic continuation')
             previous_public = snapshot([e for e in live_updates if e['sessionUpdate'] != 'user_message_chunk'])
             previous = None
             last_notice = time.monotonic()
+            last_semantic_change = None
+            dialogue_public = None
+            deferred_questions = []
+            blocker_notice = None
             while True:
-                if store.get(task['id'])['state'] == 'cancelling':
-                    owner.notify_cancel()
-                    owner.close_session()
-                    store.update(task['id'], native_cancel=dict(foreground='already_end_turn', session_unloaded=True, workers='unknown'))
-                    raise ProtocolError('Background cancellation requested; native worker stop unproven; occupancy retained')
+                if check_cancel():
+                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates), first=previous is None)
                 _, history = owner.load()
-                if baseline:
-                    additions(baseline, history)
-                turn_history = history[len(baseline):]
-                public_history = [entry for entry in turn_history if entry['sessionUpdate'] != 'user_message_chunk']
-                fresh = first_replay(previous_public, public_history) if previous is None else additions(previous, history)
+                if check_cancel():
+                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates), first=previous is None)
+                comparison = previous
+                recovered = []
+                if previous is not None and deferred_questions:
+                    comparison = list(previous)
+                    for deferred in list(deferred_questions):
+                        index = deferred['index']
+                        if (index >= len(history) or history[index]['sessionUpdate'] != 'agent_message_chunk'
+                                or not history[index]['content']['text'].startswith(deferred['text'])):
+                            raise ProtocolError('Deferred question history ambiguous; retain HOLD and inspect originating interaction '+str(deferred['interaction_seq']))
+                        value = history[index]['content']['text']
+                        suffix = value[len(deferred['text']):]
+                        recovered.append((deferred, suffix, bool(suffix) and index+1 < len(history)
+                            and history[index+1]['sessionUpdate'] in {'tool_call', 'user_message_chunk'}))
+                        comparison[index] = history[index]
+                turn_history = additions(baseline, history)
+                public_history = turn_history
+                fresh = first_replay(previous_public, public_history) if previous is None else additions(comparison, history)
+                if dialogue_public is not None:
+                    fresh = first_replay(dialogue_public, fresh)
+                    dialogue_public = None
+                for deferred, suffix, boundary in recovered:
+                    update = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=suffix))
+                    for kind, text in deferred['decoder'].feed(dict(params=dict(update=update))):
+                        emit(kind, text, interaction_seq=deferred['interaction_seq'])
+                    if boundary:
+                        for kind, text in deferred['decoder'].finish():
+                            emit(kind, text, interaction_seq=deferred['interaction_seq'])
+                    deferred['text'] = history[deferred['index']]['content']['text']
+                    if not deferred['decoder'].pending:
+                        deferred_questions.remove(deferred)
+                appended = history[len(previous if previous is not None else baseline):]
                 for entry in fresh:
-                    for kind, text in decoder.feed(dict(params=dict(update=entry))):
+                    for kind, text in decoder.feed(dict(params=dict(update=entry)), text_boundary=entry in appended):
                         emit(kind, text)
                 previous = history
-                # User material is needed only for prefix reconciliation, not public status.
+                now = time.time()
+                if fresh or any(suffix or boundary for _, suffix, boundary in recovered) or last_semantic_change is None:
+                    last_semantic_change = now
+                # Persist only reconciled successful loads, never partial RPC updates.
                 store.update(task['id'], native_snapshot=[e for e in history if e['sessionUpdate'] != 'user_message_chunk'],
-                             native_permission_decisions=owner.permission_decisions)
+                    native_permission_decisions=owner.permission_decisions,
+                    native_observation=dict(turn=task['turn'], last_success_at=now,
+                        last_semantic_change_at=last_semantic_change,
+                        pending_tools=[dict(id=safe_tool_id(e['toolCallId']), name=safe_tool_name(e.get('title')), kind=safe_tool_kind(e.get('kind')),
+                            status=e['status']) for e in history if e['sessionUpdate']=='tool_call'
+                            and e.get('status') in {'pending', 'in_progress'}],
+                        question_ids=store.get(task['id']).get('questions', []), input_available=True,
+                        question_blockers=[dict(interaction_seq=d['interaction_seq'], reason='incomplete_question',
+                            available_actions=['observe', 'dialogue', 'cancel'], blocks_completion=True)
+                            for d in deferred_questions]+([dict(interaction_seq=current_interaction,
+                                reason='incomplete_question', available_actions=['observe', 'dialogue', 'cancel'],
+                                blocks_completion=True)] if pending_question(decoder) else [])))
+                blockers = store.get(task['id'])['native_observation']['question_blockers']
+                signature = tuple(b['interaction_seq'] for b in blockers)
+                if signature and signature != blocker_notice:
+                    public_emit('stage', 'Native question fragment incomplete; observe this owner for a complete boundary, '
+                        'or explicitly dialogue/cancel after review. Completion remains blocked; no partial question published.',
+                        interaction_seq=signature[0], notice_kind='incomplete_question', question_blockers=blockers)
+                blocker_notice = signature
                 current_text = '\n'.join(e['content']['text'] for e in turn_history if e['sessionUpdate'] == 'agent_message_chunk')
                 if fatal_error(current_text):
                     raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
-                workers = completion(turn_history, task, lambda result: store.update(task['id'], native_result=result),
-                                     owner=owner, baseline=baseline)
+                entry = store.native_dialogue_claim(*binding)
+                if entry is not None:
+                    if pending_question(decoder):
+                        # An explicit input is not evidence that a background tail finished.
+                        index = len(history)-1
+                        if index < 0 or history[index]['sessionUpdate'] != 'agent_message_chunk':
+                            raise ProtocolError('Deferred question location ambiguous; retain HOLD and inspect current interaction')
+                        deferred = EventDecoder()
+                        deferred.pending, deferred.pending_overflow = decoder.pending, decoder.pending_overflow
+                        deferred_questions.append(dict(interaction_seq=current_interaction, index=index,
+                            text=history[index]['content']['text'], decoder=deferred))
+                        decoder.pending = ''
+                        decoder.pending_overflow = False
+                    else:
+                        for kind, text in decoder.finish():
+                            emit(kind, text)
+                    current_interaction = entry['interaction_seq']
+                    dialogue_live = []
+                    def publish_dialogue(update):
+                        dialogue_live.append(update)
+                        for kind, text in decoder.feed(dict(params=dict(update=update))):
+                            emit(kind, text)
+                    emit('stage', 'Dialogue '+entry['command_id']+' claimed; not yet sent.')
+                    body_header = 'CALLCLI_DIALOGUE '+json.dumps(dict(task=task['id'], turn=task['turn'],
+                        interaction_seq=current_interaction, command_id=entry['command_id'],
+                        question_id=entry.get('question_id'), question=entry.get('question')))
+                    body_header += (' Keep the current session and roster; do not repeat /swarm or replace workers. '
+                        'Report dispatch separately from coordinator-reported ACK and artifact evidence. '
+                        'Any final CALLCLI_RESULT must include this task, turn and interaction_seq; resolve remaining questions first.')
+                    store.native_dialogue_state(*binding, entry['command_id'], 'send_started')
+                    foreground_ended = False
+                    response, _ = owner.request('session/prompt', dict(sessionId=owner.session_id,
+                        prompt=[dict(type='text', text=body_header+'\n\n'+entry['prompt'])]), timeout=None,
+                        check_cancel=check_cancel, on_update=publish_dialogue)
+                    foreground_ended = response.get('stopReason')=='end_turn' and not owner.request_cancel_sent
+                    if response.get('stopReason') != 'end_turn':
+                        if check_cancel():
+                            if response.get('stopReason')=='cancelled':
+                                store.native_dialogue_state(*binding,entry['command_id'],'cancelled')
+                            return cancel_cleanup(history)
+                        raise ProtocolError('Native dialogue did not return end_turn; effects unknown')
+                    for kind, text in decoder.finish():
+                        emit(kind, text)
+                    dialogue_public = snapshot([e for e in dialogue_live if e['sessionUpdate']!='user_message_chunk'])
+                    store.native_dialogue_state(*binding, entry['command_id'], 'returned')
+                    emit('stage', 'Dialogue '+entry['command_id']+' returned; worker adoption requires public ACK/artifact evidence.')
+                    continue
+                workers = (None if deferred_questions or pending_question(decoder) else
+                    completion(turn_history, store.get(task['id']), owner=owner, baseline=baseline))
                 if workers is not None:
-                    if store.get(task['id'])['state'] == 'cancelling':
-                        raise ProtocolError('Cancellation raced native completion; reconcile before release')
-                    owner.close_session()
+                    if not store.native_input_seal(*binding, current_interaction):
+                        continue
+                    completion(turn_history, store.get(task['id']), lambda result: store.update(task['id'], native_result=result),
+                               owner=owner, baseline=baseline)
+                    unload('completion')
                     store.update(task['id'], native_cleanup=dict(turn=task['turn'], workers=workers,
                         evidence='native-add-kill-completed-and-session-unload', session_unloaded=True,
                         all_descendants_proven_stopped=False), native_phase='settled')
@@ -457,21 +811,41 @@ def run_native(store, task, emit, policy):
                     last_notice = time.monotonic()
                 # Observation interval, never an execution deadline or generation prompt.
                 for _ in range(20):
-                    if store.get(task['id'])['state'] == 'cancelling':
+                    current = store.get(task['id'])
+                    if current['state'] == 'cancelling' or any(c.get('kind')=='dialogue' and c.get('status')=='accepted'
+                            for c in current.get('commands', {}).values()):
                         break
                     time.sleep(.1)
     except ProtocolError as exc:
-        if 'decoder' in locals():
-            for kind, text in decoder.finish():
-                emit(kind, text)
+        if 'deferred_questions' in locals() and deferred_questions:
+            observation = store.get(task['id']).get('native_observation', {})
+            reason = ('history_ambiguous' if str(exc).startswith('Deferred question history ambiguous;')
+                      else 'unresolved_question')
+            observation['question_blockers'] = [dict(interaction_seq=d['interaction_seq'], reason=reason,
+                available_actions=['inspect_origin', 'reconcile_hold'], blocks_completion=True) for d in deferred_questions]
+            store.update(task['id'], native_observation=observation)
         if owner is not None and owner.session_id and not submitted:
             try:
-                owner.close_session()
-                store.update(task['id'], native_cleanup=dict(turn=task['turn'], workers=[], session_unloaded=True, no_prompt=True))
+                unload('preprompt-failure')
+                if owner.created_session and baseline == [] and cleanup_token:
+                    store.native_cleanup_commit(*binding, cleanup_token, dict(kind='fresh-no-prompt', task=task['id'],
+                        session_id=owner.session_id, turn=task['turn'], launch_id=task['launch_id'],
+                        epoch=task.get('control_epoch',1), workers=[], no_prompt=True, fresh=True, baseline_empty=True,
+                        session_unloaded=True, all_descendants_proven_stopped=False))
             except ProtocolError:
                 pass  # Original failure remains authoritative; cleanup unproven.
         store.update(task['id'], native_phase='unknown', native_workers='unknown' if submitted else 'not_submitted')
         return TurnResult('unknown', None, None, str(exc))
     finally:
+        if 'binding' in locals():
+            try:
+                store.native_input_end(*binding)
+            except ValueError:
+                pass  # A stale owner cannot mutate its successor or release fence.
         if owner is not None:
-            owner.stop()
+            exit_receipt = owner.stop(force=False) if cancellation_unverified else owner.stop()
+            try:
+                store.native_owner_diagnostics(*binding,native_owner_exit=exit_receipt,
+                                               native_permission_decisions=owner.permission_decisions)
+            except ValueError:
+                pass  # Closed/replaced identity cannot be reopened by final diagnostics.

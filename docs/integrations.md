@@ -81,7 +81,7 @@ hermes plugins doctor call-cli
 
 上例无执行预算；Hermes 模型工具拒绝 timeout，OMP 模型工具同样收口，旧缓存字段会明确报错。非常规显式硬预算仍可通过原 CLI/Python start 接口表达，shell 不受此 schema 约束；存量显式值在受支持续轮清除前继续生效。保留真实返回的 task.id 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造来源。
 
-原生工具支持 `start/list/status/events/reply/intervene/cancel/close`。运行期介入使用精确 `task_id`、修订 `prompt` 和必填稳定 `command_id`；重试复用相同 ID。`pending/cancelling` 不是生效证明：先等旧轮结算，再调用 `status` 或 `events` 推进同 session 续轮；重复查询不重复启动，`unknown` 不续派。`cancel` 撤回待执行介入。通用 CLI 声明 `--runtime hermes` 不产生原生来源绑定或通知能力，两条路径不能混称同一次验收。
+Hermes 源码候选动作是 `start/list/status/events/reply/dialogue/intervene/cancel/close/reconcile`；当前宿主只调用实际加载 schema 中的动作。`dialogue` 必带 observed expected_turn/稳定 command_id，仅有能力的 AGY native 原 owner 串行接收，不取消；`reconcile` 沿后文精确 controller/证明门禁，非通用 CLI/OMP 权限。`intervene` 保持 cancel+resume：精确 task_id、修订 prompt 和稳定 command_id；旧轮确认结算后由当前 controller status/events 推进一次后继，unknown 不续派。通用 `--runtime hermes` 声明不产生原生来源绑定或通知，两条路径不能混称。
 
 **Hermes 的 `status` / `events` 不是纯读操作**：它们会推进此前已由 `intervene` 授权、仍为 pending 的介入；旧轮确认结算后，查询可能启动同 session 的下一轮。没有已授权 pending 介入时不会自行派工；`unknown` 保留不确定结果，不自动重试。终端 dispatch 的迟到回执按 turn 与 launch identity 条件写回，不能覆盖新轮的状态或 process ID。
 
@@ -127,13 +127,15 @@ First-deployment prerequisite: the native tasks DB must contain no `release_*` s
 
 在新建自有 RPC 实例中单次加载：`omp --mode rpc --no-ui --no-extensions -e /absolute/call-cli/omp-extension.mjs`；不全局启用，不热附着、重启或 reload 现有宿主。`-e` 使用固定 commit 目录的绝对路径，按下方[运行时依赖闭包](#运行时依赖闭包)保留相邻文件；只复制 `.mjs` 不可运行。要求实测 OMP 18.18.1 extension API、Python 3，以及业务执行时现有 ACPX/目标 CLI。可用 `CALL_CLI_PYTHON` 指定解释器，`CALL_CLI_DB` 指定既有共享任务库；默认沿用通用入口的共享 DB，不另建库绕过 writer 互斥。零模型夹具才使用独立 scratch DB，不把它当生产协作隔离方式。
 
-模型工具 `call_cli_omp` 接受 start/list/status/events/reply/intervene/cancel/close，不接受 origin、capability 或 DB。可信 extension 从实际 `ctx.sessionManager.getSessionId()` 和 `ctx.agent.id` 注入绑定，通过 stdin 调用 `omp_bridge.py`。Python 接缝复用 `Collaboration` 和 Store，保存 capability 哈希与宿主绑定；随机原值仅保留宿主内存，不写入模型文本、参数 schema、日志或 `appendEntry`。这是可信本地 extension 提供的绑定，不是远程认证服务；同用户任意代码不在隔离边界内。standalone 的私有 client handle 语义不变。
+OMP 候选模型工具 `call_cli_omp` 接受 `start/list/status/events/reply/dialogue/intervene/cancel/close`，不提供 `reconcile`，不接受 origin/capability/DB。`dialogue` 仍限 AGY native 能力并要求 expected_turn/command_id。可信 ctx 注入 session/agent，经 stdin 调用 `omp_bridge.py` 并复用 core；capability 哈希保存、原值仅在宿主内存，不进入模型/schema/日志。源码支持不等当前宿主已加载；standalone client handle 仍不是原生宿主身份。
 
 这是活跃任务轮询，不是 stdout 直接推送，也不是 daemon：每个活跃 binding 用默认 1 秒受管 timer，批次内每个活跃任务各启动一次 one-shot Python/SQLite 读取；批次结束后再计时，无重叠读取。成本随活跃任务数和活跃时间增长，尚未实测吞吐或 CPU，不能据此宣称低开销。无活跃任务时不设 timer；waiting_reply、终态或单任务读取异常暂停对应跟踪，close 移除对应跟踪；显式 status/reply/intervene 等可重新激活。短暂 SQLite busy 保留游标及跟踪，在下一批再读，不生成错误唤醒；其他异常仅暂停该任务，不拖停整个 binding，不自动重派或取消。
 
 非阻塞保护仅用于内部 poll（wait）：初始化与归属读取之前设置 busy_timeout=0，锁竞争返回 busy，不虚构任务状态。bind/start/reply/intervene/close 等非 poll 动作仍保留 Store 的 SQLite 15 秒连接超时及显式失败语义，不返回假 busy-success；这不是所有工具动作都非阻塞的承诺。
 
 每个短批次把 stage 合并为最新一条，连续相同 stage 文本不再唤醒；有变化的阶段仍可主动唤醒纠偏。问题、失败、完成在下一次成功读取时及时以官方 `sendMessage` follow-up 投递，工具状态等无业务变化不唤醒；不是 steer。回答片段合并到结算通知，游标依据实际读到并获宿主队列接纳的批次推进，不依据 stdout 尾号；队列接纳不等于模型已经理解或用户已经看到。同 session 的首次并发 start 共用一次 bind，不串行所有任务；reply/intervene 等重新激活跟踪后，旧读取结果按请求 revision 丢弃并由新读取补齐，不得覆盖新轮状态。intervene 仍是 core 的 cancel+resume，不是 OMP steer。
+
+OMP/AGY unknown 共用可行动 attention；无当前轮终态事件时补 task snapshot 提醒。task-local 内存集合记录实际已送入 followUp 的 turn：同/跨轮迟到已提醒事件不重复，从未提醒旧轮仍首次送达；缺 event.turn 时兼容当前 task.turn，完全无 turn 的事件仍按游标可见、snapshot fallback 单独记账。close/detach 清理原 track；不承诺重启后的持久 exactly-once。stage-only 保 HOLD，通知不触发自动重放，真实宿主消费/投递未验。
 
 复核请求沿用 stage + quiet_notice:true，附 notice_kind（quiet/checkpoint）与 elapsed，并保留 turn/seq；这类事件绕过普通 stage 合并和同文去重。公共 runner 复用同一循环/600s 常量，静默与长期活跃共享冷却，每 600s 至多一条，活动不会推迟检查点；取消/结算后停止。发起方据真实状态选择等待、明确介入或取消，不自动终止/续跑，也不要求逐条转给用户。followUp 入队不证明已消费，CLI 依赖活跃 owner wait；退出后无介入/终止保证。reply/intervene 的 clear_timeout 只作用于受支持的下一轮，queued 保守拒绝，详见 usage 的清除契约。新宿主任务无硬预算，旧值不清除仍保留硬截止；启动/控制边界不变。
 
@@ -147,22 +149,22 @@ session switch/branch/tree/shutdown 清理本宿主 timer、丢弃迟到投递�
 
 一个适配器提供三个方法：`prepare_start(model, effort, approval)` 返回持久选择字段；`run(store, task, emit)` 执行已认领轮次，发出安全的 `stage/answer/question/tool` 事件并返回 `TurnResult(state, exit_code, stop_reason, note)`；`control(task, action, timeout)` 提供精确会话控制与关闭后的 `status_snapshot/no-session` 读回。执行中检查共享任务的 `cancelling`，只有执行真正结算才能返回 cancelled；未知结果返回 unknown，不重放。适配器不修改归属、轮次或 writer 占用；现有设备锁可以复用，不新增进程服务或状态库。新增后端只需实现并注册它，随 runner 安装，不必修改其他后端；不要求使用 ACP。
 
-公共 start 接受 AGY 专用 agy_approval、agy_swarm、agy_worker_model；G4C 默认 native，G4A 默认 off，显式模式覆盖。native 唯一 ACP owner 不经 ACPX control/recovery；close 按当前 task/turn 结果、worker add/kill completed 与 unload 证据释放，不要求 ACP 未提供的 rawOutput，也不证明任意后代死亡。异常保 unknown/HOLD。
+公共 start 接受 AGY 专用 agy_approval/agy_swarm/agy_worker_model；G4C 默认 native，G4A 默认 off，显式覆盖。native 不经 ACPX control/recovery：正常完成依本轮 native_result+worker add/kill completed+unload；取消依独立可信 owner receipt、匹配 kill 与精确 unload，不借业务 result。原 owner 在安全边界一次 cleanup 可附确认过的 swarm status；未知仍 HOLD。v3 end_turn 后单 worker 候选实测已通过，非默认部署/宿主或任意后代死亡证明。
 
 结算状态与该轮唯一 `<turn>:settled` 事件在同一事务提交，事件带持久 seq、问题 ID、回答摘要和适用的介入续作提示。runner 仅打印事务接受的结算事件；即使其后轮次已推进或进入关闭，也不会丢弃这个已合法结算的通知。被拒绝的旧 runner 不广播终态，普通旧轮事件过滤保持不变；游标补读可恢复已入库事件，不承诺进程崩溃后的 stdout 重放。
 
-ACPX 路径及其他 backend 不变；agy.py 按持久路由选择 native owner。native 复用 Store/runner/安装锁/skill/event；首 end_turn 仍 running，完整 load 观察后台。逐轮清除旧结果与清理证据，当前轮独立对账。AGY unknown 原子事件带 attention_required/next_action，runner stdout 与 OMP 托管轮询 follow-up/Hermes notify 主动返回；真实宿主接收/消费未验，不新增监控平台。详见 [AGY 合同](../skill/references/agy-models.md)。
+agy.py 按持久路由选择 native owner，复用 Store/runner/安装锁/skill/event；首 end_turn 仍 running，完整 load 观察后台，按 turn 隔离旧结果/cleanup。OMP 与 AGY unknown 原子事件带 attention_required/next_action，原 runner stdout 与 OMP 托管 followUp/Hermes notify 返回；真实宿主接收/模型消费仍未验，不新增监控平台。见 [AGY 合同](../skill/references/agy-models.md)与[当前验收索引](../VERIFICATION.md#current-acceptance-index)。
 
 公共 start 可选 `skills` 数组，两个入口通过 Store 创建固定快照；ACPX 后端每轮在 prompt 前经现有目标命令暂存并加入技能路径/模式提示。其他后端可复用 `skills.stage(store, task, emit)` 与 `skills.guidance(task)`，不使用时不得声称支持读取。目标 `CALLCLI_SKILL` 行规范化为独立 skill 事件，Store 按轮次记录实际自报；required 缺报只标未验证，不改业务结算。契约、限制和选择策略见[技能传递](../skill/references/skill-passing.md)。
 
 ## 运行时依赖闭包
 
-安装按入口生成文件与 SHA-256 manifest，不用旧总数推算。当前 import 与相邻资源读取关系如下；这些文件须来自同一固定 commit，源码更新不自动更新已安装副本或内存 schema。
+安装按入口实际 import、动态加载与相邻资源生成逐文件 SHA-256 manifest，不用历史文件数量推算。同一冻结候选可按 commit 或未提交内容哈希定位；源码更新不等物理副本/内存加载。
 
-- 公共 core／runner 闭包：`bridge.py`、`native_continuity.py`（Hermes native wrapper 使用；只读当前 profile `state.db` metadata）、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`agy_native.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`skill-stage.cjs`、`shared-prompt.cjs`。后两个资源分别由 `skills.py`、`acpx_backend.py` 相邻读取。`collab.py` 仍直用基础 `Store`，不启用 native metadata continuity。
-- 通用 POSIX 入口：公共闭包加 `collab.py`。
-- Hermes 插件入口：公共闭包加 `__init__.py`、`plugin.yaml`；manifest 声明 `call_cli`，不声明或全局启用 OMP extension。已有插件若提供 `collab.py`、`models.cjs`、`remote-client.cjs` 等附带入口，按其实际依赖保留，不替换整个物理目录或删除未列文件。
-- 实验性 OMP 宿主入口：公共闭包加 `collab.py`、`omp_bridge.py`、`omp-extension.mjs`；`.mjs` 通过相邻路径启动 Python bridge，后者导入 `collab.py`，再复用现有 runner。它不是 Hermes 插件注册项。
+- 公共 core/runner/close 闭包：`bridge.py`、`runner.py`、`backends.py`、`acpx_backend.py`、`agy.py`、`agy_native.py`、`events.py`、`transport.py`、`updates.py`、`skills.py`、`recovery.py`、`release.py`；相邻 Node 资源 `skill-stage.cjs`、`shared-prompt.cjs`、`release-backend.cjs`。`skills.py` 读取 staging helper；ACP adapter 读取 shared helper；`release.py` 调用 release helper，后者 require shared helper。Node/npm/ACPX 与目标 CLI 是设备既有依赖，不从控制端复制认证。
+- 通用 POSIX 入口：公共闭包加 `collab.py`；直接基础 Store，不启用 Hermes metadata continuity。
+- Hermes native plugin：公共闭包加 `__init__.py`、`plugin.yaml`、`native_continuity.py`（只读本 profile metadata）；完整保留 `dashboard/plugin_api.py`、`dashboard/manifest.json`，dashboard 动态加载相邻 `release.py` 并依赖宿主 FastAPI/web_deps。固定目标 policy 是另准的私有配置，不是公开打包资源。已有附带 CLI/发现/SSH 入口按其依赖保留，不整目录覆盖或删除未知文件。
+- OMP 可选宿主入口：公共闭包加 `collab.py`、`omp_bridge.py`、`omp-extension.mjs`；不需 `native_continuity.py`，也不是 Hermes plugin 注册项。extension 通过相邻路径启动 bridge/runner，不能只复制 `.mjs`。
 - 可选模型发现：`models.cjs` 相邻需要 `shared-prompt.cjs`；实际调用还需设备本机 Node/npm/ACPX。SSH 客户端按所选 `remote-client.cjs`／`remote-client.ps1`／`codex-ssh.cjs` 单独打包，不改变协调核心依赖。
 - 公共协作技能：完整 `skill/SKILL.md`、`skill/references/`、`skill/templates/`，包含 OMP 适配、单次 load 和维护检查指导；个人副本另合并私有库存／Hermes 独有内容并验链接，不回拷进公开仓。检查目标仍是 call-cli 与本轮实际参与 CLI 的协作 skill。
 

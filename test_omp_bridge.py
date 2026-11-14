@@ -23,6 +23,18 @@ class HostBridgeTests(unittest.TestCase):
     def call(self, action, **args):
         return self.bridge.handle(self.a, self.key, dict(action=action, **args))
 
+    def test_dialogue_queues_on_bound_owner_without_cancel_or_relaunch(self):
+        task = self.call('start', agent='agy', prompt='owned', cwd=self.tmp.name)['task']
+        self.bridge.store.update(task['id'], state='running', runner_pid=123)
+        self.bridge.store.native_input_open(task['id'], 1, task['launch_id'], 1)
+        args = dict(task_id=task['id'], prompt='revise', command_id='d1', expected_turn=1)
+        result = self.call('dialogue', **args)['task']
+        self.assertEqual((result['state'], result['turn'], result['commands']['d1']['status']), ('running', 1, 'accepted'))
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.call('dialogue', **args)['task'], result)
+        with self.assertRaises(ValueError):
+            self.call('dialogue', **dict(args, expected_turn=2, command_id='stale'))
+
     def test_model_limits_rejected_but_legacy_budget_can_be_cleared(self):
         for value in (300, None):
             with self.assertRaisesRegex(ValueError, 'timeout'):

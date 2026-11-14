@@ -19,6 +19,24 @@ class CollaborationTests(unittest.TestCase):
                 returncode=0, stdout=b'{"action":"status_snapshot","status":"no-session","summary":"no active session"}'),
             lock=lambda task, **kw: nullcontext(True))
 
+    def test_cli_dialogue_uses_same_turn_without_launch_or_cancel(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        client = self.c.connect('omp')['client_id']
+        task = self.c.start(client, agent='agy', prompt='owned', cwd='/project')
+        self.c.store.update(task['id'], state='running', runner_pid=123)
+        self.c.store.native_input_open(task['id'], 1, task['launch_id'], 1)
+        output = StringIO()
+        with patch.object(collab, 'Collaboration', return_value=self.c), redirect_stdout(output):
+            rc = collab.main(['--db', str(self.db), '--client', client, 'dialogue', '--task', task['id'],
+                '--prompt', 'revise', '--expected-turn', '1', '--command-id', 'd1'])
+        self.assertEqual(rc, 0, output.getvalue())
+        result = json.loads(output.getvalue())
+        self.assertEqual((result['state'], result['turn']), ('running', 1))
+        self.assertEqual(result['commands']['d1']['status'], 'accepted')
+        self.assertEqual((len(self.launches), self.controls), (1, []))
+
     def test_new_tasks_without_budget_remain_cancellable_and_legacy_budgets_survive(self):
         client = self.c.connect('omp')['client_id']
         unbounded = self.c.start(client, prompt='inspect', cwd='/project')

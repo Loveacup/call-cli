@@ -6,9 +6,11 @@ import unittest
 
 
 def load_plugin():
+    import sys
+    if 'callcli_plugin' in sys.modules:
+        return sys.modules['callcli_plugin']
     spec=importlib.util.spec_from_file_location('callcli_plugin',Path(__file__).with_name('__init__.py'),submodule_search_locations=[str(Path(__file__).parent)])
     mod=importlib.util.module_from_spec(spec)
-    import sys
     sys.modules[spec.name]=mod
     spec.loader.exec_module(mod)
     return mod
@@ -54,6 +56,34 @@ class HostTimeoutTests(unittest.TestCase):
             self.assertNotIn('timeout', ctx.called[1])
 
 class PluginTests(unittest.TestCase):
+    def test_repeated_plugin_load_retains_patchable_native_submodule(self):
+        import sys
+        first = load_plugin()
+        second = load_plugin()
+        self.assertIs(second.native_continuity, sys.modules[second.Store.__module__])
+        self.assertIs(first.Store, second.Store)
+
+    def test_dialogue_schema_and_live_owner_submission_do_not_launch_or_cancel(self):
+        mod = load_plugin()
+        self.assertIn('dialogue', mod.SCHEMA['parameters']['properties']['action']['enum'])
+        with tempfile.TemporaryDirectory() as d:
+            env = {'HERMES_SESSION_ID':'s1', 'HERMES_SESSION_KEY':'key'}
+            ctx = Ctx(); c = mod.Coordinator(ctx, Path(d), lambda k,x='':env.get(k,x))
+            task = c.handle(dict(action='start', agent='agy', cwd=d, prompt='owned'))['task']
+            store = mod.Store(Path(d)/'call-cli/tasks.sqlite3')
+            store.update(task['id'], state='running', runner_pid=123)
+            store.native_input_open(task['id'], 1, task['launch_id'], 1)
+            args = dict(action='dialogue', task_id=task['id'], prompt='revise', expected_turn=1, command_id='d1')
+            admitted = c.handle(args)['task']
+            self.assertEqual((admitted['state'], admitted['turn']), ('running', 1))
+            self.assertEqual(admitted['commands']['d1']['status'], 'accepted')
+            self.assertEqual(len(ctx.calls), 1)
+            self.assertEqual(c.handle(args)['task'], admitted)
+            for field in ('expected_turn', 'command_id'):
+                missing = dict(args); missing.pop(field)
+                with self.assertRaises(ValueError):
+                    c.handle(missing)
+
     def test_launch_reuses_native_notification_route_without_model_supplied_origin(self):
         mod=load_plugin()
         with tempfile.TemporaryDirectory() as d:
@@ -170,15 +200,27 @@ class PluginTests(unittest.TestCase):
             task=c.handle({'action':'start','agent':'omp','cwd':str(fixture.root),'prompt':'old'})['task']
             store=mod.Store(fixture.root/'call-cli/tasks.sqlite3')
             store.update(task['id'],state='running')
-            c.handle({'action':'intervene','task_id':task['id'],'prompt':'new','command_id':'preprovider'})
+            intent={'action':'intervene','task_id':task['id'],'prompt':'new','command_id':'preprovider','expected_turn':1}
+            c.handle(intent)
             store.finish_turn(task['id'],1,'cancelled',0,'cancelled')
+            self.assertEqual(len(ctx.calls),1,'settlement alone must not launch a successor')
             c.handle({'action':'status','task_id':task['id']})
             self.assertEqual(store.get(task['id'])['turn'],2)
+            admitted=store.get(task['id'])
+            self.assertEqual((admitted['commands']['preprovider']['command_id'],admitted['commands']['preprovider']['expected_turn'],
+                admitted['commands']['preprovider']['source_turn'],admitted['commands']['preprovider']['target_turn']),('preprovider',1,1,2))
+            c.handle({'action':'events','task_id':task['id'],'after':0})
+            c.handle({'action':'status','task_id':task['id']})
+            c.handle(intent)
+            self.assertEqual(len(ctx.calls),2,'controller reads and command replay must not duplicate target launch')
             self.assertEqual(__import__('test_dispatch').run_dispatched(store.path, task['id']),0)
             final=store.get(task['id'])
             self.assertEqual(final['state'],'completed')
             self.assertTrue(final['acpx_created'])
             self.assertFalse(final['needs_session'])
+            self.assertEqual(final['commands']['preprovider']['status'],'target_completed')
+            origin=mod.capture_origin(lambda k,x='':env.get(k,x),'default')
+            self.assertEqual([e['text'] for e in store.events(task['id'],origin) if e['kind']=='answer'],['FAKE_ANSWER'])
             calls=[json.loads(line) for line in (fixture.root/'calls.jsonl').read_text().splitlines()]
             self.assertEqual(sum('new' in call for call in calls),1)
         finally:
@@ -308,6 +350,7 @@ class PluginTests(unittest.TestCase):
     def test_register_exposes_real_bound_tool(self):
         mod=load_plugin();ctx=Ctx();mod.register(ctx)
         self.assertEqual(ctx.registration['name'],'call_cli')
+        self.assertIn('dialogue', ctx.registration['schema']['parameters']['properties']['action']['enum'])
         self.assertTrue(callable(ctx.registration['handler']))
         self.assertTrue(ctx.registration['check_fn']())
         ctx.enabled=False

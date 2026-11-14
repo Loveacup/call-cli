@@ -60,6 +60,7 @@ class HostBridge(Collaboration):
             'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'skills'},
             'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
             'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout', 'expected_turn', 'command_id'},
+            'dialogue': {'task_id', 'prompt', 'command_id', 'expected_turn', 'question_id'},
             'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},
         }
         args = dict(args)
@@ -70,6 +71,8 @@ class HostBridge(Collaboration):
             raise ValueError('Unsupported action or model-supplied host field')
         if action == 'intervene' and not args.get('command_id'):
             raise ValueError('Stable command_id required')
+        if action == 'dialogue' and (not args.get('command_id') or type(args.get('expected_turn')) is not int):
+            raise ValueError('dialogue requires expected_turn and stable command_id')
         result = getattr(self, action)(capability, **args)
         if action == 'list':
             return {'tasks': [self.public(t) for t in result]}

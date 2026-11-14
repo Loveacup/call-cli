@@ -1,0 +1,13 @@
+{
+  "provenance": "Owned live AGY 1.5.8 acceptance sample, public tool-only snapshots; scratch artifacts not published. No message bodies or private raw payloads. Not a complete wire history.",
+  "before": [
+    {"sessionUpdate":"tool_call","toolCallId":"call_11574431354340982426","title":"swarm","kind":"other","status":"completed","swarm":{"action":"models"}},
+    {"sessionUpdate":"tool_call","toolCallId":"call_9547561210439123374","title":"swarm","kind":"other","status":"completed","swarm":{"action":"add","name":"cancel_echo","model":"gemini-4-hydrogen-medium"}},
+    {"sessionUpdate":"tool_call","toolCallId":"call_15213078799188487249","title":"read_board","kind":"other","status":"completed"},
+    {"sessionUpdate":"tool_call","toolCallId":"call_7732696754249451444","title":"swarm","kind":"other","status":"completed","swarm":{"action":"status"}}
+  ],
+  "cleanup": [
+    {"sessionUpdate":"tool_call","toolCallId":"call_2180693409424447969","title":"swarm","kind":"other","status":"completed","swarm":{"action":"kill","name":"cancel_echo"}},
+    {"sessionUpdate":"tool_call","toolCallId":"call_11659299499719082775","title":"swarm","kind":"other","status":"completed","swarm":{"action":"status"}}
+  ]
+}

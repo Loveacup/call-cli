@@ -45,3 +45,41 @@ test('resource symlink cannot redirect bundle writes', () => {
     assert.equal(fs.existsSync(path.join(outside,'untouched')),false);
   } finally {run({task,op:'cleanup'});fs.rmSync(outside,{recursive:true,force:true});}
 });
+test('concurrent first directory creation preserves separate writable task copies', t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(),'callcli-mkdir-race-'));
+  const shared = path.join(scratch,'call-cli-skills'), mkdir = fs.mkdirSync;
+  t.mock.method(os,'tmpdir',() => scratch);
+  t.mock.method(fs,'mkdirSync',(dir,options) => {
+    if (dir === shared && !fs.existsSync(dir)) mkdir(dir,options);
+    return mkdir(dir,options);
+  });
+  try {
+    const spec = bundle({'SKILL.md':'# Required guide','references/value.txt':'ORIGINAL'});
+    const left = run({task:taskId(),bundle:spec}), right = run({task:taskId(),bundle:spec});
+    assert.notEqual(left.target_path,right.target_path);
+    fs.writeFileSync(path.join(left.target_path,'references/value.txt'),'LEFT_ONLY');
+    assert.equal(fs.readFileSync(path.join(right.target_path,'references/value.txt'),'utf8'),'ORIGINAL');
+    assert.equal(fs.statSync(shared).mode & 0o777,0o700);
+  } finally {fs.rmSync(scratch,{recursive:true,force:true});}
+});
+
+test('concurrent creation cannot replace skill directories with a symlink or file', t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(),'callcli-mkdir-unsafe-'));
+  const shared = path.join(scratch,'call-cli-skills'), mkdir = fs.mkdirSync;
+  t.mock.method(os,'tmpdir',() => scratch);
+  let replacement = 'symlink';
+  t.mock.method(fs,'mkdirSync',(dir,options) => {
+    if (dir === shared && !fs.existsSync(dir)) {
+      if (replacement === 'symlink') fs.symlinkSync(scratch,dir);
+      else fs.writeFileSync(dir,'not a directory');
+    }
+    return mkdir(dir,options);
+  });
+  try {
+    for (replacement of ['symlink','file']) {
+      assert.throws(() => run({task:taskId(),bundle:bundle({'SKILL.md':'# Guide'})}));
+      fs.unlinkSync(shared);
+    }
+    assert.deepEqual(fs.readdirSync(scratch),[]);
+  } finally {fs.rmSync(scratch,{recursive:true,force:true});}
+});

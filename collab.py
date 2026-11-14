@@ -119,6 +119,11 @@ class Collaboration:
             self._dispatch(task)
         return self.status(client, task_id)
 
+    def dialogue(self, client, task_id, prompt, *, expected_turn, command_id, question_id=None):
+        self.store.dialogue(task_id, self.origin(client), prompt, expected_turn=expected_turn,
+                            command_id=command_id, question_id=question_id)
+        return self.status(client, task_id)
+
     def _advance(self, client, task_id):
         task, launch = self.store.advance_intervention(task_id, self.origin(client))
         if launch or (task['state'] == 'queued' and task.get('launch_turn') != task['turn']):
@@ -202,12 +207,12 @@ def main(argv=None):
     start = sub.add_parser('start')
     start.add_argument('--device', default='local')
     start.add_argument('--agent', choices=list(BACKENDS), default='codex')
-    start.add_argument('--model', help='Advertised model ID; omitted uses G4C. G4C defaults native swarm; G4A defaults single-agent/off')
+    start.add_argument('--model', help='Advertised exact model ID or native AGY family; omitted uses G4C. G4C defaults native swarm; G4A defaults off')
     start.add_argument('--effort', help='Exact advertised thought_level value (AGY)')
     start.add_argument('--agy-approval', choices=['approve-all', 'approve-reads'],
                        help='AGY only: new tasks default to approve-all; approve-reads denies shell/write requests')
     start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY per-task override: native/on or single-agent/off; default depends on coordinator model')
-    start.add_argument('--agy-worker-model', help='Exact advertised worker ID when supplied; AGY native resolves G4H intent from the live catalog and effort')
+    start.add_argument('--agy-worker-model', help='Advertised exact ID or family for native AGY workers; family uses catalog current effort independently of coordinator effort')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
     start.add_argument('--write', action='store_true')
@@ -219,7 +224,7 @@ def main(argv=None):
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
     start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
     sub.add_parser('list')
-    for action in ['status', 'events', 'wait', 'reply', 'intervene', 'cancel', 'close']:
+    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'intervene', 'cancel', 'close']:
         p = sub.add_parser(action)
         p.add_argument('--task', required=True)
         if action in {'events', 'wait'}:
@@ -234,6 +239,11 @@ def main(argv=None):
             p.add_argument('--command-id', help='Stable intent ID; reuse unchanged for retry-safe submission')
         if action == 'reply':
             p.add_argument('--question-id', required=True)
+        if action == 'dialogue':
+            p.add_argument('--prompt', required=True)
+            p.add_argument('--expected-turn', type=int, required=True)
+            p.add_argument('--command-id', required=True)
+            p.add_argument('--question-id')
     opts = vars(parser.parse_args(argv))
     action, db, client = opts.pop('action'), opts.pop('db'), opts.pop('client')
     polling_token = _polling.set(action == 'wait')

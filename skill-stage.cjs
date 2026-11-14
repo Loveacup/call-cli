@@ -4,9 +4,10 @@ const fs = require('fs'), path = require('path'), os = require('os'), crypto = r
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const excluded = name => name.startsWith('.') || ['node_modules', '__pycache__', 'auth.json'].includes(name) || /(?:\.pem|\.key)$/i.test(name) || /^(?:id_|credentials)/i.test(name);
 function directory(dir) {
-  if (fs.existsSync(dir)) {
-    if (fs.lstatSync(dir).isSymbolicLink() || !fs.statSync(dir).isDirectory()) throw Error('Unsafe skill directory');
-  } else fs.mkdirSync(dir, {mode: 0o700});
+  try { fs.mkdirSync(dir, {mode: 0o700}); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const stat = fs.lstatSync(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw Error('Unsafe skill directory');
 }
 function rootFor(task) {
   if (!/^[a-f0-9]{16}$/.test(task)) throw Error('Invalid task identity');

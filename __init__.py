@@ -17,24 +17,24 @@ SCHEMA={
     'name':'call_cli',
     'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/intervene/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
-        'action':{'type':'string','enum':['start','list','status','events','reply','intervene','cancel','close','reconcile']},
+        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','intervene','cancel','close','reconcile']},
         'task_id':{'type':'string'},
         'device':{'type':'string','description':'local or an existing SSH host alias from call-cli device table'},
         'remote_shell':{'type':'string','enum':['posix','powershell'],'default':'posix'},
         'agent':{'type':'string','enum':list(BACKENDS)},
-        'model':{'type':'string','description':'Advertised ACP model ID; omitted uses G4C. G4C defaults native swarm; G4A defaults off'},
+        'model':{'type':'string','description':'Advertised exact model ID or native AGY family; omitted uses G4C. G4C defaults native swarm; G4A defaults off'},
         'effort':{'type':'string','description':'AGY advertised thought_level value; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
-        'command_id':{'type':'string','description':'Stable intent ID; required for intervene and cross-controller or new no-question reply; reuse on retry'},
+        'command_id':{'type':'string','description':'Stable intent ID; required for dialogue/intervene and cross-controller or new no-question reply; reuse on retry'},
         'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
         'agy_approval':{'type':'string','enum':['approve-all','approve-reads'],'description':'AGY only: new tasks default to approve-all; approve-reads denies shell/write permission requests. Not a filesystem sandbox; independent of write reservation.'},
         'agy_swarm':{'type':'string','enum':['native','off'],'description':'AGY task override: native/on or single-agent/off. G4C defaults native, G4A defaults off'},
-        'agy_worker_model':{'type':'string','description':'Exact advertised AGY native execution model; defaults to live-resolved G4H'},
+        'agy_worker_model':{'type':'string','description':'Advertised exact ID or native AGY worker family; defaults to G4H with catalog current effort'},
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
-        'expected_turn':{'type':'integer','description':'Observed turn being answered; required for cross-controller continuation, new no-question reply and native close/reconcile recovery'},
+        'expected_turn':{'type':'integer','description':'Observed turn; required for dialogue, cross-controller continuation, new no-question reply and native close/reconcile recovery'},
         'after':{'type':'integer','default':0},
         'clear_timeout':{'type':'boolean','description':'reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'}
     },'required':['action'],'additionalProperties':False}
@@ -71,7 +71,7 @@ class Coordinator:
         action=args['action']
         store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root, action=action)
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
-        if action in {'status','events','reply','intervene','cancel','close','reconcile'}:
+        if action in {'status','events','reply','dialogue','intervene','cancel','close','reconcile'}:
             task=store.get(args.get('task_id',''),origin)
         if action=='start':
             agent=args.get('agent');device=args.get('device','local');cwd=args.get('cwd','');prompt=args.get('prompt','')
@@ -88,6 +88,10 @@ class Coordinator:
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=None,continuation_version=2,
                               needs_session=True,acpx_created=False,session_creation_attempted=False,**fields)
             return self.launch(store,task)
+        if action=='dialogue':
+            task=store.dialogue(task['id'],origin,args.get('prompt',''), expected_turn=args.get('expected_turn'),
+                                command_id=args.get('command_id'), question_id=args.get('question_id'))
+            return {'task':self.public(task),'note':'Dialogue accepted by bound owner queue; not sent or adopted until evidence returns'}
         if action=='intervene':
             prompt=args.get('prompt','')
             command_id=args.get('command_id','')

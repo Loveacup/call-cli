@@ -1,6 +1,6 @@
 # 给 AI：在线协作手册
 
-本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。通用入口支持 `connect/start/list/status/events/wait/reply/intervene/cancel/close`；Hermes 原生工具只使用其实际提供的动作。
+本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。源码通用入口支持 `connect/start/list/status/events/wait/reply/dialogue/intervene/cancel/close`；`dialogue` 仅适用于有输入能力的 AGY native 原 owner。Hermes 候选另有受控 `reconcile`，实际调用以当前加载 schema 为准，不把源码动作当成现役已安装。
 
 ## 调用约定
 
@@ -23,7 +23,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
-- native 不设硬执行 timeout，首 end_turn 后仍 running。正常按本轮最终结果、对应 worker add/kill completed 和 session unload 结算并释放，不承诺所有后代死亡；缺 rawOutput 不单独保 HOLD。旧轮 result/cleanup/roster 不复用。fatal/异常退出/缺必要事件/取消不明保 unknown，attention_required 事件经 runner／既有宿主主动回流；OMP triggerTurn follow-up 与 Hermes notify 仅说明路径，实际接收／消费另验。真实取消未验且不追加付费专项。
+- native 不设硬执行 timeout，首 end_turn 后仍 running。正常业务按本轮结果、对应 worker add/kill completed 和 session unload 结算；可信取消按独立 owner receipt，不要求 native_result。缺 rawOutput 不单独保 HOLD；fatal/断线/缺证/取消不明仍 unknown，不自动重放。AGY 1.5.8 v3 候选单 worker 已实测 end_turn 后一次公开 cancel、cleanup kill+status、精确 unload/not-found、可信 cancelled、重复 close 相等及 natural exit 0。限线程 launcher/观测 wrapper 路径，不是部署、active-tool 热取消或所有后代全停证明；宿主接收/消费另验，后续付费调用须明确授权。见[当前验收索引](../VERIFICATION.md#current-acceptance-index)。
 - 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
@@ -43,6 +43,8 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 
 `unknown` 轮的 `answer_tail` 与累计 `answer` 可能仍含工具前文字，仅用于历史／部分结果对账，不是完成证据；须先按终态判断，再验收具体成果。迟到的重复工具更新即使不再产生工具通知，也会重置最终回答窗口；其后没有新回答或待答问题时会保守结算为 `unknown`，不能用旧 `answer_tail` 覆盖该结算。
 
+OMP 与 AGY 的 unknown 现复用原 runner 的主动 attention 通知：携精确 task/turn/seq、originating-session 范围及保留 HOLD/禁止自动重放的下一动作。仅 stage 输出仍是 unknown，不当作完成。OMP 发起扩展通过既有 wait/followUp 对同轮 snapshot/迟到终态去重，新 turn 可再提醒；已入队不代表模型消费或用户收到。收到取消后的 pending intervene 时，由原 controller 消费 Hermes status/events（通用入口 wait）推进一次 successor，继续验实际 target_turn 和修订结果；unknown 不续派。
+
 问题协议使用 `CALLCLI_QUESTION Q1 问题正文`（依次 Q2、Q3）：`Q[1-9][0-9]*` 后接一个 ASCII 空格和非空正文。编号是同一 task/turn 内的逻辑问题身份，不是源 messageId，也不用于授权。相同编号与完整正文指纹（SHA-256 与字符长度）相同的复述只登记一次，保留首个 event token 供 reply；不同编号或无编号的同文问题仍各需一答。同编号正文不同保留独立可答 token，并附安全 `question_note`，不打断收流或覆盖正文。身份计算发生在公开文本截到 8000 字符之前；不持久化或通知超长原始正文。旧事件缺少完整身份依据时保守保留，不凭截断前缀合并。下一轮可重新使用 Q1；历史事件不回写，旧任务已登记的重复 token 不自动合并。
 
 编号问题事件公开 `question_label`、`question_sha256`、`question_length`；同编号不同正文另带 `question_note`。指纹覆盖解码后完整问题文本（含编号、UTF-8 编码），长度为字符数，均在 8000 字符公开上限之前计算；因此两条可见截断文本相同的事件仍可能有不同指纹并分别待答。
@@ -52,6 +54,14 @@ runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标
 `Q1:`、`Q1.`、编号前多余空格或编号后多个空格不属于该身份语法，按无编号问题逐条登记，不进行宽松推断。原失败公开文本以 `Q1 ` 开头，已符合此规则；该形状的回放已通过，但真实任务仍需部署后的父方验收。
 
 编号身份由持久事件保存，重新打开 Store 或同轮重复提交不重新登记已回答的问题；这不提供 runner 崩溃后自动恢复或 exactly-once 投递。普通同 token 重放、旧轮事件拒收及全部独立问题答完才续轮的规则不变。
+
+native AGY 成功完整 replay 先按 baseline 前缀校验并生成 turn delta，公开事件与 completion 共用它；首次 replay 以有序文本游标允许跨工具块拆分／合并，新增重复同文保留，顺序／正文改写拒绝。后续 load 仍按位置校验，历史重分块可进入 unknown/HOLD；没有真实后续持久 history 重分块证据，不扩展重写算法。工具按 ID 合并有效状态。`native_observation` 保存本轮最后成功／语义变化墙钟时间、安全 pending_tools、question_ids 与 input_available；后者仅表示已注册原 owner 输入能力，unknown/退出后为 false，新 turn 清除旧观察，不证明 worker 活性。
+
+完整问题依换行、新追加的原生工具／用户块或该文本所属前台 end_turn 发布；历史工具原位更新、完整 load、重复快照、异常退出和本地主动提交 dialogue 都不证明背景尾行结束。主动输入前的半行／协议前缀保留原 interaction，单独跟踪同 owner 的原 history 槽位与前缀，阻止 seal/unload。后续原槽位本次确有前缀增长时，换行或紧邻的原生 tool/user 后继块可证明边界；后继可已在前次成功 replay 中存在。整次 replay 校验成功后才按原 interaction 恰好一次发布。无增长时即使追加 tool/user 也不 flush 暂存片段；无边界仍阻塞。新输入同文问题独立保留，可逐 token dialogue 回答后正常结算。不支持任意历史重分块或猜测移位归属；歧义／改写保 unknown/HOLD，不重放、不伪称恢复。
+
+`native_observation.question_blockers` 仅公开 interaction_seq、固定 reason、blocks_completion 和 available_actions，不含片段正文、长度或指纹。正常 incomplete_question 的动作是观察原 owner、显式 dialogue 或经复核取消；阻塞集合变化产生一次安全 stage/notice_kind=incomplete_question，不逐 load 刷屏。明确槽位归属歧义时公开 history_ambiguous；断线等其他失败使用中性 unresolved_question，真实原因保留在 settlement_note。两者动作均为 inspect_origin/reconcile_hold，旧输入能力失效。半行不是正式 question_id，不能当已答；取消不证明 worker 停止或 HOLD 释放。
+
+
 
 - `running`：结合真实阶段、工具状态和产物判断进展；静默不等于卡死。
 - `waiting_reply`：读取具体问题，再自行判断或询问用户。必须使用返回的准确 question ID。
@@ -68,7 +78,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
   --prompt '针对该问题的真实回答'
 ```
 
-多个问题逐项回答，全部记录后才续轮。发起 CLI 必须自行消费事件和作答；测试脚本替它代答不能证明原生发起端闭环。不要把监控写成一条长期占住控制权的 shell 循环，要允许用户在发起端继续输入要求。
+既有 ACPX 路径逐项 reply 后续轮；native AGY 用 `dialogue --task TASK_ID --expected-turn TURN --command-id STABLE_ID --question-id QUESTION_ID --prompt ANSWER`，同运行轮逐问串行送入原 owner。question_id 只在返回 end_turn 后从待答列表移除；RPC 返回只证明输入返回，不证明业务采用。相同 task/turn/interaction 编号和完整正文的问题重述幂等，下一 interaction 可重用编号，旧待答问题不会自动丢弃。协调者持续消费并独立读回结果，不以测试代答冒充真实宿主消费。
 
 ## 执行中主动改向或传达用户要求
 
@@ -82,6 +92,12 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 ```
 
 同一次提交的重试复用同一个 command ID。`pending/queued` 仅证明提交，不证明改向生效。实现语义是：请求介入 → 原轮取消 → 确认原轮结算 → 同目标会话续轮 → 读取修订结果。继续短 `wait` 驱动和观察状态转换，不宣称无损热修改。
+
+AGY native 自动观察只 load，禁止定时 nudge；显式串行输入用新 `dialogue`，不走本段 cancel+resume。必填 observed expected_turn 和稳定 command_id，可选 question_id；只支持当前 controller、running、launch/epoch 匹配且 accepting 的原 owner。load/prompt outstanding 时仅排队，请求返回后串行发送，task.turn 和 session roster 不变。commands 的 accepted→claimed→send_started→returned 不是业务采用证明；发送不明 unknown 不重放，未发送 not_sent 不自动补发。每输入 interaction_seq 递增，当前 final 必须携带匹配 interaction_seq，旧结果不能结算；待答/待发送命令阻止 seal/unload。新候选 schema 不等运行 gateway 已加载，旧 G4C owner 无能力明确 unsupported，不第二 owner 接管。
+
+回答准入从持久原 question event 提取 token、label、原 interaction、公开正文及完整身份指纹，随 CALLCLI_DIALOGUE 结构头送入原 owner，避免同答案／倒序答问混淆；仅返回后移除精确目标 token，其余待答保留。正文沿用公开有界投影，不冒称截断长问题的全文。后续 prompt live 文本在自身 end_turn 发布完整无换行问题，与下一成功 load 按序对齐避免重复。原生 post_message completed 只证明 dispatch 已观察；公共 ACK 是 coordinator-reported，实际采用须独立产物读回。fixture 校验头并据实际身份生成结果，合成 ACK 不是真实 worker 收件证明。claimed/send_started 后不明不重领不重放。
+
+
 
 清除误设/继承预算：reply/intervene 支持布尔 `clear_timeout`，CLI 对应 `--clear-timeout`；省略保留预算。reply 需等原轮结算，多个问题的清除选择暂存到最后一答推进新轮；中途 intervene 替换答题序列会丢弃该暂存选择，由介入自身的 clear 决定。running/cancelling 介入只记录下一轮清除，确认原轮结算后原子应用；撤回不改旧预算。所有 queued 清除保守拒绝（后台进程可能已捕获旧预算），可等待结算或显式取消后再介入；普通 queued 介入不变。unknown 仍拒绝续轮并保留锁。CLI/OMP reply 必须有真实未答 question_id，completed 无问题用 intervene；Hermes 保留无问题的 completed reply 能力。
 
@@ -114,6 +130,18 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 ```
 
 取消受理不等于远端停止。确认实际轮次、退出与终止证据后再转移写权限；EOF、SSH 断线或超时不能代替停写证明。保留已有成果，未知状态不自动另派同一实现。
+
+AGY native 候选把取消清理与业务成功分开：封普通输入后，由原 owner 在 end_turn、可信 roster、无活动工具的串行边界必要时发送一次绑定 cancel_id 的 cleanup-only prompt，撤销旧业务，仅 kill 精确已知 worker，并允许确认过的原生 swarm status 观察。status 的原始工具 ID/name/action、原始参数契约与最终 completed/kind/worker 证据均严格校验，不代替 kill。完整 history 对账每 worker completed kill 后才精确 unload、提交匹配 task/session/turn/launch/epoch/cancel_id 的可信 receipt，允许 cancelled；不要求 CALLCLI_RESULT、不伪造 native_result。缺证、failed、新 worker/re-add、未知/业务工具或发送不明仍 HOLD，不提前 session unload。dialogue 取消只确认该输入返回，不当已答；accepted 未发记 not_sent。正常 seal 后晚到 cancel/intervene 拒绝。
+
+取消在 load outstanding 期间提交时，该 load 返回不能扩充取消 roster；清理仍以请求开始前最后可信完整 history（首次则为已发布 live 工具集合）为准。首次取消 replay 使用严格有序 live/replay 对齐，允许合法 user 回显和分块差异，工具身份／结构缺失或改写拒绝；后续完整快照继续前缀校验。已知 worker 的状态升级允许，新 add 不准入。原始 replay 中 completed kill 后再次 add 同 worker，即使复用 toolCallId，也因 generation 歧义保 HOLD，不能由 snapshot 合并掩盖。cancelled 不能借 native_result/普通成功 cleanup JSON 走 completed 门禁。
+
+
+native close 只消费已有 cleanup，不再发原生 close。Hermes reconcile(expected_turn) 可对 unknown 读回可信取消／fresh-no-prompt receipt；CLI/OMP 用 close 同一证据门禁。task JSON 手填字段、coordinator 文本、ACPX no-session 都不能代替 owner receipt；缺证保 HOLD，不能卸载后第二 owner attach/load 或重放 close。fresh 独占创建、空 preprompt baseline、未提交 prompt 且 exact unload 的模型设置失败可安全 close，原 unknown/诊断保留至 close；reused/创建不明不适用。
+
+完成或可信取消已卸载后，同逻辑 task 后续 turn 使用 fresh native session 并记 native_predecessor_session_id，不冒充同 native session resume。native_owner_exit 按实际记录 natural/terminate-fallback/kill-fallback 及 returncode；成功路径默认 stop 的 fallback 能力仍存在，v3 实际为 natural 0。取消清理未证路径仅关 stdio、有界观察，不发送 terminate/kill；退出未证记 PID、stdio-closed-exit-unverified，worker fate 仍 unknown，原 owner 退出后持续协调/恢复 unsupported，不称活现场可恢复。receipt 不防有权直接修改私有 DB 的操作者伪造，也不证明任意后代全停。
+
+关闭诊断区分 operation/stage/substep；pre-fence 诊断 operation 保留 backend 的 resolve，用户 close/reconcile 意图另记 requested_action。resolve 失败持久 close_diagnostic 且 external_close_attempted=false，保原 completed、不造 fence；修复依赖后显式 close 可重新 resolve。post-fence close 一次，后续只 probe；first_failure 与 latest_probe 分开，secondary shutdown 单列。仅公开安全 name/code、returncode/signal/timeout、stderr 有无/长度，不回流 message/stack/raw stderr。候选通过不代表当前服务已加载。
+
 
 完成后读回产物、检查范围并执行必要测试；只读任务则核对返回值与真实输入。执行方自报“完成”不是验收。随后关闭并核对结果：
 
