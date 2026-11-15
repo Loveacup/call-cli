@@ -125,5 +125,80 @@ function adapter({badReadback=false,replacement=false,badBefore}={}) {
     [{syscall:'spawnSync npm',code:'ETIMEDOUT'}, 'npm_root_timeout'],
     [{message:'PRIVATE_SENTINEL',stack:'PRIVATE_SENTINEL'}, 'backend_unavailable']
   ]) assert.equal(failureReason(error), reason);
+
+  // Multi-scope lookup finds native-skip sessions created with full agent command flags.
+  let closedSkip = false, skipCloses = 0, resolvedAgents = [];
+  const skipTarget = {...target, agent: 'omp'};
+  const skipDeps = {loadRuntime: async () => ({
+    createAgentRegistry: () => ({resolve: name => `resolved:${name}`, list: () => ['omp']}),
+    createSharedAcpRuntime: ({agentRegistry}) => {
+      assert.equal(agentRegistry.resolve('omp acp --auto-approve --allow-home'), 'omp acp --auto-approve --allow-home');
+      assert.equal(agentRegistry.resolve('omp'), 'resolved:omp');
+      return {
+        getStatus: async () => ({acpxRecordId: skipTarget.record, backendSessionId: skipTarget.acp,
+          lastRequestId: 'fixture-task:4', details: {cwd: skipTarget.cwd, closed: closedSkip}}),
+        findSession: async ({agent}) => {
+          resolvedAgents.push(agent);
+          return (!closedSkip && agent === 'omp acp --auto-approve --allow-home')
+            ? {acpxRecordId: skipTarget.record, backendSessionId: skipTarget.acp, cwd: skipTarget.cwd, sessionKey: skipTarget.session}
+            : undefined;
+        },
+        close: async () => {closedSkip = true; skipCloses++;},
+        shutdown: async () => {}
+      };
+    }
+  })};
+  const skipRes = await closeTarget(skipTarget, skipDeps);
+  assert.equal(skipRes.verified, true);
+  assert.equal(skipCloses, 1);
+  assert.ok(resolvedAgents.includes('omp acp --auto-approve --allow-home'));
+
+  // probeTarget checks all candidate scopes including AGY skip-permissions.
+  const agyReopened = {loadRuntime: async () => ({
+    createAgentRegistry: () => ({resolve: name => `resolved:${name}`}),
+    createSharedAcpRuntime: () => ({
+      getStatus: async () => ({acpxRecordId: target.record, backendSessionId: target.acp,
+        lastRequestId: 'fixture-task:4', details: {cwd: target.cwd, closed: true}}),
+      findSession: async ({agent}) => agent === 'agy acp --dangerously-skip-permissions'
+        ? {acpxRecordId: 'reopened'} : undefined,
+      close: async () => {throw Error('PROBE_MUST_NOT_CLOSE');},
+      shutdown: async () => {}
+    })
+  })};
+  await assert.rejects(probeTarget({...target, agent: 'agy'}, agyReopened),
+    error => failureReason(error) === 'name_scope_replaced_or_reopened');
+
+  // Configured Windows-style executable path argv scope is discovered and passed cleanly on win32.
+  let winClosed = false, winResolved = [];
+  const winDeps = {
+    platform: 'win32',
+    resolveConfiguredAgentArgv: async () => ['C:\\Users\\example\\AppData\\Local\\omp\\omp.exe', 'acp', '--auto-approve', '--allow-home'],
+    loadRuntime: async () => ({
+      createAgentRegistry: ({overrides}) => {
+        assert.deepEqual(overrides.omp, ['omp', 'acp']);
+        return {resolve: name => `resolved:${name}`};
+      },
+      createSharedAcpRuntime: ({agentRegistry}) => {
+        const customScope = '"C:\\\\Users\\\\example\\\\AppData\\\\Local\\\\omp\\\\omp.exe" acp --auto-approve --allow-home';
+        assert.deepEqual(agentRegistry.resolve(customScope), ['C:\\Users\\example\\AppData\\Local\\omp\\omp.exe', 'acp', '--auto-approve', '--allow-home']);
+        assert.deepEqual(agentRegistry.resolve('omp acp --auto-approve --allow-home'), ['omp', 'acp', '--auto-approve', '--allow-home']);
+        return {
+          getStatus: async () => ({acpxRecordId: target.record, backendSessionId: target.acp,
+            lastRequestId: 'fixture-task:4', details: {cwd: target.cwd, closed: winClosed}}),
+          findSession: async ({agent}) => {
+            winResolved.push(agent);
+            return (!winClosed && agent === customScope)
+              ? {acpxRecordId: target.record, backendSessionId: target.acp, cwd: target.cwd, sessionKey: target.session}
+              : undefined;
+          },
+          close: async () => {winClosed = true;},
+          shutdown: async () => {}
+        };
+      }
+    })
+  };
+  assert.equal((await closeTarget({...target, agent: 'omp'}, winDeps)).verified, true);
+  assert.ok(winResolved.some(a => a.includes('omp.exe')));
+
   console.log('STRICT_NATIVE_RELEASE_PROOF_OK');
 })().catch(error=>{console.error(error);process.exitCode=1;});

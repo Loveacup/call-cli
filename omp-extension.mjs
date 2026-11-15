@@ -1,8 +1,8 @@
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
-const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close']);
-const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision']);
+const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']);
+const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
 const visible = new Set(['stage', 'question', 'permission', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
 
@@ -109,10 +109,12 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       if (args && Object.hasOwn(args, 'clear_timeout') && !['reply', 'intervene'].includes(args.action)) throw new Error('clear_timeout requires reply or intervene');
       if (!args || Object.keys(args).some(name => !fields.has(name)) || !actions.has(args.action)) throw new Error('Unsupported action or host field');
       if (args.action === 'dialogue' && (!args.command_id || !Number.isInteger(args.expected_turn) || args.expected_turn < 1)) throw new Error('dialogue requires expected_turn and stable command_id');
+      if (args.action === 'release_only' && (!Number.isInteger(args.expected_turn) || args.expected_turn < 1)) throw new Error('release_only requires observed expected_turn');
+      if (Object.hasOwn(args, 'abandon') && (args.action !== 'release_only' || typeof args.abandon !== 'boolean')) throw new Error('abandon requires release_only and a boolean');
       const bindingKey = key(ctx);
       let binding = bindings.get(bindingKey);
       if (!binding) {
-        if (!['start', 'list'].includes(args.action)) throw new Error('Current host session is not bound');
+        if (!['start', 'list', 'release_only'].includes(args.action)) throw new Error('Current host session is not bound');
         let pending = pendingBindings.get(bindingKey);
         if (!pending) {
           const expectedGeneration = generation;
@@ -133,7 +135,7 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       if (!live(binding, ctx)) throw new Error('Host session changed; action outcome must be reconciled, not replayed');
       if (result.task) {
         const id = result.task.id;
-        if (args.action === 'close') {
+        if (args.action === 'close' || args.action === 'release_only') {
           binding.tasks.delete(id);
           if (binding.timer && ![...binding.tasks.values()].some(track => track.active)) {
             binding.ctx.clearTimer(binding.timer);
@@ -171,14 +173,15 @@ export default function register(pi) {
   const z = pi.zod;
   pi.registerTool({name: 'call_cli_omp', label: 'Call CLI', description: 'Coordinate an exact task from this OMP host session. Host identity is injected, never model supplied. Events return as queued follow-ups; not steer.',
     parameters: z.object({action: z.enum([...actions]), task_id: z.string().optional(), agent: z.enum(['omp', 'codex', 'pi', 'agy']).optional(),
+      abandon: z.boolean().optional().describe('release_only only: accept possible active native/detached work and release ownership without stop proof'),
       device: z.string().optional(), cwd: z.string().optional(), prompt: z.string().optional(), write: z.boolean().optional(), resource: z.string().optional(),
       clear_timeout: z.boolean().optional().describe('reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'),
-      model: z.string().optional().describe('AGY oc/oa/4c/4a/4h: bare=single, s=Swarm, t=Teamwork; omitted=ocs. Advertised IDs supported; shorthand/mode conflicts reject'), effort: z.string().optional(), agy_approval: z.enum(['approve-all', 'approve-reads']).optional(), remote_shell: z.enum(['posix', 'powershell']).optional(),
+      model: z.string().optional().describe('AGY oc/oa/4c/4a/4h: bare=single, s=Swarm, t=Teamwork; omitted=ocs. Advertised IDs supported; shorthand/mode conflicts reject'), effort: z.string().optional(), agy_approval: z.enum(['skip-permissions', 'approve-all', 'approve-reads']).optional(), remote_shell: z.enum(['posix', 'powershell']).optional(),
       agy_swarm: z.enum(['native', 'off']).optional().describe('AGY route override for advertised IDs; must match shorthand: bare=off, s=native'), agy_worker_model: z.string().optional(),
-      agy_mode: z.enum(['single', 'swarm', 'teamwork', 'dynamic']).optional().describe('Explicit execution mode; native modes require their advertised command; Dynamic requires exact script approval'),
+      agy_mode: z.enum(['single', 'swarm', 'teamwork', 'dynamic']).optional().describe('Explicit execution mode; native modes require their advertised command; default skip-permissions executes Dynamic /run-workflow natively (explicit non-skip preserves script approval)'),
       permission_id: z.string().optional(), script_sha256: z.string().optional(), decision: z.enum(['allow_once', 'reject_once']).optional(),
       skills: z.array(z.object({path: z.string(), mode: z.enum(['required', 'optional', 'reference']), location: z.enum(['origin', 'target']).optional()})).optional(),
-      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'), expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue'), after: z.number().optional()}).strict(),
+      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'), expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue and release_only'), after: z.number().optional()}).strict(),
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await adapter.execute(args, ctx);
       return {content: [{type: 'text', text: JSON.stringify(result)}]};

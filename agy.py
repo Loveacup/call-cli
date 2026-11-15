@@ -10,20 +10,32 @@ except ImportError:
 
 
 AGY_FATAL_LINE = '\u26a0 Agent execution terminated due to error.'
+AGY_APPROVALS = {'skip-permissions', 'approve-all', 'approve-reads'}
+
+
+def is_skip_permissions(task):
+    return task.get('execution_policy') == 'native-skip' or task.get('agy_approval') == 'skip-permissions'
 
 
 def permission_mode(task):
     # Missing persisted fields are legacy tasks, not permission to widen access.
     value = task.get('agy_approval')
     if value is not None:
-        if value not in {'approve-all', 'approve-reads'}:
-            raise ValueError('agy_approval must be approve-all or approve-reads')
-        return value
+        if value not in AGY_APPROVALS:
+            raise ValueError('agy_approval must be skip-permissions, approve-all, or approve-reads')
+        return 'approve-all' if value == 'skip-permissions' else value
+    if task.get('execution_policy') == 'native-skip':
+        return 'approve-all'
     return 'approve-all' if task['write'] else 'approve-reads'
 
 
 def prompt_guidance(task):
     mode = permission_mode(task)
+    if is_skip_permissions(task):
+        return ('Prefer native read/search tools for reading and searching. '
+                'Tool approval policy: skip-permissions (native CLI permission, sandbox, and directory prompts skipped; parent fallback approve-all). '
+                'Shell execution is approved within the stated task scope. '
+                'This policy does not expand business task authorization, task identity, or writer lock.\n\n')
     return ('Prefer native read/search tools for reading and searching. '
             'Tool approval policy: '+mode+'. '
             + ('Shell execution is approved within the stated task scope. '
@@ -41,6 +53,11 @@ def outcome_note(decoder, exit_code, state):
     reason = None
     if fatal_error(decoder.text):
         reason = 'AGY reported a fatal execution error (final line "'+AGY_FATAL_LINE+'")'
+    elif decoder.final_answer.strip() == '⚠ Model produced invalid output.':
+        # Observed error-only response, not arbitrary prose mentioning an error.
+        return ('AGY reported "⚠ Model produced invalid output."; no usable final answer '
+                'although the protocol ended '+str(decoder.stop_reason)+' with exit '+str(exit_code)
+                +'; turn not completed, outcome unknown, no automatic replay.')
     elif (exit_code == 0 and not decoder.failed and decoder.stop_reason == 'end_turn'
           and state == 'completed' and decoder.tool_failed and not decoder.final_answer.strip()):
         reason = 'AGY tool failed without a final answer'
@@ -60,13 +77,21 @@ class AgyBackend(AcpxBackend):
 
     def prepare_start(self, model, effort, approval):
         self.validate_selection(model, effort)
-        approval = 'approve-all' if approval is None else approval
-        if approval not in {'approve-all', 'approve-reads'}:
-            raise ValueError('agy_approval must be approve-all or approve-reads')
-        return dict(agy_approval=approval, **{k:v for k,v in dict(model=model, effort=effort).items() if v is not None})
+        approval = 'skip-permissions' if approval is None else approval
+        if approval not in AGY_APPROVALS:
+            raise ValueError('agy_approval must be skip-permissions, approve-all, or approve-reads')
+        fields = dict(agy_approval=approval, **{k:v for k,v in dict(model=model, effort=effort).items() if v is not None})
+        if approval == 'skip-permissions':
+            fields['execution_policy'] = 'native-skip'
+        return fields
+
+    def agent_argv(self, task):
+        if is_skip_permissions(task):
+            return ['agy', 'acp', '--dangerously-skip-permissions']
+        return ['agy', 'acp']
 
     def agent_args(self, task):
-        return ['--agent', 'agy acp']
+        return ['--agent', ' '.join(self.agent_argv(task))]
 
     def permission_mode(self, task):
         return permission_mode(task)

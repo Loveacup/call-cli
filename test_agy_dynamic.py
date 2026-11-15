@@ -35,7 +35,7 @@ class DynamicTests(unittest.TestCase):
 
 class DynamicLifecycleTests(unittest.TestCase):
     @contextlib.contextmanager
-    def workspace(self, fault='normal', surface='generic', transform=None):
+    def workspace(self, fault='normal', surface='generic', transform=None, agy_approval='approve-all'):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root/'agy'
@@ -70,8 +70,11 @@ class DynamicLifecycleTests(unittest.TestCase):
                         if action=='events': return dict(events=host.events(key, **args))
                         return dict(task=getattr(host, action)(key, **args))
                     db = host.store.path
-                task = handle(dict(action='start', agent='agy', cwd=directory, prompt='synthetic workflow',
-                    agy_mode='dynamic', model='gemini-4-argon', effort='low', write=True))['task']
+                start_args = dict(action='start', agent='agy', cwd=directory, prompt='synthetic workflow',
+                    agy_mode='dynamic', model='gemini-4-argon', effort='low', write=True)
+                if agy_approval is not None:
+                    start_args['agy_approval'] = agy_approval
+                task = handle(start_args)['task']
                 thread = threading.Thread(target=lambda: run_task(db, task['id'], turn=task['turn'],
                     launch_id=task['launch_id'], epoch=task['control_epoch']))
                 thread.start()
@@ -416,6 +419,86 @@ class DynamicLifecycleTests(unittest.TestCase):
             self.assertEqual(status()['state'],'unknown')
             self.assertIn('control did not settle',status().get('settlement_note',''))
             self.assertNotIn('native_cleanup',status())
+
+    def test_default_skip_permissions_dynamic_runs_natively_across_hosts(self):
+        for surface in ('generic', 'hermes', 'omp'):
+            with self.subTest(surface=surface), self.workspace(surface=surface, agy_approval=None) as (root, handle, task, thread, status, events, _):
+                self.assertEqual((task['agy_approval'], task['execution_policy']), ('skip-permissions', 'native-skip'))
+                thread.join(6)
+                self.assertFalse(thread.is_alive())
+                argv = json.loads((root/'argv.json').read_text())
+                self.assertIn('--dangerously-skip-permissions', argv)
+                self.assertNotIn('native_permission', status())
+                self.assertFalse(any(e['kind']=='permission' for e in events()))
+                self.assertIn('Execute authorized workflows natively under skip-permissions', (root/'prompt').read_text())
+                self.assertEqual(status()['state'], 'completed', status().get('settlement_note'))
+                self.assertEqual(status()['native_phase'], 'settled')
+                self.assertEqual(status()['native_cleanup']['outcome'], 'completed')
+                self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+
+    def test_skip_permissions_dynamic_unexpected_permission_and_guards(self):
+        with self.workspace('force-permission', agy_approval=None) as (root, handle, task, thread, status, events, _):
+            thread.join(6)
+            self.assertEqual(status()['state'], 'completed', status().get('settlement_note'))
+            self.assertNotIn('native_permission', status())
+            self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+        for fault in ('foreign', 'mismatched-script', 'duplicate-option'):
+            with self.subTest(fault=fault), self.workspace(fault, agy_approval=None) as (root, handle, task, thread, status, _events, _wait):
+                thread.join(6)
+                self.assertEqual(status()['state'], 'unknown')
+                self.assertNotIn('native_cleanup', status())
+        def conflict(source):
+            return source.replace("            if fault!='async':\n",
+                "            update(dict(sessionUpdate='tool_call_update', toolCallId='workflow', rawInput=dict(Script='mutated'), status='completed'))\n            if fault!='async':\n", 1)
+        with self.workspace(agy_approval=None, transform=conflict) as (root, handle, task, thread, status, _events, _wait):
+            thread.join(6)
+            self.assertEqual(status()['state'], 'unknown')
+            self.assertNotIn('native_cleanup', status())
+
+    def test_skip_permissions_dynamic_requires_real_script_identity_and_allows_sparse_after_identity(self):
+        missing_old = "                rawInput=dict(Script='changed' if fault=='changed-executed-script' else script),\n"
+        rejected = {
+            'missing-script': lambda s: s.replace(missing_old, '', 1),
+            'in-progress-then-sparse-completed': lambda s: (
+                s.replace(missing_old, '', 1)
+                 .replace("                status='in_progress' if fault=='async' else 'failed' if fault=='failed' else 'completed'))\n",
+                          "                status='in_progress'))\n"
+                          "            update(dict(sessionUpdate='tool_call_update', toolCallId='workflow', status='completed'))\n", 1)
+            ),
+            'in-progress-then-late-script': lambda s: (
+                s.replace(missing_old, '', 1)
+                 .replace("                status='in_progress' if fault=='async' else 'failed' if fault=='failed' else 'completed'))\n",
+                          "                status='in_progress'))\n"
+                          "            update(dict(sessionUpdate='tool_call_update', toolCallId='workflow', rawInput=dict(Script=script), status='completed'))\n", 1)
+            ),
+            'script-path': lambda s: s.replace(missing_old, "                rawInput=dict(ScriptPath='wf.py'),\n", 1),
+            'empty-script': lambda s: s.replace(missing_old, "                rawInput=dict(Script=''),\n", 1),
+        }
+        for label, transform in rejected.items():
+            with self.subTest(case=label), self.workspace(agy_approval=None, transform=transform) as (root, handle, task, thread, status, events, _wait):
+                thread.join(6)
+                final = status()
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(final['state'], 'unknown', final.get('settlement_note'))
+                self.assertEqual(sum(e['kind'] == 'permission' for e in events()), 0)
+                self.assertNotIn('native_cleanup', final)
+                self.assertFalse(any(r.get('method') == 'session/close' for r in self.requests(root)))
+                self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'unknown')
+
+        for suffix_case, extra_raw in (('omitted', ''), ('empty-obj', ', rawInput={}')):
+            def valid_sparse(s):
+                return (s.replace("                status='in_progress' if fault=='async' else 'failed' if fault=='failed' else 'completed'))\n",
+                                  "                status='in_progress'))\n"
+                                  "            update(dict(sessionUpdate='tool_call_update', toolCallId='workflow', status='completed'" + extra_raw + "))\n", 1))
+            with self.subTest(sparse=suffix_case), self.workspace(agy_approval=None, transform=valid_sparse) as (root, handle, task, thread, status, events, _wait):
+                thread.join(6)
+                final = status()
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(final['state'], 'completed', final.get('settlement_note'))
+                self.assertEqual(sum(e['kind'] == 'permission' for e in events()), 0)
+                self.assertEqual(final['native_cleanup']['outcome'], 'completed')
+                self.assertTrue(final['native_cleanup']['session_unloaded'])
+                self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
 
 if __name__ == '__main__':
     unittest.main()

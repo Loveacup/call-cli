@@ -64,6 +64,7 @@ class HostBridge(Collaboration):
             'dialogue': {'task_id', 'prompt', 'command_id', 'expected_turn', 'question_id'},
             'permission': {'task_id', 'expected_turn', 'command_id', 'permission_id', 'script_sha256', 'decision'},
             'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},
+            'release_only': {'task_id', 'expected_turn', 'abandon'},
         }
         args = dict(args)
         action = args.pop('action', '')

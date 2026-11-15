@@ -48,7 +48,7 @@ OMP 实验适配复用现有 core／writer 互斥：同 session 首次并发请�
 
 ## 权限与任务材料
 
-授权决定业务范围；审批不是沙箱，write 表示编辑授权与目录占用。新 AGY 默认 `ocs`，裸简称 off、后缀 s 原生 Swarm、t 原生 Teamwork 源码候选；显式模式须匹配，缺广告不降级。旧任务、完整广告 ID 与其他 CLI 保持兼容。内部角色、分工、审批策略及权限由 AGY 原生负责，桥不设置父写／子只读或子权限证明门槛，不改 AGY 配置和调度。公开问题／审批事件沿现有机制传递，无事件明确不可观测；native 问题用绑定原 question_id 的 dialogue，普通 reply 仍为已结算轮续办。正常公开结果与精确卸载不要求逐成员 add/kill、不宣称后代全停；Teamwork 首次委派返回不是完成，观察边界见[模式合同](references/agy-models.md)。fatal/异常 unknown 主动回流，不自动重放；源码、安装与用户实收分别验。
+授权决定业务范围；**新启动**的 `OMP`/`Codex`/`Pi`/`AGY` 默认启用 `native-skip`（经各 CLI 原生参数与模式跳过交互审批、CLI 沙箱与目录限制，不仅父级 `approve-all`），同时严格保留业务范围、`origin`/`controller` 身份隔离与 `write` 单 writer 互斥（中继或并发只读任务仍保持 `write: false`）。现有运行中/历史任务不打断、不扩权；不改任何 CLI 全局用户配置、上游包或凭据。AGY 显式 `--agy-approval approve-all|approve-reads` 保留非 skip 兼容，Dynamic 在默认 `skip-permissions` 下直接原生执行 `/run-workflow` 而不再阻塞自造脚本审批，显式非 skip 才要求精确 `permission`。新 AGY 默认 `ocs`，裸简称 off、后缀 s 原生 Swarm、t 原生 Teamwork 源码候选；显式模式须匹配，缺广告不降级。内部角色、分工、审批策略及权限由 AGY 原生负责，桥不设置父写／子只读或子权限证明门槛，不改 AGY 配置和调度。公开问题／审批事件沿现有机制传递，无事件明确不可观测；native 问题用绑定原 question_id 的 dialogue，普通 reply 仍为已结算轮续办。正常公开结果与精确卸载不要求逐成员 add/kill、不宣称后代全停；Teamwork 首次委派返回不是完成，观察边界见[模式合同](references/agy-models.md)。fatal/异常 unknown 主动回流，不自动重放；源码、安装与用户实收分别验（源码候选在部署与宿主重载前不对运行中会话生效）。
 
 方法材料先本地选择，不足再按相关性、维护来源与实质更新找公开候选；[任务技能传递](references/skill-passing.md)提供 required／optional／reference 快照与逐轮读取／采用核验。暂存、读取、自报采用、独立验收是不同证据；传递 skill 不扩大业务权限，也不默认全局安装。
 

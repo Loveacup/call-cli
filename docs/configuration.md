@@ -133,7 +133,7 @@ PowerShell 客户端当前使用 macOS `/usr/bin/base64 -D`，仅核验 macOS �
 - 新建任务前说明首轮的 npm 版本查询；升级是单独维护动作，确认这类副作用在用户授权内。不要从项目维护者的个人环境推导当前用户授权。
 - 同一协作复用同一 DB 与 client handle。Hermes 插件的 DB 由宿主代码定位，没有独立的 DB 配置键；通用入口要复用其任务库时，先核对实际路径。
 - 源码不会替你把文件同步到执行设备；cwd 和产物都属于目标设备。
-- OMP/Codex/Pi 默认 `approve-reads`，`--write` 使用 `approve-all`。新 AGY 默认持久化 `agy_approval: approve-all`；显式只读审批传 `--agy-approval approve-reads`。旧任务缺字段沿用原 `write` 映射，续轮保留策略。审批不是路径沙箱；`write` 仍用于写入授权与目录占用。把授权范围写进任务，保留目标 CLI 原有沙箱。
+- 经 Call-CLI **新启动**的 OMP/Codex/Pi/AGY 默认持久化 `execution_policy: native-skip`，以各 CLI 原生参数与模式跳过交互审批、CLI 沙箱与目录限制（OMP POSIX `--agent 'omp acp --auto-approve --allow-home'`、Windows 经 `acpx/runtime` 结构化 `agentArgv=['omp', 'acp', '--auto-approve', '--allow-home']`；Codex `INITIAL_AGENT_MODE=agent-full-access` + `set-mode agent-full-access`；Pi parent `approve-all`；AGY 默认 `agy_approval: skip-permissions`，POSIX 与 Windows `off` 经 `agy acp --dangerously-skip-permissions`），同时不改动任何 CLI 全局用户配置（`~/.acpx`、`~/.codex`、`~/.omp`、`~/.pi`、`~/.gemini`）、凭据或其他 profile。注：实证 ACPX Shared Runtime `fs/*` 回调仍硬性校验路径位于 `cwd` 子树（`ACP_INVALID_RUNTIME_OPTION` 拒绝覆写 `fs` 回调），属于待 PM/用户决策（Option A vs B）的公开上游缺口，跨目录读写依赖各 CLI 原生工具。仅 AGY 保留显式 `--agy-approval approve-all|approve-reads` 兼容。缺 `execution_policy` / `agy_approval` 的既有运行中与历史任务不打断、不扩权，续轮保留各自策略。`write` 仍独立用于写入授权与单 writer 工作区占用互斥，不得由并发中继或只读任务滥用；业务任务范围与来源身份隔离仍严格执行。注意：源码候选在受支持部署/宿主重载前不对运行中会话生效。
 - 不因创建另一 DB 就认定旧 writer 已停；先按原任务对账，不启动竞争写者。
 
 ### 认证

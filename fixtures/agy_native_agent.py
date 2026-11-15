@@ -8,6 +8,7 @@ import time
 import uuid
 
 root = Path(os.environ['AGY_NATIVE_FIXTURE'])
+(root/'argv.json').write_text(json.dumps(sys.argv[1:]))
 session = '11111111-1111-4111-8111-111111111111'
 model = os.environ.get('AGY_NATIVE_INITIAL_MODEL', 'gemini-4-carbon')
 closed = (root/'closed-session').exists()
@@ -101,6 +102,8 @@ for line in sys.stdin:
             update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
         if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
             update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
+        if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
+            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
     elif method == 'session/set_config_option':
         if closed:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
@@ -151,6 +154,35 @@ for line in sys.stdin:
             captured=None
             send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
             continue
+        if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
+            body = msg['params']['prompt'][0]['text']
+            race = os.environ['AGY_NATIVE_HISTORY_RACE']
+            if not body.startswith('CALLCLI_DIALOGUE '):
+                saved = [dict(sessionUpdate='agent_message_chunk', content=dict(type='text',
+                    text='CALLCLI_QUESTION Q1 Which label?\n'))]
+                if race == 'non-tail':
+                    saved.append(dict(sessionUpdate='tool_call', toolCallId='work', name='read_file',
+                        kind='read', status='in_progress'))
+                for entry in saved: update(entry)
+            else:
+                # Native background writes between the last load and this prompt.
+                saved[0]['content']['text'] += 'Late background answer\n'
+                if race == 'non-tail': saved[1]['status'] = 'completed'
+                if race == 'rewrite': saved[0]['content']['text'] = 'Rewritten old question\n'
+                if race == 'delete': saved.clear()
+                if race == 'multi' and any(e['sessionUpdate']=='user_message_chunk' for e in saved):
+                    saved[0]['content']['text'] += 'Older interaction update\n'
+                saved.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)))
+                answer_text = 'Revised answer\n'
+                if race == 'multi' and sum(e['sessionUpdate']=='user_message_chunk' for e in saved) == 1:
+                    answer_text += 'CALLCLI_QUESTION Q2 Confirm revision?\n'
+                answer = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=answer_text))
+                saved.append(answer)
+                update(answer)
+                if race == 'live-rewrite': saved[-1] = dict(answer, content=dict(type='text', text='Tampered answer\n'))
+                if race == 'missing-boundary': saved.pop(-2)
+            send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+            continue
         if os.environ.get('AGY_SWARM_THIN'):
             body=msg['params']['prompt'][0]['text']
             (root/'prompt').write_text(body)
@@ -160,7 +192,17 @@ for line in sys.stdin:
                 if fault!='board-only':
                     update(dict(sessionUpdate='tool_call',toolCallId='dispatch',name='swarm',kind='other',status='completed',rawInput=dict(action='add',name='worker-1')))
                     update(dict(sessionUpdate='tool_call',toolCallId='status',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='working')])))
-                text('Work accepted\n' if fault=='status-working' else 'Run /swarm board\n')
+                text('CALLCLI_STAGE Work accepted\n' if fault=='status-working' else os.environ.get('CALLCLI_TEST_BOARD_TEXT','Run /swarm board')+'\n')
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault in {'working-final','working-final-active','working-final-question'}:
+                update(dict(sessionUpdate='tool_call',toolCallId='status',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='working')])))
+                if fault=='working-final-active':
+                    update(dict(sessionUpdate='tool_call',toolCallId='active',name='read_file',kind='read',status='in_progress'))
+                text('Native final: requested analysis is complete.\n')
+                if fault=='working-final-question': text('CALLCLI_QUESTION Q1 Confirm choice?\n')
                 saved=captured
                 captured=None
                 send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
@@ -175,6 +217,23 @@ for line in sys.stdin:
                 text('Native final initial\n')
                 saved=captured
                 saved[0]['kind']='read'
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='sparse-load-enrich' and not body.startswith('CALLCLI_DIALOGUE '):
+                update(dict(sessionUpdate='tool_call',toolCallId='sparse-read',name='read_file',status='in_progress'))
+                update(dict(sessionUpdate='tool_call',toolCallId='sparse-swarm',name='swarm',status='in_progress'))
+                text('CALLCLI_STAGE sparse work pending\n')
+                saved=captured
+                captured=None
+                send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                continue
+            if fault=='canary-section-prefix-change' and not body.startswith('CALLCLI_DIALOGUE '):
+                canary=os.environ.get('CALLCLI_TEST_CANARY','CANARY')
+                captured.append(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text='Private prompt '+canary)))
+                text('CALLCLI_STAGE canary stage pending\n')
+                update(dict(sessionUpdate='tool_call',toolCallId='pending-work',title='read /private/'+canary,status='in_progress',rawInput=dict(secret=canary)))
+                saved=captured
                 captured=None
                 send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
                 continue
@@ -217,7 +276,7 @@ for line in sys.stdin:
                 text('CALLCLI_STAGE draft ready\nCALLCLI_QUESTION Q1 Which label?\n')
             else:
                 if body.startswith('CALLCLI_DIALOGUE '):
-                    if fault in {'board-working','status-working'}:
+                    if fault in {'status-working'}:
                         update(dict(sessionUpdate='tool_call_update',toolCallId='status',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='completed')])))
                     if fault=='status-new-id':
                         update(dict(sessionUpdate='tool_call',toolCallId='status-later',name='swarm',kind='other',status='completed',rawInput=dict(action='status'),rawOutput=dict(workers=[dict(name='worker-1',status='completed')])))
@@ -242,7 +301,9 @@ for line in sys.stdin:
                 continue
             text('CALLCLI_STAGE workflow pending\n')
             script = '' if fault=='bad-script' else 'print("synthetic")'
-            if fault!='unapproved':
+            native_skip_cli = '--dangerously-skip-permissions' in sys.argv
+            force_permission = fault in {'foreign', 'bad-script', 'mismatched-script', 'duplicate-option', 'force-permission'}
+            if fault!='unapproved' and (not native_skip_cli or force_permission):
                 send(dict(id='permit', method='session/request_permission', params=dict(sessionId='foreign' if fault=='foreign' else session,
                     toolCall=dict(toolCallId='workflow', title='run_workflow', kind='other', rawInput=dict(Script=script),
                         args=dict(Script='changed' if fault=='mismatched-script' else script)),
@@ -432,12 +493,32 @@ for line in sys.stdin:
             captured=None
             continue
         if os.environ.get('AGY_SWARM_THIN'):
-            if os.environ['AGY_SWARM_THIN']=='async' and (root/'finish').exists():
+            fault=os.environ['AGY_SWARM_THIN']
+            if fault=='async' and (root/'finish').exists():
                 for entry in saved:
                     if entry.get('toolCallId')=='pending': entry['status']='completed'
                 if not (root/'result.txt').exists():
                     (root/'result.txt').write_text('initial')
                     saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='Native final initial\n')))
+            if fault=='sparse-load-enrich' and (root/'finish').exists():
+                for entry in saved:
+                    if entry.get('toolCallId')=='sparse-read':
+                        entry['kind']='read'
+                        entry['status']='completed'
+                    elif entry.get('toolCallId')=='sparse-swarm':
+                        entry['kind']='other'
+                        entry['status']='completed'
+                        entry['rawInput']=dict(action='status')
+                if not (root/'result.txt').exists():
+                    (root/'result.txt').write_text('initial')
+                    saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',text='Native final initial\n')))
+            if fault=='canary-section-prefix-change' and (root/'tamper').exists():
+                canary=os.environ.get('CALLCLI_TEST_CANARY','CANARY')
+                for entry in saved:
+                    if entry.get('sessionUpdate')=='agent_message_chunk':
+                        entry['content']=dict(type='text',text='Rewritten private '+canary+'\n')
+                    elif entry.get('toolCallId')=='pending-work':
+                        entry['status']='completed'
             for entry in saved: update(entry)
             send(dict(id=msg['id'],result=metadata()))
             captured=None
@@ -529,15 +610,25 @@ for line in sys.stdin:
             tail_loads += int(prompted)
             if tail_loads > 2:
                 raise SystemExit(7)
-            for action in ('add', 'kill'):
-                update(dict(sessionUpdate='tool_call', toolCallId=action, name='swarm',
-                    status='completed' if prompted else 'pending',
-                    args=dict(action=action, name='worker-a', model='gemini-4-hydrogen-medium')))
+            tail_mode = os.environ['AGY_NATIVE_TAIL_GROWTH']
             task_id = (root/'task-id').read_text()
             old = 'CALLCLI_RESULT '+json.dumps(dict(task=task_id, turn=0, status='completed', result='old result', workers=[]))+'\n'
             extra = 'CALLCLI_STAGE tail stage\nCALLCLI_RESULT '+json.dumps(dict(task=task_id, turn=turn,
                 status='completed', result='tail result', workers=['worker-a']))+'\n'
-            text(old+(extra if prompted else ''))
+            if tail_mode in {'non-tail', 'non-tail-rewrite'}:
+                if prompted:
+                    body_text = ('REWRITTEN '+extra) if tail_mode == 'non-tail-rewrite' else (old+extra)
+                else:
+                    body_text = old
+                text(body_text)
+            for action in ('add', 'kill'):
+                update(dict(sessionUpdate='tool_call', toolCallId=action, name='swarm',
+                    status='completed' if prompted else 'pending',
+                    args=dict(action=action, name='worker-a', model='gemini-4-hydrogen-medium')))
+            if tail_mode == 'non-tail' and prompted:
+                text('Native final tail result\n')
+            if tail_mode not in {'non-tail', 'non-tail-rewrite'}:
+                text(old+(extra if prompted else ''))
             send(dict(id=msg['id'], result=metadata()))
             captured = None
             continue

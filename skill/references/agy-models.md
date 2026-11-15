@@ -21,7 +21,7 @@ Teamwork 最小源码路径用现有 CALLCLI_STAGE/QUESTION 提示：委派或�
 
 观察局限：未核实 Teamwork 可机器依赖的结构化业务终态字段。后续未标 stage 的普通文本可能是进展而非结果；只有委派确认、工具终态或缺公开回流时不声称完整业务完成。离线 fixture 证明路由／异步访谈／同源修改／结果与正常 close，不证明真实 provider 暴露相同序列或子团队已停。既有真实样本报告子写审批 60s 超时，但父 ACP 未收到对应公开许可，原因不可观测；这不构成子写禁令或父写要求。公开问题／审批事件有则沿现有机制传递，无事件明确不可观测，不强塞回调或为此修改 AGY 权限、配置及调度。
 
-取消仅转发一次原生 session/cancel，不自动生成逐员 cleanup prompt，不重放业务；当前 ACP 未提供可独立依赖的内部停止确认，因此结算为 unknown/HOLD 并明确内部停写未知，不把前台 cancelled、stdio 退出或 PID 消失当作全后代已停。现存旧任务可信 receipt 仍可按旧合同消费，不追溯补证或释放旧 HOLD。
+取消仅转发一次原生 session/cancel，不自动生成逐员 cleanup prompt，不重放业务；缺内部停止确认时业务结果 unknown，不把前台 cancelled、stdio 退出或 PID 消失当作全后代已停。普通 close/reconcile 仍消费可信 receipt；非活跃旧任务可按[权威恢复合同](core-requirements.md#写占用恢复合同)显式接受风险释放资源，不补造停止证明或业务成功。
 
 本次仅源码与离线 fixture 验证；真实 Hermes／OMP 必须更新完整运行时副本并由宿主重新加载后才获得新行为。未部署、未发新模型请求，历史模型／取消样本保持历史口径，不作为当前真实宿主消费或用户实收证明。
 
@@ -48,15 +48,15 @@ python3 collab.py --db "$DB" --client "$CLIENT" start \
 # 若本次 metadata 已核实，可加 --effort "$THOUGHT_LEVEL"
 ```
 
-Hermes `call_cli` 同样接受 `agent: "agy"`、`model`、可选 `effort`。模型/effort 存在任务 JSON，reply/intervene 沿用，不对旧任务强加新字段。创建原生会话使用 `--agent 'agy acp'`；每轮在 prompt 前设置精确模型/effort并读回，事件 `model` 记录该核验。状态、取消和关闭仍指向同一原生命名会话。
+Hermes `call_cli` 同样接受 `agent: "agy"`、`model`、可选 `effort`。模型/effort 存在任务 JSON，reply/intervene 沿用，不对旧任务强加新字段。创建原生会话在默认 `native-skip` 下使用 `agy acp --dangerously-skip-permissions`（显式 `approve-all|approve-reads` 使用 `agy acp`；Windows ACPX 路径经 `acpx/runtime` 传入结构化 `agentArgv`）；每轮在 prompt 前设置精确模型/effort并读回，事件 `model` 记录该核验。状态、取消和关闭仍指向同一原生命名会话。
 
 ACPX Shared Runtime 的 `setModel`/`setConfigOption` 需要已经运行的 owner，不能用来启动空闲会话。runner 使用原生 CLI `set` 后 `sessions show` 读回，再由 Shared Runtime 提交 prompt；控制失败不提交。不要用离线 mock 的成功推断真实 owner 已存在。
 
 ## 持久审批与结果诊断
 
-`--agy-approval approve-all|approve-reads`（Hermes `agy_approval`）仅适用于 AGY。新任务省略时持久化 `approve-all`，本次任务须已有相应工具授权；显式只读审批选 `approve-reads`，shell／写入请求非交互 deny。`write` 独立表示编辑授权和工作区占用，获授权编辑仍须设 true。审批不是 OS／文件沙箱，不能靠 `write: false` 限制真实文件访问。reply/intervene 保留策略，旧 JSON 缺字段继续按原 `write` 映射，OMP/Codex/Pi 的默认值不变。原生 read/search 优先提示不禁用已授权 shell。
+`--agy-approval skip-permissions|approve-all|approve-reads`（Hermes `agy_approval`）仅适用于 AGY。新任务省略时默认持久化 `agy_approval: skip-permissions` 与 `execution_policy: native-skip`：POSIX（ACPX 与 native owner）与 Windows（ACPX 经 `acpx/runtime` 结构化 `agentArgv`）均启动 `agy acp --dangerously-skip-permissions`（ACPX 侧以 `approve-all` 兜底），原生跳过交互权限、CLI 沙箱与目录限制；Dynamic 模式在此策略下直接原生执行 `/run-workflow`，不再额外卡住人工脚本 `permission` 审批，但仍必须真实观测到有界非 `ScriptPath` 的 `Script` 身份（`workflow_script_sha256`）后才允许稀疏更新、完成结算或卸载（缺真实 `Script` 时保留 `unknown`/HOLD）。若需显式传统闸门，传 `approve-all` 或只读拒绝 `approve-reads`（不设 `native-skip`）。`write` 仍独立表示编辑授权和单 writer 工作区占用，并发只读任务保持 `write: false`。reply/intervene 保留原策略；缺 `execution_policy` / `agy_approval` 的旧任务不扩权，继续按原 `write` 映射（历史记录中的旧默认示例亦仅属历史）。OMP/Codex/Pi 新启动同样默认持久化 `execution_policy: native-skip`。
 
-native callback 的 native_permission_decisions 仅保数值 RPC ID、root/foreign 归属、安全 tool ID/kind、option kinds、choice/reason、response_sent_at/send_error。既有会话身份校验不变：approve-all 仅选匹配本任务 session 的 allow_once；缺该选项明确 allow_once_unavailable，非匹配 session 返回 cancelled 并报 scope mismatch。这是公开回调归属校验，不是 Teamwork 内部权限配置；不猜测或授权未暴露的子 session。approve-reads execute 沿用既有拒绝语义，不新增 Teamwork 强制策略。完整 worker 审批继承／真实 60s 等待根因未证，不据此要求子权限证明或追加权限实验。
+native 非 skip 显式审批（`approve-all` / `approve-reads`）下，callback 的 `native_permission_decisions` 仅保数值 RPC ID、root/foreign 归属、安全 tool ID/kind、option kinds、choice/reason、response_sent_at/send_error：显式 `approve-all` 仍只选匹配本任务 session 的 `allow_once`（缺该选项明确 `allow_once_unavailable`）；默认 `skip-permissions` 若意外收到同源回调可回退 `allow_always`，非匹配 session 始终返回 cancelled 并报 scope mismatch。这是公开回调归属校验，不是 Teamwork 内部权限配置；不猜测或授权未暴露的子 session。approve-reads execute 沿用既有拒绝语义，不新增 Teamwork 强制策略。完整 worker 审批继承／真实 60s 等待根因未证，不据此要求子权限证明或追加权限实验。
 
 
 AGY 专属策略在 `agy.py`；任务生命周期、SQLite、runner、Shared Runtime 与 OMP/Codex/Pi 共用。不要另建协调栈。`end_turn`／exit 0 只证明协议结束：工具 failed 且最后工具事件后无最终回答、也无待答问题，或既有 fatal 精确最终行，结算 `unknown`，不自动续轮／重放。stage 不算回答；正常提问保留 `waiting_reply` 可回复，fatal 最终行仍覆盖提问。失败后恢复并给最终回答可完成。

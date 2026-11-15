@@ -18,8 +18,7 @@ async function loadRuntime(expectedVersion) {
   return sdk;
 }
 
-async function loadAuth(cwd, home = require('node:os').homedir()) {
-  // Match ACPX CLI precedence on this device; never send credentials via the controller.
+async function readAcpxConfigs(cwd, home = require('node:os').homedir()) {
   const configs = [];
   for (const file of [path.join(home, '.acpx', 'config.json'), path.join(cwd, '.acpxrc.json')]) {
     let config = {};
@@ -29,6 +28,12 @@ async function loadAuth(cwd, home = require('node:os').homedir()) {
     if (!config || typeof config !== 'object' || Array.isArray(config)) throw Error('INVALID_AUTH_CONFIG');
     configs.push(config);
   }
+  return configs;
+}
+
+async function loadAuth(cwd, home = require('node:os').homedir()) {
+  // Match ACPX CLI precedence on this device; never send credentials via the controller.
+  const configs = await readAcpxConfigs(cwd, home);
   const authCredentials = Object.create(null);
   for (const config of configs) {
     if (config.auth == null) continue;
@@ -41,6 +46,49 @@ async function loadAuth(cwd, home = require('node:os').homedir()) {
   const authPolicy = configs[1].authPolicy ?? configs[0].authPolicy ?? 'skip';
   if (!['skip', 'fail'].includes(authPolicy)) throw Error('INVALID_AUTH_POLICY');
   return {authCredentials, authPolicy};
+}
+
+function splitCommandLine(value) {
+  const parts = [];
+  let current = '', quote = null, escaping = false, hasPart = false;
+  for (const ch of String(value)) {
+    if (escaping) {current += ch; escaping = false; hasPart = true;}
+    else if (ch === '\\' && quote !== "'") {escaping = true;}
+    else if (quote) {if (ch === quote) quote = null; else current += ch; hasPart = true;}
+    else if (ch === "'" || ch === '"') {quote = ch; hasPart = true;}
+    else if (/\s/.test(ch)) {if (hasPart) {parts.push(current); current = ''; hasPart = false;}}
+    else {current += ch; hasPart = true;}
+  }
+  if (escaping) {current += '\\'; hasPart = true;}
+  if (quote) throw Error('INVALID_AGENT_COMMAND');
+  if (hasPart) parts.push(current);
+  return parts;
+}
+
+function renderArgvIdentity(argv) {
+  const safe = /^[A-Za-z0-9_@%+=:,./^~-]+$/u;
+  return argv.map(arg => safe.test(arg) ? arg : JSON.stringify(arg)).join(' ');
+}
+
+async function resolveConfiguredAgentArgv(agent, requestedArgv, cwd, home = require('node:os').homedir()) {
+  const configs = await readAcpxConfigs(cwd, home);
+  let entry;
+  for (const config of configs) {
+    if (config.agents == null) continue;
+    if (typeof config.agents !== 'object' || Array.isArray(config.agents)) throw Error('INVALID_AGENT_CONFIG');
+    if (Object.hasOwn(config.agents, agent)) entry = config.agents[agent];
+  }
+  let base;
+  if (Array.isArray(entry?.argv) && entry.argv.length > 0 && entry.argv.every(x => typeof x === 'string' && x.length > 0)) {
+    base = [...entry.argv];
+  } else if (typeof entry?.command === 'string' && entry.command.trim()) {
+    base = splitCommandLine(entry.command);
+  } else {
+    return [...requestedArgv];
+  }
+  let i = 1;
+  while (i < base.length && i < requestedArgv.length && base[i] === requestedArgv[i]) i++;
+  return [...base, ...requestedArgv.slice(i)];
 }
 
 function publicEvent(event) {
@@ -130,6 +178,15 @@ async function run(options, prompt, deps = {}) {
         || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(options.sessionId)
         || typeof options.sessionName !== 'string' || !options.sessionName
         || (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))) throw Error('INVALID_INPUT');
+    const ALLOWED_AGENT_ENV = {INITIAL_AGENT_MODE: new Set(['agent-full-access'])};
+    const agentEnv = {};
+    if (options.agentEnv !== undefined) {
+      if (!options.agentEnv || typeof options.agentEnv !== 'object' || Array.isArray(options.agentEnv)) throw Error('INVALID_AGENT_ENV');
+      for (const [k, v] of Object.entries(options.agentEnv)) {
+        if (!Object.prototype.hasOwnProperty.call(ALLOWED_AGENT_ENV, k) || typeof v !== 'string' || !ALLOWED_AGENT_ENV[k].has(v)) throw Error('INVALID_AGENT_ENV');
+        agentEnv[k] = v;
+      }
+    }
     const permissionMode = options.permissionMode ?? (options.write ? 'approve-all' : 'approve-reads');
     if (!['approve-all', 'approve-reads'].includes(permissionMode)) throw Error('INVALID_PERMISSION_MODE');
     const timeout = options.timeoutMs === undefined ? {} : {timeoutMs:options.timeoutMs};
@@ -138,6 +195,11 @@ async function run(options, prompt, deps = {}) {
     stage = 'auth_load';
     const auth = await (deps.loadAuth ?? loadAuth)(options.cwd);
     stage = 'runtime_create';
+    var savedEnv = {};
+    for (const [k, v] of Object.entries(agentEnv)) {
+      savedEnv[k] = Object.prototype.hasOwnProperty.call(process.env, k) ? process.env[k] : undefined;
+      process.env[k] = v;
+    }
     runtime = sdk.createSharedAcpRuntime({cwd: options.cwd,
       permissionMode,
       nonInteractivePermissions: 'deny', ...timeout,
@@ -190,6 +252,10 @@ async function run(options, prompt, deps = {}) {
     terminal = {type: 'callcli.shared.result', requestId: requestId ?? null, status: 'failed', stopReason: null,
       stage, reasonCode:stage+'_failed'};
   } finally {
+    for (const [k, v] of Object.entries(savedEnv ?? {})) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     try {await send(terminal);} catch {code = 1;}
     // shutdown detaches this client; it is NOT cancellation of accepted work.
     if (runtime) {try {await runtime.shutdown();} catch {code = 1;}}
@@ -197,4 +263,234 @@ async function run(options, prompt, deps = {}) {
   return code;
 }
 
-module.exports = {run, loadRuntime, loadAuth};
+function isAbsoluteTargetPath(value) {
+  return typeof value === 'string' && (path.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value));
+}
+
+function sameTargetPath(a, b, platform) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const paths = platform === 'win32' ? path.win32 : path;
+  const x = paths.resolve(a), y = paths.resolve(b);
+  return platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
+function sessionRunState(status, record) {
+  if (typeof status?.details?.status === 'string') return status.details.status === 'running' ? 'alive' : status.details.status;
+  if (typeof record?.pid === 'number' && record.pid > 0) {
+    try {
+      process.kill(record.pid, 0);
+      return 'alive';
+    } catch (error) {
+      return error?.code === 'EPERM' ? 'alive' : 'dead';
+    }
+  }
+  if (record?.lastAgentExitSignal || (record?.lastAgentExitCode ?? 0) !== 0) return 'dead';
+  return 'idle';
+}
+
+async function controlStatus(record, options) {
+  const win = process.platform === 'win32';
+  const root = cp.execFileSync(win ? 'cmd.exe' : 'npm', win ? ['/d', '/s', '/c', 'npm root -g'] : ['root', '-g'],
+    {encoding:'utf8', timeout:15000, stdio:['ignore','pipe','pipe']}).trim();
+  const cli = require.resolve('acpx', {paths:[path.dirname(root)]});
+  const result = cp.execFileSync(process.execPath, [cli, '--cwd', record.cwd, '--format', 'json',
+    '--agent', record.agentCommand, 'status', '-s', record.name],
+    {encoding:'utf8', timeout:options.timeoutMs ?? 20000, stdio:['ignore','pipe','pipe']});
+  return JSON.parse(result);
+}
+
+async function control(options, deps = {}) {
+  const send = deps.send ?? sendFrame;
+  let shared, embedded, ok = false;
+  try {
+    const validActions = new Set(['new', 'show', 'status', 'close', 'cancel', 'model', 'effort', 'mode']);
+    if (!options || !validActions.has(options.action) || !isAbsoluteTargetPath(options.cwd)
+        || typeof options.session !== 'string' || !options.session.trim()
+        || typeof options.agent !== 'string' || !options.agent.trim()
+        || !Array.isArray(options.agentArgv) || options.agentArgv.length === 0
+        || !options.agentArgv.every(s => typeof s === 'string' && s.length > 0)
+        || !['approve-all', 'approve-reads'].includes(options.permissionMode)
+        || (options.recordId !== undefined && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(options.recordId))
+        || (options.backendSessionId !== undefined && (typeof options.backendSessionId !== 'string' || !options.backendSessionId))
+        || (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0))
+        || (['model', 'effort', 'mode'].includes(options.action) && (typeof options.value !== 'string' || !options.value.trim()))) {
+      throw Error('INVALID_CONTROL_INPUT');
+    }
+    const timeout = options.timeoutMs === undefined ? {} : {timeoutMs: options.timeoutMs};
+    const samePath = (a, b) => sameTargetPath(a, b, deps.platform ?? process.platform);
+    const sdk = await (deps.loadRuntime ?? loadRuntime)(options.expectedVersion);
+    const home = options.home ?? require('node:os').homedir();
+    const auth = await (deps.loadAuth ?? loadAuth)(options.cwd, home);
+    const stateDir = path.join(home, '.acpx');
+    const store = (deps.createSessionStore ?? (dir => sdk.createFileSessionStore({stateDir: dir})))(stateDir);
+    const bound = options.recordId === undefined ? undefined : await store.load(options.recordId);
+    if (options.recordId !== undefined && (!bound || bound.acpxRecordId !== options.recordId
+        || !samePath(bound.cwd, options.cwd) || bound.name !== options.session
+        || typeof bound.acpSessionId !== 'string' || !bound.acpSessionId
+        || (options.backendSessionId !== undefined && bound.acpSessionId !== options.backendSessionId))) {
+      throw Error('RECORD_BINDING_MISMATCH');
+    }
+    // Existing tasks retain their creation-time launcher, including pre-flags Windows OMP.
+    const effectiveArgv = bound
+      ? bound.agentArgv ?? bound.agentCommand
+      : await (deps.resolveConfiguredAgentArgv ?? resolveConfiguredAgentArgv)(
+        options.agent, options.agentArgv, options.cwd, home);
+    const legacyArgv = options.agent === 'omp' ? ['omp', 'acp'] : undefined;
+    const baseRegistry = sdk.createAgentRegistry({overrides: {[options.agent]: effectiveArgv}});
+    const agentRegistry = legacyArgv ? {...baseRegistry, resolve: agent =>
+      agent === 'callcli-legacy-omp' ? legacyArgv : baseRegistry.resolve(agent)} : baseRegistry;
+    shared = sdk.createSharedAcpRuntime({
+      cwd: options.cwd, agentRegistry, permissionMode: options.permissionMode,
+      nonInteractivePermissions: 'deny', ...timeout,
+      authCredentials: auth.authCredentials, authPolicy: auth.authPolicy
+    });
+    const lookup = {sessionKey: options.session, agent: options.agent, cwd: options.cwd};
+    const action = options.action;
+    const findTarget = async () => {
+      if (!bound) {
+        const current = await shared.findSession(lookup);
+        const legacy = legacyArgv ? await shared.findSession({...lookup, agent:'callcli-legacy-omp'}) : undefined;
+        if (current && legacy && current.acpxRecordId !== legacy.acpxRecordId) throw Error('AMBIGUOUS_SESSION_SCOPE');
+        const found = current ?? legacy;
+        if (found && (!samePath(found.cwd, options.cwd) || found.sessionKey !== options.session)) throw Error('RECORD_BINDING_MISMATCH');
+        return found;
+      }
+      if (bound.closed) return undefined;
+      return {backend: 'acpx-shared', acpxRecordId: bound.acpxRecordId,
+        runtimeSessionName: bound.acpxRecordId, backendSessionId: bound.acpSessionId,
+        agentSessionId: bound.agentSessionId, sessionKey: bound.name, cwd: bound.cwd};
+    };
+    if (action === 'new') {
+      const existing = await findTarget();
+      if (existing) await shared.close({handle: existing});
+      const created = await shared.ensureSession({
+        ...lookup, mode: 'persistent',
+        ...(typeof options.model === 'string' && options.model ? {sessionOptions: {model: options.model}} : {})
+      });
+      const record = await store.load(created.acpxRecordId);
+      const agentSessionId = record?.agentSessionId ?? created.agentSessionId;
+      await send({
+        action: 'session_ensured', created: true,
+        acpxRecordId: created.acpxRecordId,
+        acpxSessionId: record?.acpSessionId ?? created.backendSessionId,
+        ...(agentSessionId ? {agentSessionId} : {}),
+        name: options.session,
+        ...(existing ? {replacedSessionId: existing.acpxRecordId} : {})
+      });
+      ok = true;
+    } else if (action === 'show') {
+      const found = await findTarget();
+      if (!found) throw Error('SESSION_NOT_FOUND');
+      const record = await store.load(found.acpxRecordId);
+      if (!record) throw Error('RECORD_NOT_FOUND');
+      await send(record);
+      ok = true;
+    } else if (action === 'status') {
+      const found = await findTarget();
+      if (!found) {
+        await send({action: 'status_snapshot', status: 'no-session', summary: 'no active session'});
+        ok = true;
+      } else {
+        const status = await shared.getStatus({handle: found});
+        const record = await store.load(found.acpxRecordId);
+        const agentSessionId = record?.agentSessionId ?? found.agentSessionId;
+        await send({
+          action: 'status_snapshot',
+          status: sessionRunState(status, record),
+          summary: status?.summary ?? 'session idle',
+          acpxRecordId: found.acpxRecordId,
+          acpxSessionId: record?.acpSessionId ?? found.backendSessionId,
+          ...(agentSessionId ? {agentSessionId} : {})
+        });
+        ok = true;
+      }
+    } else if (action === 'close') {
+      const found = await findTarget();
+      if (!found) throw Error('SESSION_NOT_FOUND');
+      await shared.close({handle: found});
+      const record = await store.load(found.acpxRecordId);
+      const agentSessionId = record?.agentSessionId ?? found.agentSessionId;
+      await send({
+        action: 'session_closed',
+        acpxRecordId: found.acpxRecordId,
+        acpxSessionId: record?.acpSessionId ?? found.backendSessionId,
+        ...(agentSessionId ? {agentSessionId} : {})
+      });
+      ok = true;
+    } else if (action === 'cancel') {
+      const found = await findTarget();
+      if (!found) {
+        await send({action: 'cancel_result', acpxRecordId: 'unknown', cancelled: false});
+        ok = true;
+      } else {
+        await shared.cancel({handle: found});
+        await send({action: 'cancel_result', acpxRecordId: found.acpxRecordId, cancelled: true});
+        ok = true;
+      }
+    } else {
+      const found = await findTarget();
+      if (!found) throw Error('SESSION_NOT_FOUND');
+      const applyControl = (rt, handle) => {
+        if (action === 'model') return rt.setModel({handle, model: options.value});
+        if (action === 'effort') return rt.setConfigOption({handle, key: 'thought_level', value: options.value});
+        return rt.setMode({handle, mode: options.value});
+      };
+      try {
+        await applyControl(shared, found);
+      } catch (error) {
+        if (error?.code !== 'ACP_BACKEND_UNAVAILABLE') throw error;
+        const record = await store.load(found.acpxRecordId);
+        if (!record || record.closed || record.acpxRecordId !== found.acpxRecordId
+            || !samePath(record.cwd, options.cwd) || record.name !== options.session
+            || record.acpSessionId !== found.backendSessionId) throw Error('RECORD_BINDING_MISMATCH');
+        const idle = await (deps.controlStatus ?? controlStatus)(record, options);
+        if (idle.status !== 'idle' || idle.acpxRecordId !== record.acpxRecordId
+            || idle.acpxSessionId !== record.acpSessionId) throw Error('OWNER_NOT_IDLE');
+        // 0.21.1 lacks the exact-resume guard and can recreate an unprompted session.
+        // Reuse the existing version check rather than weaken old-task identity.
+        await (deps.loadRuntime ?? loadRuntime)('0.22.0');
+        const restoreRegistry = sdk.createAgentRegistry({overrides:{[options.agent]: record.agentArgv ?? record.agentCommand}});
+        const launch = restoreRegistry.resolve(options.agent);
+        const restoredArgv = Array.isArray(launch) ? launch : undefined;
+        if (record.acpx?.reset_on_next_ensure === true
+            || (restoredArgv ? renderArgvIdentity(restoredArgv) : launch) !== record.agentCommand
+            || JSON.stringify(restoredArgv ?? []) !== JSON.stringify(record.agentArgv ?? [])) {
+          throw Error('RECORD_BINDING_MISMATCH');
+        }
+        embedded = sdk.createAcpRuntime({
+          cwd: options.cwd, sessionStore: store,
+          agentRegistry: restoreRegistry,
+          permissionMode: options.permissionMode, nonInteractivePermissions: 'deny', ...timeout,
+          authCredentials: auth.authCredentials, authPolicy: auth.authPolicy
+        });
+        // Public ensure with the saved provider ID marks this record strict-resume.
+        // It reuses the exact stored record; it must not create a replacement.
+        const restored = await embedded.ensureSession({sessionKey: record.acpxRecordId,
+          agent: options.agent, cwd: record.cwd, mode: 'persistent', resumeSessionId: record.acpSessionId});
+        if (restored.acpxRecordId !== record.acpxRecordId || restored.backendSessionId !== record.acpSessionId) {
+          throw Error('RECORD_BINDING_MISMATCH');
+        }
+        await applyControl(embedded, restored);
+      }
+      const updated = await store.load(found.acpxRecordId);
+      const agentSessionId = updated?.agentSessionId ?? found.agentSessionId;
+      await send({
+        action: action === 'model' ? 'model_set' : action === 'effort' ? 'config_set' : 'mode_set',
+        acpxRecordId: found.acpxRecordId,
+        acpxSessionId: updated?.acpSessionId ?? found.backendSessionId,
+        ...(agentSessionId ? {agentSessionId} : {})
+      });
+      ok = true;
+    }
+  } catch {
+    ok = false;
+  } finally {
+    let cleanupFailed = false;
+    if (embedded) {try {await embedded.shutdown();} catch {cleanupFailed = true;}}
+    if (shared) {try {await shared.shutdown();} catch {cleanupFailed = true;}}
+    if (cleanupFailed) ok = false;
+  }
+  return ok ? 0 : 1;
+}
+
+module.exports = {run, control, loadRuntime, loadAuth, resolveConfiguredAgentArgv, splitCommandLine, renderArgvIdentity};

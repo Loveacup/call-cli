@@ -17,7 +17,7 @@ SCHEMA={
     'name':'call_cli',
     'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/intervene/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
-        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only'], 'description':'release_only: explicit original-controller unknown-task resource release, not business success or continuation; requires expected_turn and a settled local exact-record runner'},
+        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only','recovery_status'], 'description':'recovery_status: read-only exact-task resource projection and observed turn for current authorized release caller; no business content or control. release_only: current authorized caller releases an exact unknown task using observed expected_turn. For a settled local non-native exact record, close at most once and verify strictly; uncertainty retains HOLD. Only abandon=true explicitly releases ownership without stop proof when strict recovery is unavailable or remains HOLD; native/detached work may still be active. No business continuation or success claim'},
         'task_id':{'type':'string'},
         'permission_id':{'type':'string'},
         'script_sha256':{'type':'string'},
@@ -30,15 +30,16 @@ SCHEMA={
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
         'command_id':{'type':'string','description':'Stable intent ID; required for dialogue/intervene and cross-controller or new no-question reply; reuse on retry'},
-        'write':{'type':'boolean','default':False,'description':'Only for already authorized file edits/tests'},
-        'agy_approval':{'type':'string','enum':['approve-all','approve-reads'],'description':'AGY only: new tasks default to approve-all; approve-reads denies shell/write permission requests. Not a filesystem sandbox; independent of write reservation.'},
+        'write':{'type':'boolean','default':False,'description':'Reserve exclusive Call-CLI single-writer lock for authorized file edits/tests'},
+        'agy_approval':{'type':'string','enum':['skip-permissions','approve-all','approve-reads'],'description':'AGY only: new tasks default to skip-permissions (native CLI permission/sandbox/dir skip); approve-all/approve-reads keep explicit non-skip gates. Independent of Call-CLI business scope and write lock.'},
         'agy_swarm':{'type':'string','enum':['native','off'],'description':'AGY route override for advertised IDs; must match shorthand: bare=off, s=native'},
-        'agy_mode':{'type':'string','enum':['single','swarm','teamwork','dynamic'],'description':'Explicit execution mode; native modes require their advertised command; Dynamic requires exact script approval'},
+        'agy_mode':{'type':'string','enum':['single','swarm','teamwork','dynamic'],'description':'Explicit execution mode; native modes require their advertised command; under default skip-permissions Dynamic executes /run-workflow natively without redundant script approval prompts (explicit non-skip preserves script approval).'},
         'agy_worker_model':{'type':'string','description':'Optional native worker-model preference forwarded to AGY; no default or per-member completion gate'},
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
         'expected_turn':{'type':'integer','description':'Observed turn; required for dialogue, release_only, cross-controller continuation, new no-question reply and native close/reconcile recovery'},
+        'abandon':{'type':'boolean','description':'release_only only: explicitly accept native/detached activity risk and release ownership without stop proof; never business success'},
         'after':{'type':'integer','default':0},
         'clear_timeout':{'type':'boolean','description':'reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'}
     },'required':['action'],'additionalProperties':False}
@@ -71,12 +72,29 @@ class Coordinator:
             raise ValueError('Unknown call_cli field')
         if 'clear_timeout' in args and args.get('action') not in {'reply', 'intervene'}:
             raise ValueError('clear_timeout requires reply or intervene')
+        if 'abandon' in args and (args.get('action') != 'release_only' or type(args['abandon']) is not bool):
+            raise ValueError('abandon requires release_only and a boolean')
         origin=capture_origin(self.get_env,self.ctx.profile_name)
         action=args['action']
         store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root, action=action)
+        if action == 'recovery_status':
+            if set(args) != {'action', 'task_id'}:
+                raise ValueError('recovery_status accepts only exact task_id')
+            task, receipt = store.recovery_snapshot(args['task_id'], origin)
+            return {'resource_recovery': {
+                'task_id': task['id'], 'turn': task['turn'],
+                'business_state': (receipt.get('business_state', task['state'])
+                                   if isinstance(receipt, dict) else task['state']),
+                'resource_state': ('released' if isinstance(receipt, dict) and receipt.get('state') == 'released'
+                                   else task.get('resource_state', task['state'])),
+                'write': task.get('write', False) is True,
+                'receipt': {key: receipt.get(key) for key in
+                    ('state', 'operation', 'business_state', 'external_close_attempted')}
+                    if isinstance(receipt, dict) else None}}
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
         if action in {'status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only'}:
-            task=store.get(args.get('task_id',''),origin)
+            task=(store.release_target(args.get('task_id',''),origin) if action=='release_only'
+                  else store.get(args.get('task_id',''),origin))
         if action=='start':
             agent=args.get('agent');device=args.get('device','local');cwd=args.get('cwd','');prompt=args.get('prompt','')
             if not agent or not cwd or not prompt.strip():
@@ -141,11 +159,12 @@ class Coordinator:
                 backend = NativeBackend(toolchain_bin=toolchain_bin)
             from .release import close_task, recover_native
             receipt = (close_task(store,origin,task['id'],args.get('expected_turn'),backend=backend) if action == 'close'
-                       else recover_native(store,origin,task['id'],args.get('expected_turn'),action,backend=backend))
-            if receipt['state'] == 'released':
+                       else recover_native(store,origin,task['id'],args.get('expected_turn'),action,backend=backend,abandon=args.get('abandon',False)))
+            if receipt['state'] == 'released' and action != 'release_only':
                 from .skills import cleanup
                 cleanup(store,task)
-            return {'task':self.public(store.get(task['id'],origin)),'receipt':receipt}
+            current = store.release_target(task['id'],origin) if action=='release_only' else store.get(task['id'],origin)
+            return {'task':self.public(current),'receipt':receipt}
         raise ValueError('Unknown action')
 
     @staticmethod

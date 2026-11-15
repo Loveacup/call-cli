@@ -1,5 +1,22 @@
 # Verification
 
+## Public source update (2026-11-15)
+
+This publication includes native-skip defaults for new tasks, AGY invalid-output handling, native history/dialogue reconciliation, navigation-only response handling, structured-argv control identity, and explicit resource recovery. Source publication does not activate an installed adapter or modify existing tasks.
+
+The isolated publication checkout was checked with Python 3.13 and Node 26 before push:
+
+```sh
+python3.13 -B -m unittest -v test_agy test_agy_dynamic test_backends test_bridge test_plugin test_omp_bridge test_collab test_release_only test_release test_release_toolchain test_close_safety test_recovery_card test_review_release_only test_writer_recovery test_recovery_status test_review_findings test_agy_invalid_output test_history_status_diagnostic test_native_history_candidate test_navigation_protocol test_runner.RunnerContractTests
+node --test test_skill_stage.cjs test_shared_prompt.cjs test_models.cjs test_codex_ssh.cjs test_omp_extension.mjs test_control_identity.cjs
+node test_release_backend.cjs
+git diff --check
+```
+
+Observed: Python ran 241 tests in 108.985 seconds, OK; Node reported 101 tests, 99 passed, 2 opt-in native SDK tests skipped, 0 failed; the strict release proof script printed `STRICT_NATIVE_RELEASE_PROOF_OK` and exited 0. Some Python tests are inherited/imported and therefore executed more than once by unittest; this is a runner count, not a claim of 241 distinct scenarios. These checks used synthetic transports/fixtures, not live model calls. The native SDK opt-in tests, real Windows/PowerShell execution, deployment/reload, live provider behavior, all-descendant cancellation and original-session delivery were not verified in this publication pass. No full Python discovery rerun is claimed here.
+
+The ACPX Shared Runtime `fs/*` cwd restriction remains an upstream limitation. Resource abandonment records risk and releases coordination ownership only; it is not stop proof or business success. Earlier sections below retain their historical scope and counts, not fresh acceptance of this source update.
+
 <a id="current-acceptance-index"></a>
 ## Current Acceptance Index (2026-11-14)
 

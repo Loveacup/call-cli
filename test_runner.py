@@ -1240,10 +1240,26 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
                     ACPX_FAKE_TOOLS=json.dumps([{'toolCallId':'shell1','kind':'execute','status':'failed'}]))):
                 rc, state, events = self.run_agy(['CALLCLI_STAGE attempting shell\n'])
                 self.assertEqual((rc, state['state']), (1, 'unknown'))
-                self.assertIsNone(state.get('settlement_note'))
+                self.assertEqual((state['stop_reason'],state['exit_code']),
+                                 ('end_turn',1) if 'ACPX_FAKE_EXIT' in transport else (None,0))
+                diagnostics=[e for e in events if e['kind']=='diagnostic' and
+                             e.get('reason_code')=='post_result_exit_nonzero']
+                if 'ACPX_FAKE_EXIT' in transport:
+                    self.assertEqual([(e.get('stage'),e.get('reason_code')) for e in diagnostics],
+                                     [('prompt_result','post_result_exit_nonzero')])
+                    self.assertEqual(state['settlement_note'],diagnostics[0]['text'])
+                    self.assertIn('Preserve HOLD',state['settlement_note'])
+                    self.assertIn('no automatic replay',state['settlement_note'])
+                    self.assertNotIn('shutdown',state['settlement_note'])
+                    explanation=state['settlement_note']
+                else:
+                    # This legacy failed frame has no structured diagnostic; do not invent a cause.
+                    self.assertIsNone(state.get('settlement_note'))
+                    self.assertEqual(diagnostics,[])
+                    explanation='Prompt exited '+str(state['exit_code'])
                 terminal = events[-1]
                 self.assertEqual(terminal['text'], 'AGY task '+state['id']+' turn '+str(state['turn'])+
-                    ' needs initiator attention: Prompt exited '+str(state['exit_code']))
+                    ' needs initiator attention: '+explanation)
                 self.assertEqual((terminal['kind'], terminal['turn']), ('unknown', state['turn']))
                 self.assertTrue(terminal['attention_required'])
                 self.assertEqual(terminal['notification_scope'], 'originating-session')

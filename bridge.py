@@ -83,7 +83,8 @@ class Store:
             return posixpath.normpath(value.replace(chr(92), '/')).rstrip('/').casefold()
         for row in db.execute('SELECT data FROM tasks WHERE id != ?', (task['id'],)):
             other = json.loads(row['data'])
-            if not other['write'] or other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}:
+            if (not other['write'] or other.get('resource_state') == 'released'
+                    or other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}):
                 continue
             shared = task['resource'] and task['resource'] == other['resource']
             left, right = norm(task['cwd']), norm(other['cwd'])
@@ -732,7 +733,7 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
-            if task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
+            if task.get('release_epoch') or task['turn']!=turn or task['state'] not in {'running','cancelling'}:return False
             return self._finish_turn(db,task,state,rc,stop_reason,note,text=text,answer_tail=answer_tail)
 
     def _finish_turn(self,db,task,state,rc,stop_reason,note=None,*,text=None,answer_tail=''):
@@ -750,6 +751,13 @@ class Store:
             task['skill_verification'] = 'unverified' if task['skill_report_missing'] else 'reported'
         task.pop('settlement_note',None)
         if note:task['settlement_note']=note
+        cleanup = self.native_cleanup_verified(db, task)
+        auto_release = (state == 'unknown' and cleanup and cleanup.get('kind') == 'fresh-no-prompt'
+                and cleanup.get('fresh') is True and cleanup.get('baseline_empty') is True
+                and cleanup.get('no_prompt') is True and not task.get('native_prompt_submitted')
+                and task.get('native_owner_exit', {}).get('returncode') is not None)
+        if auto_release:
+            task['resource_state'] = 'released'
         event = dict(token=str(turn)+':settled', kind=state,
                      text=(text if text is not None else note or 'Prompt exited '+str(rc))[:8000],
                      turn=turn, question_ids=task.get('questions', []), answer_tail=answer_tail)
@@ -762,13 +770,18 @@ class Store:
             event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
         if state == 'unknown' and task['agent'] in {'agy','omp'}:
             event.update(attention_required=True, notification_scope='originating-session',
-                         next_action=task['agent'].upper()+' outcome unknown. Inspect this exact task and artifacts now; preserve HOLD. '
-                                     'Do not replay automatically; reconcile before any authorized continuation.',
+                         next_action=task['agent'].upper()+' outcome unknown. Do not replay automatically. '+event['recovery']['next_action'],
                          delivery='event-generated; host receipt and consumption unverified')
         inserted = db.execute('INSERT INTO events VALUES (?,?,?)',(task_id,event['token'],json.dumps(event)))
         event['seq'] = inserted.lastrowid
         event['recovery']['seq'] = inserted.lastrowid
         self._save(db,task)
+        if auto_release:
+            try:
+                from .release import release_resources
+            except ImportError:
+                from release import release_resources
+            release_resources(db, task, source='preprompt-failure', actor=task['controller'])
         return event
 
     def events(self, task_id, origin, after=0):
@@ -780,6 +793,9 @@ class Store:
     def list(self, origin):
         with self.connect() as db:
             return [json.loads(r['data']) for r in db.execute('SELECT data FROM tasks WHERE owner=?', (origin.key(),))]
+
+    def release_target(self, task_id, origin):
+        return self.get(task_id, origin)
 
     def get(self, task_id, origin=None):
         with self.connect() as db:

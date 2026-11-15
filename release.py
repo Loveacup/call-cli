@@ -284,6 +284,9 @@ class Release:
                 raise ValueError('Reconciliation reservation mismatch')
             attempt = dict(number=len(receipt.get('attempts', []))+1, operation='probe',
                            stage='probe', reason_code='in_progress', started_at=self.clock())
+            if getattr(self, 'actor', None):
+                attempt['actor'] = self.actor
+                receipt.setdefault('business_state', 'unknown')
             receipt.setdefault('attempts', []).append(attempt)
             self._publish(db, task, receipt)
             snapshot = canonical(receipt)
@@ -323,9 +326,59 @@ class Release:
         return receipt
 
 
+def release_resources(db, task, *, source, actor):
+    """Release coordination ownership only; preserve business/native observations."""
+    Release.install(db)
+    row = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task['id'],)).fetchone()
+    previous = json.loads(row[0]) if row else {}
+    if previous.get('state') == 'released':
+        return previous
+    for entry in task.get('commands', {}).values():
+        if entry.get('status') in {'pending', 'queued', 'target_started', 'accepted', 'claimed'}:
+            entry['status'] = 'release-revoked'
+    if task.get('intervention', {}).get('status') in {'pending', 'queued', 'target_started'}:
+        task['intervention']['status'] = 'release-revoked'
+    task.update(resource_state='released', release_epoch=task.get('release_epoch', 1))
+    receipt = dict(previous, state='released', phase='resource-only', operation=source,
+        source=source, task=task['id'], turn=task['turn'], actor=actor,
+        business_state=task['state'], resource_state='released', released_at=time.time(),
+        external_close_attempted=any(a.get('operation') == 'close' for a in previous.get('attempts', [])),
+        arbitraryDetachedDescendantsProven=False,
+        risk='Native session or detached work may still be active; release is not stop or business success')
+    if not row:
+        db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
+                   (task['id'], task['release_epoch'], json.dumps(task), canonical(receipt)))
+    Release._publish(db, task, receipt)
+    return receipt
+
+
+def check_release_task(task):
+    if task['state'] not in {'unknown', 'closed'}:
+        raise ValueError('Release-only requires unknown/HOLD; active writers must settle first')
+    pid = task.get('runner_pid')
+    if pid:
+        if type(pid) is not int or pid < 1:
+            raise ValueError('Invalid runner identity; retain reservation')
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        except (OSError, TypeError, ValueError, OverflowError):
+            raise ValueError('Runner activity unverified; retain reservation') from None
+        else:
+            raise ValueError('Runner is still active; retain reservation')
+
+
+def release_only_task(store, origin, task_id, expected_turn, *, backend=None, abandon=False):
+    return recover_native(store, origin, task_id, expected_turn, 'release_only', backend, abandon=abandon)
+
+
 def close_task(store, origin, task_id, expected_turn=None, backend=None):
     """Common public close: no uncertain transport replay or text-only release."""
     task = store.get(task_id, origin)
+    if task.get('resource_state') == 'released':
+        with store.connect() as db:
+            return json.loads(db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()[0])
     controller = Origin(**task.get('controller', task['origin'])).key()
     if not store._allows(controller, origin):
         raise PermissionError('Former controller has inspection rights only')
@@ -368,7 +421,7 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                 and current['state'] in {'completed','unknown'} and not current.get('runner_pid'))
             verified = verified or bool(trusted and trusted.get('kind')=='native-mode-settled'
                 and trusted.get('mode')==current.get('agy_mode','swarm') and trusted.get('mode') in {'swarm','teamwork'}
-                and trusted.get('outcome')==current['state']=='completed'
+                and trusted.get('outcome')==current['state'] and current['state'] in {'completed','unknown'}
                 and trusted.get('evidence')=='public-response-and-session-unload' and not current.get('runner_pid'))
             verified = verified or bool(trusted and trusted.get('kind')=='verified-cancellation'
                 and trusted.get('cancel_id')==current.get('native_cancel_id')
@@ -425,19 +478,35 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
     return recover_native(store, origin, task_id, expected_turn, 'close', backend)
 
 
-def recover_native(store, origin, task_id, expected_turn, operation, backend=None):
-    """Host-authenticated exact-task recovery; no policy file or model identity."""
-    native = store.get(task_id, origin)
+def recover_native(store, origin, task_id, expected_turn, operation, backend=None, *, abandon=False):
+    """Host-authenticated exact-task recovery, with explicit resource abandonment."""
+    import dataclasses
     release_only = operation == 'release_only'
+    lookup = store.release_target if release_only else store.get
+    if type(abandon) is not bool or (abandon and operation != 'release_only'):
+        raise ValueError('abandon requires release_only and a boolean')
+    native = lookup(task_id, origin)
     if release_only:
-        same = getattr(store, '_same_principal', store._allows)
-        if not all(same(Origin(**owner).key(), origin) for owner in
-                   (native['origin'], native.get('controller', native['origin']))):
-            raise PermissionError('Release-only requires the original current controller')
-        if native.get('agy_swarm') == 'native' or native.get('runner_pid'):
-            raise ValueError('Release-only requires a settled non-native runner')
-        if native['state'] not in {'unknown', 'closed'}:
-            raise ValueError('Release-only requires unknown/HOLD')
+        if type(expected_turn) is not int or native['turn'] != expected_turn:
+            raise ValueError('Release-only requires the observed expected_turn')
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = lookup(task_id, origin)
+            if current != native:
+                raise ValueError('Release-only snapshot changed')
+            row = (db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='release_fences'").fetchone() else None)
+            if row and json.loads(row[0]).get('state') == 'released':
+                return json.loads(row[0])
+            check_release_task(current)
+            if current.get('native_owner_exit', {}).get('kind') == 'stdio-closed-exit-unverified' and not abandon:
+                return dict(state='unknown', phase='hold', stage='runner', reason_code='native_exit_unverified',
+                    risk='Native owner may still be active; use release_only with abandon=true to explicitly accept this risk')
+            if abandon:
+                return release_resources(db, current, source='explicit-abandonment', actor=dataclasses.asdict(origin))
+            if current.get('agy_swarm') == 'native' or current['device'] != 'local' or not current.get('acpx_record_id'):
+                return dict(state='unknown', phase='hold', stage='resolve', reason_code='exact_close_unavailable',
+                    risk='Native session or detached work may still be active; explicitly use abandon=true to release ownership without stop proof')
     if native.get('agy_swarm') == 'native':
         if type(expected_turn) is not int or native['turn']!=expected_turn:
             raise ValueError('Native recovery requires observed expected_turn')
@@ -452,8 +521,11 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
         raise ValueError('Recovery requires the observed expected_turn')
     if operation not in {'close', 'reconcile', 'release_only'}:
         raise ValueError('Unsupported recovery operation')
-    if not store._allows(Origin(**task.get('controller', task['origin'])).key(), origin):
+    if not release_only and not store._allows(Origin(**task.get('controller', task['origin'])).key(), origin):
         raise PermissionError('Former controller has inspection rights only')
+    if task.get('resource_state') == 'released':
+        with store.connect() as db:
+            return json.loads(db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()[0])
     if release_only:
         operation = 'close'
     elif task['state'] == 'unknown':
@@ -483,7 +555,7 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
                 external_close_attempted=False, turn=task['turn'], epoch=task.get('control_epoch',1), request_id=policy['request_id'])
             with store.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
-                current=store._owned(db,task_id,origin)
+                current=lookup(task_id,origin)
                 if current!=task: raise ValueError('Pre-fence resolution snapshot changed')
                 current['close_diagnostic']=diagnostic
                 store._save(db,current)
@@ -491,20 +563,24 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
     recovery = object.__new__(Release)
     recovery.home, recovery.policy, recovery.backend, recovery.clock = store.path.parent, policy, backend, time.time
     recovery.store = store
+    recovery.actor = dataclasses.asdict(origin)
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        current = store.get(task_id, origin)
+        current = lookup(task_id, origin)
         if current != task:
             raise ValueError('Recovery snapshot changed')
-        if not store._allows(Origin(**current.get('controller', current['origin'])).key(), origin):
+        if not release_only and not store._allows(Origin(**current.get('controller', current['origin'])).key(), origin):
             raise PermissionError('Recovery controller authority changed')
         if existing and json.loads(existing[0]).get('state') == 'released':
             return json.loads(existing[0])
         if current['state'] not in {'completed','waiting_reply','cancelled','unknown'}:
             raise ValueError('Active execution must settle before recovery; reservation retained')
+        if release_only:
+            check_release_task(current)
         Release.install(db)
         fence = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
         if not fence:
+            business_state = current['state']
             current.update(state='unknown', release_epoch=1)
             store._check_writers(db, current)
             for entry in current.get('commands', {}).values():
@@ -512,11 +588,11 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
                     entry['status'] = 'release-revoked'
             if current.get('intervention', {}).get('status') in {'pending','queued','target_started'}:
                 current['intervention']['status'] = 'release-revoked'
-            receipt = dict(operation='native-recovery',target=policy,epoch=1,state='unknown',
+            receipt = dict(operation='native-recovery',target=policy,epoch=1,state='unknown',business_state=business_state,
                            phase='hold',attempts=[],admission='trusted-native-origin',binding_source='record-resolved',
                            arbitraryDetachedDescendantsProven=False)
             if release_only:
-                receipt.update(operation='release-only', business_state='unknown')
+                receipt.update(operation='release-only', business_state='unknown', actor=dataclasses.asdict(origin))
             db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
                        (task_id,1,json.dumps(current),canonical(receipt)))
             Release._publish(db,current,receipt)

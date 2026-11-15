@@ -1,5 +1,9 @@
 # Call CLI：当前目标与路线图
 
+## 当前源码更新
+
+新启动的 OMP、Codex、Pi、AGY 默认采用 `execution_policy=native-skip`；AGY Dynamic 在默认策略下直接执行原生工作流，不再叠加桥内脚本审批。任务业务授权、身份隔离与单 writer 互斥不变；历史任务不自动扩权，显式非 skip 审批仍受支持。新增最小只读 `recovery_status` 和显式风险接受的 `release_only(..., abandon=true)`，区分资源释放、原生活动停止与业务成功。源码发布不表示已安装、部署或完成真实模型验收。
+
 ## 已确认范围
 
 支持跨 CLI 新建协作会话，发起端为 OMP、Codex、Pi 或 Hermes，可通过现有 SSH 跨设备；AGY 仅作执行端，用户已取消其发起端需求。不接管已手动打开的交互会话。

@@ -1102,7 +1102,8 @@ class NativeOwnerTests(unittest.TestCase):
                     self.assertEqual((observation['attempted'],observation['verified'],observation['reason_code']),
                         (True,True,'unload_verified'))
                     if reused:self.assertNotIn('native_cleanup',before)
-                    self.assertEqual(c.close(client, task['id'])['state'], 'unknown' if reused else 'closed')
+                    self.assertEqual(c.close(client, task['id'])['state'], 'unknown')
+                    if not reused:self.assertEqual(c.status(client, task['id'])['resource_state'], 'released')
                     self.assertFalse(any(json.loads(r).get('method')=='session/prompt' for r in (root/'requests.jsonl').read_text().splitlines()))
 
     def test_forged_native_cleanup_task_fields_cannot_release(self):

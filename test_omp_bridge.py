@@ -139,6 +139,8 @@ class CloseReceiptPrivacyTests(unittest.TestCase):
         from unittest.mock import patch
         from fixtures.close_backend import CloseBackend
         from collab import Collaboration
+        public_fields={'state','phase','stage','reason_code','external_close_attempted',
+                       'resource_state','business_state','risk','arbitraryDetachedDescendantsProven','operation'}
         for surface in ('cli','omp'):
             with self.subTest(surface=surface), tempfile.TemporaryDirectory() as td:
                 bridge = (HostBridge if surface=='omp' else Collaboration)(Path(td)/'tasks.db',launch=lambda task:None)
@@ -158,9 +160,17 @@ class CloseReceiptPrivacyTests(unittest.TestCase):
                     backend.verified=True
                     packets.extend([close(),close()])
                 self.assertEqual(backend.closes,1)
-                for packet in packets:
+                for index,packet in enumerate(packets):
                     projected=packet['task']['close_receipt'] if surface=='omp' else packet['close_receipt']
-                    self.assertLessEqual(set(projected),{'state','phase','stage','reason_code','external_close_attempted'})
+                    self.assertLessEqual(set(projected),public_fields)
+                    if index < 3:
+                        self.assertEqual(projected['operation'],'native-recovery')
+                        self.assertEqual(projected['business_state'],'completed')
+                        self.assertIs(projected['arbitraryDetachedDescendantsProven'],False)
+                    else:
+                        self.assertEqual(projected,dict(state='released',phase='verified',operation='close'))
+                    for private in (*host.values(),client,'private prompt','fixture-record'):
+                        self.assertNotIn(private,json.dumps(projected))
                 self.assertEqual([p['task']['state'] if surface=='omp' else p['state'] for p in packets],
                                  ['unknown','unknown','closed','closed'])
                 card=packets[0]['task']['recovery'] if surface=='omp' else packets[0]['recovery']
@@ -175,9 +185,10 @@ class CloseReceiptPrivacyTests(unittest.TestCase):
                 self.assertEqual(receipt['target']['owner'],bridge.store.get(task['id'])['origin'])
                 self.assertGreaterEqual(len(receipt['attempts']),3)
                 nested=HostBridge.public({'events':[{'close_receipt':receipt}],'task':{'close_receipt':receipt}})
-                self.assertLessEqual(set(nested['events'][0]['close_receipt']),
-                                     {'state','phase','stage','reason_code','external_close_attempted'})
-                self.assertNotIn('target',json.dumps(nested))
+                for projected in (nested['events'][0]['close_receipt'],nested['task']['close_receipt']):
+                    self.assertEqual(projected,{key:value for key,value in receipt.items() if key in public_fields})
+                for private in ('target','owner','actor','attempts','proof',*host.values(),client,'fixture-record'):
+                    self.assertNotIn(private,json.dumps(nested))
 
 
 if __name__ == '__main__':

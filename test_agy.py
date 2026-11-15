@@ -27,16 +27,26 @@ class AgyTests(unittest.TestCase):
             c = Collaboration(Path(root)/'tasks.db', launch=lambda task: None)
             client = c.connect('codex')['client_id']
             task = c.start(client, agent='agy', cwd=root, prompt='inspect', model='advertised')
-            self.assertEqual(task['agy_approval'], 'approve-all')
+            self.assertEqual(task['agy_approval'], 'skip-permissions')
+            self.assertEqual(task['execution_policy'], 'native-skip')
+            explicit_all = c.start(client, agent='agy', cwd=root, prompt='inspect', model='advertised', agy_approval='approve-all')
+            self.assertEqual(explicit_all['agy_approval'], 'approve-all')
+            self.assertNotIn('execution_policy', explicit_all)
             for agent in ('omp', 'codex', 'pi'):
                 with self.assertRaises(ValueError):
                     c.start(client, agent=agent, cwd=root, prompt='inspect', agy_approval='approve-all')
                 other = c.start(client, agent=agent, cwd=root, prompt='inspect')
                 self.assertNotIn('agy_approval', other)
+                self.assertEqual(other['execution_policy'], 'native-skip')
+                for write in (False, True):
+                    other_task = dict(other, write=write, acpx_record_id='11111111-1111-4111-8111-111111111111', execution_version='0.22.0')
+                    options = json.loads(backend_for(agent).transport(other_task)[1])['options']
+                    self.assertEqual(options['permissionMode'], 'approve-all')
             for agent in ('agy', 'omp', 'codex', 'pi'):
                 for write in (False, True):
                     legacy = dict(task, agent=agent, write=write)
-                    legacy.pop('agy_approval')
+                    legacy.pop('agy_approval', None)
+                    legacy.pop('execution_policy', None)
                     legacy.update(acpx_record_id='11111111-1111-4111-8111-111111111111', execution_version='0.22.0')
                     options = json.loads(backend_for(legacy['agent']).transport(legacy)[1])['options']
                     self.assertEqual(options['permissionMode'], 'approve-all' if write else 'approve-reads')
@@ -59,7 +69,8 @@ class AgyTests(unittest.TestCase):
             with patch('acpx_backend.subprocess.run') as run:
                 control(t, 'new')
                 args = run.call_args.args[0]
-                self.assertIn('agy acp', args)
+                self.assertEqual(args[args.index('--agent')+1], 'agy acp --dangerously-skip-permissions')
+                self.assertIn('--approve-all', args)
                 self.assertNotIn('agy', args)
                 self.assertEqual(args[args.index('--model')+1], t['model'])
 
@@ -87,7 +98,8 @@ class AgyTests(unittest.TestCase):
             b = c.connect('pi')['client_id']
             writer = c.start(a, agent='omp', cwd=root, prompt='edit', write=True)
             reader = c.start(b, agent='agy', cwd=root, prompt='inspect', model='advertised')
-            self.assertEqual((reader['agy_approval'], reader['write']), ('approve-all', False))
+            self.assertEqual((reader['agy_approval'], reader['execution_policy'], reader['write']),
+                             ('skip-permissions', 'native-skip', False))
             with self.assertRaisesRegex(ValueError, writer['id']):
                 c.start(b, agent='agy', cwd=root, prompt='edit', model='advertised', write=True)
 
@@ -154,7 +166,7 @@ class AgyTests(unittest.TestCase):
                 self.assertEqual((task['model'],task['agy_mode'],task['agy_swarm']),
                     (expected,'teamwork','native'))
                 self.assertEqual(launched[-1]['agy_mode'],'teamwork')
-                self.assertEqual(c.status(client,task['id'])['agy_approval'],'approve-all')
+                self.assertEqual(c.status(client,task['id'])['agy_approval'],'skip-permissions')
             for fields in ({'model':'oct','agy_mode':'swarm'}, {'model':'ocs','agy_mode':'teamwork'},
                     {'model':'oct','agy_swarm':'off'}):
                 with self.assertRaisesRegex(ValueError,'conflict'):
@@ -194,7 +206,7 @@ class AgyTests(unittest.TestCase):
             prepare_start('agy','4a',agy_worker_model='gemini-4-hydrogen-medium')
         for agent in ('omp','codex','pi'):
             for model in ('oc','ocs','oct','4as','ocss'):
-                self.assertEqual(prepare_start(agent,model),{'model':model})
+                self.assertEqual(prepare_start(agent,model),{'model':model,'execution_policy':'native-skip'})
 
     def test_legacy_model_intent_is_not_reparsed_on_continuation(self):
         with tempfile.TemporaryDirectory() as root:
@@ -232,7 +244,7 @@ class AgyTests(unittest.TestCase):
             c.list(client); c.status(client,old['id'])
             self.assertEqual(c.store.get(old['id']),before)
             for agent in ('omp','codex','pi'):
-                self.assertEqual(prepare_start(agent),{})
+                self.assertEqual(prepare_start(agent),{'execution_policy':'native-skip'})
 
     def test_fatal_without_structured_auth_and_late_results_do_not_gain_auth_cause(self):
         from events import EventDecoder
@@ -251,3 +263,148 @@ class AgyTests(unittest.TestCase):
             self.assertNotIn('authentication', note)
             self.assertNotIn('401', note)
             self.assertNotIn('PRIVATE', note)
+
+    def test_native_skip_cli_flags_and_env_across_all_four_backends(self):
+        from types import SimpleNamespace
+        from acpx_backend import AcpxBackend
+        with tempfile.TemporaryDirectory() as root:
+            c = Collaboration(Path(root)/'tasks.db', launch=lambda task: None)
+            client = c.connect('omp')['client_id']
+
+            omp_task = c.start(client, agent='omp', cwd=root, prompt='inspect')
+            with patch('acpx_backend.subprocess.run') as run:
+                control(omp_task, 'new')
+                args = run.call_args.args[0]
+                self.assertEqual(args[args.index('--agent')+1], 'omp acp --auto-approve --allow-home')
+                self.assertIn('--approve-all', args)
+                self.assertEqual(args[args.index('--non-interactive-permissions')+1], 'deny')
+            win_omp = dict(omp_task, device='winbox', shell='powershell', cwd='C:/work')
+            self.assertEqual(backend_for('omp').agent_args(win_omp), ['--agent', 'omp acp --auto-approve --allow-home'])
+            self.assertEqual(backend_for('omp').agent_argv(win_omp), ['omp', 'acp', '--auto-approve', '--allow-home'])
+            with patch('acpx_backend.subprocess.run') as run:
+                import base64
+                control(win_omp, 'new')
+                win_cmd = run.call_args.args[0]
+                self.assertEqual(win_cmd[0], 'ssh')
+                ps_script = base64.b64decode(win_cmd[-1].split()[-1]).decode('utf-16le')
+                self.assertIn("'--' '--cwd'", ps_script)
+                self.assertIn('--auto-approve', ps_script)
+                self.assertIn('--allow-home', ps_script)
+                self.assertIn('node', ps_script)
+                win_payload = json.loads(run.call_args.kwargs['input'])
+                self.assertEqual(win_payload['options']['agentArgv'], ['omp', 'acp', '--auto-approve', '--allow-home'])
+                self.assertEqual(win_payload['options']['permissionMode'], 'approve-all')
+                self.assertEqual(win_payload['options']['action'], 'new')
+                bound = dict(win_omp, acpx_record_id='11111111-1111-4111-8111-111111111111', acpx_session_id='saved-acp')
+                for action in ('show', 'status', 'cancel', 'close', 'model', 'mode'):
+                    control(dict(bound, model='selected'), action)
+                    options = json.loads(run.call_args.kwargs['input'])['options']
+                    self.assertEqual(options['recordId'], bound['acpx_record_id'])
+                    self.assertEqual(options['backendSessionId'], 'saved-acp')
+
+            codex_task = c.start(client, agent='codex', cwd=root, prompt='inspect')
+            codex_task.update(acpx_record_id='11111111-1111-4111-8111-111111111111', execution_version='0.22.0')
+            payload = json.loads(backend_for('codex').transport(codex_task)[1])
+            self.assertEqual(payload['options']['permissionMode'], 'approve-all')
+            self.assertEqual(payload['options']['agentEnv'], {'INITIAL_AGENT_MODE': 'agent-full-access'})
+            with patch('acpx_backend.subprocess.run') as run:
+                control(codex_task, 'new')
+                self.assertEqual(run.call_args.kwargs['env']['INITIAL_AGENT_MODE'], 'agent-full-access')
+                self.assertNotIn('env', run.call_args.args[0][0])
+            ssh_posix = AcpxBackend().control(dict(codex_task, device='macbook', shell='posix'), 'new') if False else None
+            del ssh_posix
+            with patch('acpx_backend.subprocess.run') as run:
+                control(dict(codex_task, device='macbook', shell='posix'), 'new')
+                self.assertIn('INITIAL_AGENT_MODE=agent-full-access', run.call_args.args[0][-1])
+                self.assertNotIn('env', run.call_args.kwargs)
+                control(dict(codex_task, device='winbox', shell='powershell'), 'mode')
+                self.assertEqual(run.call_args.args[0][0], 'ssh')
+
+            pi_task = c.start(client, agent='pi', cwd=root, prompt='inspect')
+            pi_task.update(acpx_record_id='11111111-1111-4111-8111-111111111111', execution_version='0.22.0')
+            pi_opts = json.loads(backend_for('pi').transport(pi_task)[1])['options']
+            self.assertEqual(pi_opts['permissionMode'], 'approve-all')
+            with patch('acpx_backend.subprocess.run') as run:
+                control(pi_task, 'new')
+                self.assertIn('--approve-all', run.call_args.args[0])
+
+            agy_skip = c.start(client, agent='agy', cwd=root, prompt='inspect', model='advertised')
+            self.assertIn('skip-permissions', backend_for('agy').prompt_guidance(agy_skip))
+            self.assertEqual(backend_for('agy').agent_args(dict(agy_skip, agy_swarm='off', device='winbox', shell='powershell')),
+                             ['--agent', 'agy acp --dangerously-skip-permissions'])
+            with patch('acpx_backend.subprocess.run') as run:
+                import base64
+                control(dict(agy_skip, agy_swarm='off', device='winbox', shell='powershell', cwd='C:/work'), 'new')
+                ps_script = base64.b64decode(run.call_args.args[0][-1].split()[-1]).decode('utf-16le')
+                self.assertIn('--dangerously-skip-permissions', ps_script)
+                win_agy_payload = json.loads(run.call_args.kwargs['input'])
+                self.assertEqual(win_agy_payload['options']['agentArgv'], ['agy', 'acp', '--dangerously-skip-permissions'])
+                self.assertEqual(win_agy_payload['options']['permissionMode'], 'approve-all')
+            agy_explicit = c.start(client, agent='agy', cwd=root, prompt='inspect', model='advertised', agy_approval='approve-all')
+            self.assertEqual(backend_for('agy').agent_args(agy_explicit), ['--agent', 'agy acp'])
+            self.assertEqual(backend_for('agy').agent_args(dict(agy_explicit, agy_swarm='off', device='winbox', shell='powershell')),
+                             ['--agent', 'agy acp'])
+
+            legacy = dict(codex_task)
+            legacy.pop('execution_policy', None)
+            self.assertEqual(backend_for('codex').agent_env(legacy), {})
+            self.assertEqual(backend_for('omp').agent_args(dict(omp_task, execution_policy=None)), ['omp'])
+
+    def test_codex_native_skip_session_create_sets_agent_full_access_mode(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from acpx_backend import AcpxBackend
+        calls = []
+        class _Store:
+            def __init__(self, task): self.task = dict(task)
+            def update(self, _tid, **kw): self.task.update(kw); return dict(self.task)
+            def get(self, _tid): return dict(self.task)
+        backend = AcpxBackend()
+        task = {'id': 't1', 'agent': 'codex', 'cwd': '/tmp', 'device': 'local', 'shell': 'posix',
+                'session': 's1', 'turn': 1, 'state': 'running', 'write': False,
+                'version_check': {}, 'execution_policy': 'native-skip', 'prompt': 'hi'}
+        def fake_control(t, action, timeout=20):
+            calls.append(action)
+            if action == 'new':
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    'action': 'session_ensured', 'acpxRecordId': '11111111-1111-4111-8111-111111111111', 'acpxSessionId': 'acp-1'}).encode())
+            if action == 'mode':
+                return SimpleNamespace(returncode=1, stdout=b'')
+            return SimpleNamespace(returncode=0, stdout=b'')
+        emitted = []
+        with patch('updates.device_lock', side_effect=lambda *a, **kw: nullcontext(True)):
+            with patch.object(backend, 'control', side_effect=fake_control):
+                res = backend.run(_Store(task), task, lambda kind, text, **kw: emitted.append((kind, text, kw)))
+        self.assertEqual(calls, ['new', 'mode'])
+        self.assertEqual((res.state, res.stop_reason), ('unknown', None))
+        self.assertIn('reason=setup_failed', res.note)
+        self.assertEqual(emitted[-1][2]['reason_code'], 'setup_failed')
+
+    def test_native_owner_skip_permissions_argv_and_allow_always_fallback(self):
+        from types import SimpleNamespace
+        from agy_native import NativeOwner
+        from transport import command as transport_cmd
+        with patch('agy_native.subprocess.Popen') as popen:
+            popen.return_value = SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 0))
+            with patch('agy_native.selectors.DefaultSelector') as sel:
+                sel.return_value = SimpleNamespace(register=lambda *a: None)
+                owner = NativeOwner({'device': 'local', 'shell': 'posix', 'cwd': '/tmp',
+                                     'execution_policy': 'native-skip', 'agy_approval': 'skip-permissions'})
+        self.assertEqual(popen.call_args.args[0], ['agy', 'acp', '--disable-telemetry', '--dangerously-skip-permissions'])
+        sent = []
+        owner.session_id = 'owned'
+        owner.task = {'execution_policy': 'native-skip', 'agy_approval': 'skip-permissions'}
+        owner.permission_decisions = []
+        owner.send = sent.append
+        owner._callback({'id': 9, 'method': 'session/request_permission', 'params': {
+            'sessionId': 'owned',
+            'toolCall': {'toolCallId': 't1', 'kind': 'execute'},
+            'options': [{'optionId': 'always', 'kind': 'allow_always'}, {'optionId': 'deny', 'kind': 'reject_once'}],
+        }})
+        self.assertEqual(sent[-1]['result']['outcome'], {'outcome': 'selected', 'optionId': 'always'})
+        self.assertEqual((owner.permission_decisions[-1]['choice'], owner.permission_decisions[-1]['allowed']),
+                         ('allow_always', True))
+        self.assertEqual(transport_cmd('local', 'posix', ['acpx'], env={'INITIAL_AGENT_MODE': 'agent-full-access'}),
+                         ['env', 'INITIAL_AGENT_MODE=agent-full-access', 'acpx'])
+        with self.assertRaises(ValueError):
+            transport_cmd('local', 'posix', ['acpx'], env={'bad-key': '1'})

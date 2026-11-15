@@ -1,6 +1,6 @@
 # 给 AI：在线协作手册
 
-本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。源码通用入口支持 `connect/start/list/status/events/wait/reply/dialogue/permission/intervene/cancel/close`；`dialogue` 仅适用于有输入能力的 AGY native 原 owner。Hermes 候选另有受控 `reconcile` 与原始且当前 controller 专用 `release_only`；后者要求 expected_turn、unknown/HOLD、已结算非 native runner 和本地 exact record，只释放资源，business_state 保留 unknown，已有 fence 不重复 close。实际调用以当前加载 schema 为准，不把源码动作当成现役已安装。
+本文用于已配置的发起端。先按[配置手册](configuration.md)确定入口、任务库、目标和授权范围。通用入口另支持显式 `release_only`；Hermes 还提供 `reconcile`。资源释放与业务控制不同，完整权限、证明及风险边界见[权威恢复合同](../skill/references/core-requirements.md#写占用恢复合同)；不得自动重放业务。实际调用以当前加载 schema 为准。
 
 ## 调用约定
 
@@ -20,7 +20,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。AGY 仅作执行端，不作为发起端或待验入口。
 - `--agent` 仍取 omp/codex/pi/agy。新 AGY 默认 `ocs`，不按任务自动换模型；小写 `oc/oa/4c/4a/4h` 裸简称全部 off，加 s 为 native Swarm，加 t 为 native Teamwork 源码路径（须有命令广告，无 fallback）。简称与显式模式／路由冲突拒绝，完整 advertised ID/family 保持兼容。详见[简称与模式合同](../skill/references/agy-models.md)。旧任务不回填、其他 CLI 不变；源码、部署和真实业务验收分开报告。
-- `--write` 声明已授权编辑／测试与目录占用；OMP/Codex/Pi 沿用按 `write` 选审批策略。新 AGY 默认 `approve-all`，显式只读审批传 `--agy-approval approve-reads`，与 `write` 独立且随任务续轮保留；旧任务缺字段不扩权。审批不是文件沙箱。
+- `--write` 声明已授权编辑／测试与单 writer 目录占用互斥。**新启动**的 OMP/Codex/Pi/AGY 默认启用 `execution_policy: native-skip`（AGY 默认 `agy_approval: skip-permissions`；OMP/AGY 在 POSIX 与 Windows 均原生传参跳过审批与 CLI 目录限制，仅 ACPX Shared Runtime `fs/*` 回调仍受 `cwd` 子树限制，作为待 PM/用户决策的公开上游缺口），同时保留业务范围与任务/controller 身份隔离；仅 AGY 支持显式 `--agy-approval approve-all|approve-reads` 退回传统审批。缺 `execution_policy` 的既有运行中与历史任务不扩权，续轮保留各自原策略；源码改动在受支持部署与重载前不对运行中宿主生效。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
 - native 不设硬执行 timeout。Swarm／Teamwork 正常请求依公开 end_turn、完整 load、无活动工具／待答问题和当前结果，再精确 unload 与负向读回，不要求逐成员 add/kill。Teamwork 委派 RPC completed 不是业务完成；异步问题及修改沿同 owner 的 dialogue，带 expected_turn／稳定 command_id／问题原 question_id。取消只转达一次 native cancel，停止未证如实 unknown、不重放／强杀；不把旧 cleanup 样本当新薄桥证明。详见[模式合同](../skill/references/agy-models.md)和[验收索引](../VERIFICATION.md#current-acceptance-index)。
@@ -32,7 +32,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 CLI start 显式传 `--agy-mode dynamic --model <完整广告ID或family>`；Hermes/OMP 用 `agy_mode: "dynamic"`。无Dynamic简称；旧 `agy_swarm` 是兼容路由，若显式给出须为native。`agy_worker_model`不适用，子模型tier属于审核Script。`single/swarm/teamwork`可用同一模式字段表达，省略不改旧默认。
 
-收到 `permission` 事件后读取完整 `script` 和 `script_sha256`，由原发起方按已授权范围审核，再提交 `permission` 动作：`task_id/expected_turn/command_id/permission_id/script_sha256/decision`，decision仅allow_once或reject_once。CLI对应 `permission --task ... --expected-turn ... --command-id ... --permission-id ... --script-sha256 ... --decision allow_once|reject_once`。稳定command_id重复同意图不重发；approve-all不自动批workflow脚本。脚本可能包含任务敏感信息，仅回原来源，不向无关会话转发。
+在默认 `native-skip`（`skip-permissions`）下，Dynamic 通过 `agy acp --dangerously-skip-permissions` 原生执行 `/run-workflow`，不再额外要求 `permission` 动作手动逐次批准脚本；若意外收到同源 `run_workflow` 回调且存在无歧义允许项，核验 Script 后自动放行。**无论是否 `native-skip`，均必须先真实观察到合法、非空、非 `ScriptPath` 且不超 `128000` UTF-8 字节的绑定 `Script` 身份**；在同 `toolCallId` 建立 `Script` 身份前拒绝 `tool_call_update`，缺失真实 `Script` 的终态保持 `unknown`/HOLD 且绝不结算完成或卸载，建立身份后允许稀疏更新。仅显式传入 `--agy-approval approve-all|approve-reads`（或历史非 skip 任务）时保留以下阻塞式精确审批：收到 `permission` 事件后读取完整 `script` 和 `script_sha256`，由原发起方审核后提交 `permission`（`task_id/expected_turn/command_id/permission_id/script_sha256/decision`，`allow_once|reject_once`）。异源/子 session 回调与畸形冲突更新仍始终拒绝并 HOLD。脚本可能包含任务敏感信息，仅回原来源，不向无关会话转发。
 
 正常读取父工具状态和父公开答案；`native_observation.child_events/phase_logs=unavailable`，不推造子事件。首end_turn仍需完整load与工具完成、审批hash和精确卸载。dialogue只排队到前台返回后发送，非热改脚本/子agent。取消、断连或证据缺失保unknown/HOLD，不能自动cancel+resume；close不补造Swarm kill证明。详见[唯一合同](../skill/references/core-requirements.md)。这是源码候选，不是实装/真实用户闭环验收。
 
@@ -162,6 +162,20 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 `close` 会关闭自有 ACPX 会话并检查 `no-session`。关闭不明保留原定位，不删除任务库或手改状态制造成功。仅回收本任务拥有的会话、观察器和临时资源，不停止同名但归属不明的程序。
 
+### 旧任务资源恢复
+
+先核对精确任务和已观察的 turn，确认没有活跃 runner；native、缺记录或远端等不支持严格证明的任务默认返回 HOLD 和明确指引，不自动释放。严格路径失败同样保留 HOLD，重试只 probe，绝不自动转为放弃证明。以下使用实际当前调用者的能力，不冒充原 owner：
+
+```sh
+python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
+  --client CLIENT_ID release_only --task TASK_ID --expected-turn OBSERVED_TURN
+# 仅在理解可能仍有工作活动并明确接受风险时：
+python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
+  --client CLIENT_ID release_only --task TASK_ID --expected-turn OBSERVED_TURN --abandon
+```
+
+Hermes `call_cli` 或 OMP `call_cli_omp` 对应参数为 `{"action":"release_only","task_id":"TASK_ID","expected_turn":1}`；明确接受风险时另加 `"abandon":true`。将 `1` 替换为实际观察到的 turn。检查 receipt 的资源状态、业务状态、operation 与风险；释放不是业务成功或全后代停写证明。普通 close/reconcile 仍按原证明门槛处理。
+
 ## 常见阻塞：按阶段处理
 
 | 观察 | 应采取的动作 |
@@ -169,7 +183,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 | connect 无完整回复／`do_not_replay` | 保存已知 client/task，先查同一调用的效果，不重发业务 |
 | SSH 中找不到 acpx/node | 发现该设备非交互 PATH 和实际入口，不复制另一机器的内部安装路径 |
 | agent 已安装但认证失败 | `auth_required` 仅表示 runtime 报告需要认证、认证来源未知，不证明 executor HTTP 401。保留成果、先核对精确任务；由操作者检查设备认证后再明确授权续办，不传 token、不自动重登或重放。 |
-| 工具 failed／疑似权限拒绝 | 先核对持久审批：新 AGY 默认 `approve-all`，可显式 `approve-reads`；OMP/Codex/Pi 默认 `approve-reads`，`write: true` 才选 `approve-all`；旧 AGY 缺字段沿用原 `write` 映射。公开 SDK 不暴露权限决策，不能从 failed 推断 deny；必要时仅查精确自有原生记录。不要把权限拒绝当模型能力失败，也不要自动重放。 |
+| 工具 failed／疑似权限拒绝 | 先核对持久策略：新启动默认 `execution_policy: native-skip`（AGY `skip-permissions`，需已部署/重载后对新任务生效；运行前旧任务仍按原策略）；显式 AGY `--agy-approval approve-reads` 会拒绝 shell/写请求，缺新字段的旧任务仍按原 `write` 映射。公开 SDK 不暴露权限决策，不能从 failed 推断 deny；必要时仅查精确自有原生记录。不要把权限拒绝当模型能力失败，也不要自动重放。 |
 | Windows Codex `0xC0000142` | 核对 SSH 服务窗口站问题与独立桌面入口，不关闭沙箱或扩大 ACL |
 | Codex 沙箱内 Node spawn SSH `EPERM` | 使用已配置的 PowerShell 原生客户端，不自动重复已启动业务 |
 | 资源耗尽／多次控制命令超时 | 暂停新派工，按设备和精确进程身份排查，不盲重试或广泛 kill |

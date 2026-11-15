@@ -1,4 +1,4 @@
-"""Original native controller release-only: real SQLite, synthetic backend only."""
+"""Strict release and current-host recovery; isolated SQLite and synthetic backend."""
 import importlib
 import unittest
 from unittest.mock import patch
@@ -41,37 +41,27 @@ class ReleaseOnlyTests(unittest.TestCase):
         self.assertFalse(self.store.finish_turn(task['id'], 1, 'completed', 0, 'end_turn'))
         self.start(write=True)  # reservation released only after exact proof
 
-    def test_other_identity_and_ended_owner_have_no_release_authority(self):
+    def test_current_host_can_strictly_release_an_ended_owner_task(self):
         task = self.start(write=True)
         self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record')
-        fixtures.EndedOwnerTests.row(self, 'old', 'agent_close', 1, 'subagent')
-        fixtures.EndedOwnerTests.row(self, 'current')
+        self.env['HERMES_SESSION_ID'] = 'current'
+        self.env['HERMES_SESSION_KEY'] = 'current-route'
         release = importlib.import_module('callcli_plugin.release')
-        before = self.store.get(task['id'])
-        with patch.object(release, 'NativeBackend') as backend:
-            for key, value in [('HERMES_SESSION_ID', 'current'),
-                               ('HERMES_SESSION_CHAT_ID', 'other'),
-                               ('HERMES_SESSION_THREAD_ID', 'other')]:
-                old = self.env[key]
-                self.env[key] = value
-                with self.assertRaises(PermissionError):
-                    self.action('release_only', task, expected_turn=1)
-                self.env[key] = old
-            backend.assert_not_called()
-        self.assertEqual(self.store.get(task['id']), before)
+        backend = CloseBackend()
+        with patch.object(release, 'NativeBackend', return_value=backend):
+            result = self.action('release_only', task, expected_turn=1)
+        self.assertEqual(result['receipt']['actor']['session_id'], 'current')
+        self.assertEqual(result['task']['origin'], task['origin'])
+        self.assertEqual(result['task']['controller'], task['controller'])
+        self.assertEqual(result['task']['state'], 'closed')
+        self.assertEqual(backend.closes, 1)
 
-    def test_transferred_current_controller_cannot_borrow_original_authority(self):
+    def test_foreign_profile_does_not_grant_release_authority(self):
         task = self.start()
-        current = dict(task['origin'], session_id='current')
-        self.store.update(task['id'], state='unknown', runner_pid=0,
-                          acpx_record_id='fixture-record', controller=current, control_epoch=2)
-        release = importlib.import_module('callcli_plugin.release')
-        with patch.object(release, 'NativeBackend') as backend:
-            for sid in ('old', 'current'):
-                self.env['HERMES_SESSION_ID'] = sid
-                with self.assertRaises(PermissionError):
-                    self.action('release_only', task, expected_turn=1)
-            backend.assert_not_called()
+        self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record')
+        self.ctx.profile_name = 'foreign'
+        with self.assertRaises(PermissionError):
+            self.action('release_only', task, expected_turn=1)
 
     def test_admission_boundaries_are_side_effect_free(self):
         task = self.start(write=True)
@@ -80,9 +70,8 @@ class ReleaseOnlyTests(unittest.TestCase):
         release = importlib.import_module('callcli_plugin.release')
         cases = [({'state': state}, 1) for state in
                  ('queued', 'running', 'cancelling', 'completed', 'cancelled', 'waiting_reply')]
-        cases += [({'runner_pid': 42}, 1), ({'agy_swarm': 'native'}, 1),
-                  ({'device': 'remote'}, 1), ({'acpx_record_id': ''}, 1),
-                  ({}, None), ({}, 2), ({}, True)]
+        import os
+        cases += [({'runner_pid': os.getpid()}, 1), ({}, None), ({}, 2), ({}, True)]
         for fields, turn in cases:
             with self.subTest(fields=fields, turn=turn):
                 self.store.update(task['id'], **dict(base, **fields))
@@ -201,6 +190,31 @@ class ReleaseOnlyTests(unittest.TestCase):
         self.assertEqual((backend.closes, backend.probes), (0, 2))
         self.assertEqual(self.store.get(task['id'])['state'], 'unknown')
 
+
+    def test_reconcile_after_abandon_returns_receipt_without_backend(self):
+        task = self.start(write=True)
+        self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record')
+        released = self.action('release_only', task, expected_turn=1, abandon=True)
+        release = importlib.import_module('callcli_plugin.release')
+        with patch.object(release, 'NativeBackend') as backend:
+            reconciled = self.action('reconcile', task, expected_turn=1)
+        self.assertEqual(reconciled['receipt'], released['receipt'])
+        backend.return_value.resolve.assert_not_called()
+        backend.return_value.probe.assert_not_called()
+
+    def test_recovery_of_existing_fence_audits_current_actor(self):
+        task = self.start(write=True)
+        self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record')
+        release = importlib.import_module('callcli_plugin.release')
+        backend = CloseBackend(verified=False)
+        with patch.object(release, 'NativeBackend', return_value=backend):
+            held = self.action('close', task, expected_turn=1)
+            self.env['HERMES_SESSION_ID'] = 'current'
+            backend.verified = True
+            recovered = self.action('release_only', task, expected_turn=1)
+        self.assertEqual(recovered['receipt']['attempts'][:1], held['receipt']['attempts'])
+        self.assertEqual(recovered['receipt']['attempts'][-1]['actor']['session_id'], 'current')
+        self.assertEqual(recovered['receipt']['business_state'], 'unknown')
 
 if __name__ == '__main__':
     unittest.main()

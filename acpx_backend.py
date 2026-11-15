@@ -24,12 +24,20 @@ QUIET_NOTICE_SECONDS = 600
 TRANSPORT_CLEANUP_TIMEOUT = 2
 
 
+def _windows_target(task):
+    return task.get('shell') == 'powershell' or (task.get('device') == 'local' and os.name == 'nt')
+
+
+def _native_skip(task):
+    return task.get('execution_policy') == 'native-skip'
+
+
 class AcpxBackend:
     def prepare_start(self, model, effort, approval):
         if approval is not None:
             raise ValueError('agy_approval is supported only for AGY')
         self.validate_selection(model, effort)
-        return {k:v for k,v in dict(model=model, effort=effort).items() if v is not None}
+        return dict(execution_policy='native-skip', **{k:v for k,v in dict(model=model, effort=effort).items() if v is not None})
 
     def validate_selection(self, model, effort):
         for value in (model, effort):
@@ -38,10 +46,25 @@ class AcpxBackend:
         if effort is not None:
             raise ValueError('effort is currently supported only for AGY')
 
+    def agent_env(self, task):
+        if _native_skip(task) and task['agent'] == 'codex':
+            return {'INITIAL_AGENT_MODE': 'agent-full-access'}
+        return {}
+
+    def agent_argv(self, task):
+        if _native_skip(task) and task['agent'] == 'omp':
+            return ['omp', 'acp', '--auto-approve', '--allow-home']
+        return None
+
     def agent_args(self, task):
+        argv = self.agent_argv(task)
+        if argv is not None:
+            return ['--agent', ' '.join(argv)]
         return [task['agent']]
 
     def permission_mode(self, task):
+        if _native_skip(task):
+            return 'approve-all'
         return 'approve-all' if task['write'] else 'approve-reads'
 
     def prompt_guidance(self, task):
@@ -54,7 +77,60 @@ class AcpxBackend:
         return None
 
     def control(self, task, action, timeout=20):
+        if action not in {'new', 'cancel', 'status', 'close', 'model', 'effort', 'mode', 'show'}:
+            raise ValueError('Unknown control action')
+        agent_argv = self.agent_argv(task)
+        if _windows_target(task) and agent_argv is not None:
+            control_options = dict(
+                action=action,
+                cwd=task['cwd'],
+                session=task['session'],
+                agent=task['agent'],
+                agentArgv=agent_argv,
+                permissionMode=self.permission_mode(task),
+            )
+            if action != 'new' and task.get('acpx_record_id'):
+                control_options['recordId'] = task['acpx_record_id']
+                if task.get('acpx_session_id'):
+                    control_options['backendSessionId'] = task['acpx_session_id']
+            if timeout is not None:
+                control_options['timeoutMs'] = timeout * 1000
+            if task.get('execution_version') is not None:
+                control_options['expectedVersion'] = task['execution_version']
+            if action == 'new' and task.get('model') is not None:
+                control_options['model'] = task['model']
+            if action == 'model':
+                control_options['value'] = task['model']
+            elif action == 'effort':
+                control_options['value'] = task['effort']
+            elif action == 'mode':
+                control_options['value'] = task.get('agent_mode', 'agent-full-access')
+            bootstrap = ("(async()=>{try{process.stdout.on('error',()=>{process.exitCode=1;});"
+                         "const p=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+                         "const m={exports:{}};new Function('require','module','exports',p.source)(require,m,m.exports);"
+                         "process.exitCode=await m.exports.control(p.options);}catch{process.exitCode=1;}})();")
+            payload = dict(source=Path(__file__).with_name('shared-prompt.cjs').read_text(),
+                           options=control_options)
+            cli_argv = [
+                'node', '-e', bootstrap,
+                '--',
+                '--cwd', task['cwd'],
+                '--action', action,
+                '--session', task['session'],
+                '--permission-mode', control_options['permissionMode'],
+                '--agent', task['agent'],
+                '--agent-argv', *agent_argv,
+            ]
+            agent_env = self.agent_env(task) if action in {'new', 'mode'} else {}
+            cmd = command(task['device'], task.get('shell', 'powershell'), cli_argv,
+                          env=None if task['device'] == 'local' else (agent_env or None))
+            kwargs = dict(input=json.dumps(payload).encode('utf-8'), capture_output=True, timeout=timeout)
+            if agent_env and task['device'] == 'local':
+                kwargs['env'] = dict(os.environ, **agent_env)
+            return subprocess.run(cmd, **kwargs)
         args = ['acpx','--cwd',task['cwd'],'--format','json']
+        if _native_skip(task):
+            args += ['--approve-all', '--non-interactive-permissions', 'deny']
         if action == 'new' and task.get('model') is not None:
             args += ['--model', task['model']]
         args += self.agent_args(task)
@@ -66,11 +142,17 @@ class AcpxBackend:
             args += ['sessions','close',task['session']]
         elif action in {'model', 'effort'}:
             args += ['set', '-s', task['session'], 'model' if action == 'model' else 'thought_level', task[action]]
+        elif action == 'mode':
+            args += ['set-mode', '-s', task['session'], task.get('agent_mode', 'agent-full-access')]
         elif action == 'show':
             args += ['sessions','show',task['session']]
-        else:
-            raise ValueError('Unknown control action')
-        return subprocess.run(command(task['device'],task.get('shell','posix'),args),capture_output=True,timeout=timeout)
+        agent_env = self.agent_env(task) if action in {'new', 'mode'} else {}
+        cmd = command(task['device'], task.get('shell', 'posix'), args,
+                      env=None if task['device'] == 'local' else (agent_env or None))
+        kwargs = dict(capture_output=True, timeout=timeout)
+        if agent_env and task['device'] == 'local':
+            kwargs['env'] = dict(os.environ, **agent_env)
+        return subprocess.run(cmd, **kwargs)
 
     def apply_selection(self, task):
         selected = {k: task[k] for k in ('model', 'effort') if task.get(k) is not None}
@@ -100,6 +182,9 @@ class AcpxBackend:
         if task.get('timeout') is not None:
             options['timeoutMs'] = task['timeout'] * 1000
         options['permissionMode'] = self.permission_mode(task)
+        agent_env = self.agent_env(task)
+        if agent_env:
+            options['agentEnv'] = agent_env
         for key in ('model', 'effort'):
             if task.get(key) is not None:
                 options[key] = task[key]
@@ -156,10 +241,16 @@ class AcpxBackend:
                 record_id = created.get('acpxRecordId')
                 if not isinstance(record_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', record_id):
                     raise RuntimeError('ACPX creation omitted a valid native record ID')
-                store.update(task_id, acpx_created=True, needs_session=False, acpx_record_id=record_id)
+                store.update(task_id, acpx_created=True, needs_session=False, acpx_record_id=record_id,
+                             acpx_session_id=created.get('acpxSessionId'))
                 emit('diagnostic', 'Native session record observed; prompt not yet submitted.',
                      stage='session_create', reason_code='record_observed')
                 failure_stage, failure_reason = 'backend_setup', 'setup_failed'
+                if (_native_skip(task) and task['agent'] == 'codex'
+                        and (isinstance(created.get('acpxSessionId'), str) or created.get('action') == 'session_ensured')):
+                    mode = self.control(store.get(task_id), 'mode', timeout=30)
+                    if mode.returncode:
+                        raise RuntimeError('ACPX mode setup failed (exit '+str(mode.returncode)+')')
             task = store.get(task_id)
             if not task.get('acpx_record_id'):
                 # Resume a pre-upgrade task by reading its exact named session, never by
@@ -172,7 +263,7 @@ class AcpxBackend:
                 if (record.get('name') != task['session'] or not isinstance(record_id, str)
                         or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', record_id)):
                     raise RuntimeError('Existing native session identity did not verify')
-                task = store.update(task_id, acpx_record_id=record_id)
+                task = store.update(task_id, acpx_record_id=record_id, acpx_session_id=record.get('acpSessionId'))
             # The shared installation lock is held. A task may have waited for a reply
             # across an allowed update, so its creation-time version is historical only.
             version = subprocess.run(command(task['device'], task.get('shell', 'posix'), ['acpx', '--version']),

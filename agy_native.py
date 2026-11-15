@@ -1,5 +1,6 @@
 """AGY-only ACP owner. Observes native background work without driving it."""
 import json
+import re
 import os
 import selectors
 import subprocess
@@ -19,7 +20,9 @@ except ImportError:
 
 
 class ProtocolError(RuntimeError):
-    pass
+    def __init__(self, message, *, history_diagnostic=None):
+        super().__init__(message)
+        self.history_diagnostic = history_diagnostic
 
 
 class NativeOwner:
@@ -39,8 +42,13 @@ class NativeOwner:
         self.permission_handler = None
         self.workflow_identity = {}
         self.approval_wait_seconds = 0.0
+        skip = (task.get('execution_policy') == 'native-skip'
+                or task.get('agy_approval') == 'skip-permissions')
+        argv = ['agy', 'acp', '--disable-telemetry']
+        if skip:
+            argv.append('--dangerously-skip-permissions')
         self.proc = subprocess.Popen(command(task['device'], task.get('shell', 'posix'),
-            ['agy', 'acp', '--disable-telemetry']), stdin=subprocess.PIPE,
+            argv), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
             cwd=task['cwd'] if task['device'] == 'local' else None)
         self.poller = selectors.DefaultSelector()
@@ -164,10 +172,19 @@ class NativeOwner:
             value = raw[key]
             if not isinstance(value,dict):
                 raise ProtocolError('Dynamic argument evidence type unsupported; script identity unverified, retain HOLD')
+            if 'ScriptPath' in value:
+                raise ProtocolError('Dynamic ScriptPath workflow unsupported; script identity unverified, retain HOLD')
             if 'Script' in value:
-                if not isinstance(value['Script'],str):
+                if not isinstance(value['Script'], str):
                     raise ProtocolError('Dynamic Script type conflict; retain HOLD')
-                hashes.append(hashlib.sha256(value['Script'].encode()).hexdigest())
+                encoded = value['Script'].encode('utf-8')
+                if not encoded or len(encoded) > 128000:
+                    raise ProtocolError('Dynamic Script size bounds conflict; retain HOLD')
+                hashes.append(hashlib.sha256(encoded).hexdigest())
+        if raw['sessionUpdate'] == 'tool_call_update' and known is None:
+            raise ProtocolError('Dynamic workflow update precedes observed Script identity; retain HOLD')
+        if raw['sessionUpdate'] == 'tool_call' and not hashes and known is None and raw.get('status') in {'completed', 'failed'}:
+            raise ProtocolError('Dynamic terminal workflow lacks observed Script identity; retain HOLD')
         if len(set(hashes))>1 or (known is not None and hashes and known!=hashes[0]):
             raise ProtocolError('Dynamic raw Script changed or conflicted; retain HOLD')
         if hashes:
@@ -187,11 +204,17 @@ class NativeOwner:
                 and (tool.get('name') or tool.get('title'))=='run_workflow'):
             self.permission_handler(frame)
             return
-        allow = root and (self.task.get('agy_approval') == 'approve-all' or tool.get('kind') in {'read', 'search'})
+        native_skip = (self.task.get('execution_policy') == 'native-skip'
+                       or self.task.get('agy_approval') == 'skip-permissions')
+        allow = root and (native_skip or self.task.get('agy_approval') == 'approve-all' or tool.get('kind') in {'read', 'search'})
         wanted = 'allow_once' if allow else 'reject_once'
         kinds = {'allow_once','allow_always','reject_once','reject_always'}
         option_kinds = sorted({o.get('kind') for o in params.get('options', []) if o.get('kind') in kinds})
         option = next((o.get('optionId') for o in params.get('options', []) if o.get('kind') == wanted), None) if root else None
+        if root and native_skip and option is None:
+            option = next((o.get('optionId') for o in params.get('options', []) if o.get('kind') == 'allow_always'), None)
+            if option is not None:
+                wanted = 'allow_always'
         outcome = dict(outcome='selected', optionId=option) if option else dict(outcome='cancelled')
         diagnostic = dict(rpc_id=frame['id'] if type(frame.get('id')) is int else None,
             scope='root' if root else 'foreign', tool=safe_tool_id(tool.get('toolCallId')),
@@ -362,8 +385,13 @@ def normalize(update):
         if key in update:
             value[key] = update[key]
     args = update.get('args', update.get('rawInput', {}))
-    if value.get('title')=='run_workflow' and isinstance(args,dict) and isinstance(args.get('Script'),str):
-        value['workflow_script_sha256'] = hashlib.sha256(args['Script'].encode()).hexdigest()
+    if value.get('title') == 'run_workflow':
+        for source in (update.get('args'), update.get('rawInput')):
+            if isinstance(source, dict) and 'ScriptPath' not in source and isinstance(source.get('Script'), str):
+                encoded = source['Script'].encode('utf-8')
+                if 0 < len(encoded) <= 128000:
+                    value['workflow_script_sha256'] = hashlib.sha256(encoded).hexdigest()
+                    break
     if value.get('title') == 'swarm' and isinstance(args, dict):
         value['swarm'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
         output = update.get('rawOutput')
@@ -411,30 +439,147 @@ def snapshot(updates):
     return result
 
 
-def additions(previous, current):
+_KNOWN_HISTORY_UPDATES = {'user_message_chunk', 'agent_message_chunk', 'tool_call'}
+_KNOWN_TOOL_STATUSES = {'pending', 'in_progress', 'completed', 'failed'}
+
+
+def _safe_slot_type(entry):
+    kind = entry.get('sessionUpdate') if isinstance(entry, dict) else None
+    return kind if kind in _KNOWN_HISTORY_UPDATES else None
+
+
+def _safe_tool_status(entry):
+    status = entry.get('status') if isinstance(entry, dict) else None
+    return status if isinstance(status, str) and status in _KNOWN_TOOL_STATUSES else None
+
+
+def _entry_text(entry):
+    if not isinstance(entry, dict):
+        return None
+    content = entry.get('content')
+    return content.get('text') if isinstance(content, dict) and isinstance(content.get('text'), str) else None
+
+
+def _tool_history_conflict(old, new):
+    if old.get('kind') not in (None, '') and new.get('kind') != old['kind']:
+        return True
+    if 'swarm' in old:
+        return (not isinstance(new.get('swarm'), dict)
+                or any(new['swarm'].get(k) != v for k, v in old['swarm'].items()))
+    if 'swarm' in new:
+        return (not isinstance(new.get('swarm'), dict)
+                or new.get('title') != 'swarm'
+                or old.get('title') not in (None, '', 'swarm'))
+    return False
+
+
+def _history_diagnostic(reason_code, previous=(), current=(), *, index=None,
+                        background_growth=False, call_site=None, interaction_seq=None, **extra):
+    prev_agent = ''.join(_entry_text(e) or '' for e in previous if _safe_slot_type(e) == 'agent_message_chunk')
+    curr_agent = ''.join(_entry_text(e) or '' for e in current if _safe_slot_type(e) == 'agent_message_chunk')
+    prev_tools = [e.get('toolCallId') for e in previous if _safe_slot_type(e) == 'tool_call']
+    curr_tools = [e.get('toolCallId') for e in current if _safe_slot_type(e) == 'tool_call']
+    prev_users = [_entry_text(e) for e in previous if _safe_slot_type(e) == 'user_message_chunk']
+    curr_users = [_entry_text(e) for e in current if _safe_slot_type(e) == 'user_message_chunk']
+    diag = dict(
+        reason_code=reason_code,
+        call_site=call_site,
+        interaction_seq=interaction_seq,
+        previous_len=len(previous),
+        current_len=len(current),
+        background_growth=bool(background_growth),
+        concat_agent_is_prefix=curr_agent.startswith(prev_agent),
+        same_tool_id_prefix=(len(curr_tools) >= len(prev_tools) and curr_tools[:len(prev_tools)] == prev_tools),
+        same_user_prefix=(len(curr_users) >= len(prev_users) and curr_users[:len(prev_users)] == prev_users),
+    )
+    if index is not None and 0 <= index < len(previous):
+        old = previous[index]
+        new = current[index] if index < len(current) else None
+        old_type = _safe_slot_type(old)
+        new_type = _safe_slot_type(new)
+        both_tools = (old_type == new_type == 'tool_call')
+        old_text = _entry_text(old) if old_type in {'agent_message_chunk', 'user_message_chunk'} else None
+        new_text = _entry_text(new) if new_type in {'agent_message_chunk', 'user_message_chunk'} else None
+        same_text_kind = (old_type == new_type and isinstance(old_text, str) and isinstance(new_text, str))
+        diag.update(
+            index=index,
+            is_tail=(index == len(previous) - 1),
+            old_type=old_type,
+            new_type=new_type,
+            prev_slot_type=_safe_slot_type(previous[index - 1]) if index > 0 else None,
+            next_new_slot_type=_safe_slot_type(current[index + 1]) if new is not None and index + 1 < len(current) else None,
+            same_tool_id=(old.get('toolCallId') == new.get('toolCallId')) if both_tools else None,
+            old_status=_safe_tool_status(old),
+            new_status=_safe_tool_status(new),
+            old_has_kind=bool(old.get('kind')) if old_type == 'tool_call' else None,
+            new_has_kind=bool(new.get('kind')) if new_type == 'tool_call' else None,
+            same_kind=(old.get('kind') == new.get('kind')) if both_tools else None,
+            same_swarm=(old.get('swarm') == new.get('swarm')) if both_tools else None,
+            old_len=len(old_text) if isinstance(old_text, str) else None,
+            new_len=len(new_text) if isinstance(new_text, str) else None,
+            text_equal=(old_text == new_text) if same_text_kind else None,
+            is_prefix=new_text.startswith(old_text) if same_text_kind else None,
+            rstrip_is_prefix=new_text.startswith(old_text.rstrip('\r\n')) if same_text_kind else None,
+        )
+    diag.update(extra)
+    return diag
+
+
+def _format_history_diagnostic(diag):
+    fields = (
+        ('site', 'call_site'),
+        ('seq', 'interaction_seq'),
+        ('reason', 'reason_code'),
+        ('idx', 'index'),
+        ('tail', 'is_tail'),
+        ('prev', 'previous_len'),
+        ('curr', 'current_len'),
+        ('old', 'old_type'),
+        ('new', 'new_type'),
+        ('old_len', 'old_len'),
+        ('new_len', 'new_len'),
+        ('eq', 'text_equal'),
+        ('prefix', 'is_prefix'),
+        ('tool_id', 'same_tool_id'),
+        ('agent_prefix', 'concat_agent_is_prefix'),
+        ('tool_prefix', 'same_tool_id_prefix'),
+        ('user_prefix', 'same_user_prefix'),
+    )
+    parts = [f'{short}={diag[key]}' for short, key in fields if diag.get(key) is not None]
+    return '[' + ' '.join(parts) + ']' if parts else ''
+
+
+def additions(previous, current, *, background_growth=False, call_site=None, interaction_seq=None):
     if len(current) < len(previous):
-        raise ProtocolError('Native history shrank; reconciliation required')
+        raise ProtocolError('Native history shrank; reconciliation required',
+            history_diagnostic=_history_diagnostic('history_shrank', previous, current,
+                background_growth=background_growth, call_site=call_site, interaction_seq=interaction_seq))
     changed = []
     for index, old in enumerate(previous):
         new = current[index]
         if old == new:
             continue
         if old['sessionUpdate'] == new['sessionUpdate'] == 'tool_call' and old['toolCallId'] == new['toolCallId']:
-            if any(old.get(k) != new.get(k) for k in ('kind', 'swarm')):
-                raise ProtocolError('Native tool history changed; reconciliation required')
-            if old.get('status') != new.get('status'):
+            if _tool_history_conflict(old, new):
+                raise ProtocolError('Native tool history changed; reconciliation required',
+                    history_diagnostic=_history_diagnostic('tool_changed', previous, current, index=index,
+                        background_growth=background_growth, call_site=call_site, interaction_seq=interaction_seq))
+            if any(old.get(k) != new.get(k) for k in ('status', 'kind', 'swarm')):
                 changed.append(new)
-        elif (index == len(previous)-1 and old['sessionUpdate'] == new['sessionUpdate']
-              and old['sessionUpdate'] in {'agent_message_chunk', 'user_message_chunk'}
+        elif (old['sessionUpdate'] == new['sessionUpdate']
+              and ((old['sessionUpdate'] == 'agent_message_chunk' and background_growth)
+                   or (index == len(previous)-1 and old['sessionUpdate'] in {'agent_message_chunk', 'user_message_chunk'}))
               and new['content']['text'].startswith(old['content']['text'])):
             changed.append(dict(sessionUpdate=new['sessionUpdate'], content=dict(type='text',
                 text=new['content']['text'][len(old['content']['text']):])))
         else:
-            raise ProtocolError('Native history prefix changed; reconciliation required')
+            raise ProtocolError('Native history prefix changed; reconciliation required',
+                history_diagnostic=_history_diagnostic('prefix_changed', previous, current, index=index,
+                    background_growth=background_growth, call_site=call_site, interaction_seq=interaction_seq))
     return changed+current[len(previous):]
 
 
-def first_replay(published, replay):
+def first_replay(published, replay, *, call_site=None, interaction_seq=None):
     """Live deltas and persisted replay have different chunk/tool metadata shapes."""
     tools = {e['toolCallId']: e for e in published if e['sessionUpdate'] == 'tool_call'}
     messages = [e['content']['text'] for e in published
@@ -455,7 +600,12 @@ def first_replay(published, replay):
                 old = messages[message_index]
                 count = min(len(text)-consumed, len(old)-message_offset)
                 if text[consumed:consumed+count] != old[message_offset:message_offset+count]:
-                    raise ProtocolError('Native live message history changed; reconciliation required')
+                    raise ProtocolError('Native live message history changed; reconciliation required',
+                        history_diagnostic=_history_diagnostic('live_message_changed', published, replay,
+                            call_site=call_site, interaction_seq=interaction_seq,
+                            message_index=message_index, message_offset=message_offset,
+                            published_message_count=len(messages),
+                            old_len=len(old), new_len=len(text), consumed=consumed, is_prefix=False))
                 consumed += count
                 message_offset += count
                 if message_offset == len(old):
@@ -466,11 +616,41 @@ def first_replay(published, replay):
             entry = dict(sessionUpdate=entry['sessionUpdate'], content=dict(type='text', text=text[consumed:]))
         fresh.append(entry)
     if message_index != len(messages):
-        raise ProtocolError('Native live message history changed; reconciliation required')
+        raise ProtocolError('Native live message history changed; reconciliation required',
+            history_diagnostic=_history_diagnostic('live_message_unconsumed', published, replay,
+                call_site=call_site, interaction_seq=interaction_seq,
+                message_index=message_index, message_offset=message_offset,
+                published_message_count=len(messages)))
     return fresh
 
 
 
+
+
+def dialogue_body(task, entry):
+    header = 'CALLCLI_DIALOGUE '+json.dumps(dict(task=task['id'], turn=task['turn'],
+        interaction_seq=entry['interaction_seq'], command_id=entry['command_id'],
+        question_id=entry.get('question_id'), question=entry.get('question')))
+    return header+' Continue the same native session; answer the request and remaining questions.\n\n'+entry['prompt']
+
+
+def history_sections(history, task, commands):
+    """Partition only at exact returned inputs, not model-authored labels."""
+    boundaries = {dialogue_body(task, c): c['interaction_seq'] for c in commands.values()
+        if c.get('kind') == 'dialogue' and c.get('turn') == task['turn'] and c.get('status') == 'returned'}
+    sections, interaction = {0: []}, 0
+    for entry in history:
+        if entry['sessionUpdate'] == 'user_message_chunk':
+            next_interaction = boundaries.get(entry['content']['text'])
+            if next_interaction is not None:
+                if next_interaction <= interaction:
+                    raise ProtocolError('Native dialogue history reordered; reconciliation required',
+                        history_diagnostic=_history_diagnostic('dialogue_reordered', (), history,
+                            call_site='history_sections', interaction_seq=next_interaction))
+                interaction = next_interaction
+                sections[interaction] = []
+        sections[interaction].append(entry)
+    return sections
 
 
 def pending_question(decoder):
@@ -503,9 +683,9 @@ def run_native(store, task, emit, policy):
     except ImportError:
         from updates import ensure_current
     try:
-        from .agy import fatal_error
+        from .agy import fatal_error, outcome_note
     except ImportError:
-        from agy import fatal_error
+        from agy import fatal_error, outcome_note
     if 'version_check' not in task:
         checked = ensure_current(store, task)
         emit('version', json.dumps(checked))
@@ -573,7 +753,10 @@ def run_native(store, task, emit, policy):
             if owner.created_session:
                 _, baseline = owner.load()
             emit('model', json.dumps(selected))
-            task = stage(store, task, emit)
+            try:
+                task = stage(store, task, emit)
+            except RuntimeError as exc:
+                raise ProtocolError(str(exc)) from exc
             binding = (task['id'], task['turn'], task['launch_id'], task.get('control_epoch', 1))
             store.native_input_open(*binding)
             current_interaction = 0
@@ -644,7 +827,7 @@ def run_native(store, task, emit, policy):
             dialogue_public = None
             deferred_questions = []
             interaction_body = None
-            native_pending = False
+
             blocker_notice = None
             while True:
                 if check_cancel():
@@ -666,12 +849,33 @@ def run_native(store, task, emit, policy):
                         recovered.append((deferred, suffix, bool(suffix) and index+1 < len(history)
                             and history[index+1]['sessionUpdate'] in {'tool_call', 'user_message_chunk'}))
                         comparison[index] = history[index]
-                turn_history = additions(baseline, history)
+                turn_history = additions(baseline, history, background_growth=True,
+                    call_site='baseline', interaction_seq=0)
                 public_history = turn_history
-                fresh = first_replay(previous_public, public_history) if previous is None else additions(comparison, history)
+                if previous is None:
+                    fresh_sections = {0: first_replay(previous_public, public_history,
+                        call_site='initial_replay', interaction_seq=0)}
+                else:
+                    commands = store.get(task['id']).get('commands', {})
+                    old_sections = history_sections(comparison, task, commands)
+                    new_sections = history_sections(history, task, commands)
+                    if not old_sections.keys() <= new_sections.keys():
+                        raise ProtocolError('Native dialogue history missing; reconciliation required',
+                            history_diagnostic=_history_diagnostic('dialogue_missing', comparison, history,
+                                call_site='section', interaction_seq=current_interaction))
+                    fresh_sections = {seq: additions(old_sections.get(seq, []), section, background_growth=True,
+                        call_site='section', interaction_seq=seq)
+                        for seq, section in new_sections.items()}
                 if dialogue_public is not None:
-                    fresh = first_replay(dialogue_public, fresh)
+                    if current_interaction not in fresh_sections:
+                        raise ProtocolError('Native dialogue replay boundary missing; reconciliation required',
+                            history_diagnostic=_history_diagnostic('dialogue_boundary_missing',
+                                comparison if comparison is not None else baseline, history,
+                                call_site='dialogue_replay', interaction_seq=current_interaction))
+                    fresh_sections[current_interaction] = first_replay(dialogue_public, fresh_sections[current_interaction],
+                        call_site='dialogue_replay', interaction_seq=current_interaction)
                     dialogue_public = None
+                fresh = [e for section in fresh_sections.values() for e in section]
                 for deferred, suffix, boundary in recovered:
                     update = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=suffix))
                     for kind, text in deferred['decoder'].feed(dict(params=dict(update=update))):
@@ -683,9 +887,15 @@ def run_native(store, task, emit, policy):
                     if not deferred['decoder'].pending:
                         deferred_questions.remove(deferred)
                 appended = history[len(previous if previous is not None else baseline):]
-                for entry in fresh:
-                    for kind, text in decoder.feed(dict(params=dict(update=entry)), text_boundary=entry in appended):
-                        emit(kind, text)
+                for seq, section in fresh_sections.items():
+                    # A completed older response must not enter the current decoder.
+                    target = decoder if seq == current_interaction else EventDecoder()
+                    for entry in section:
+                        for kind, text in target.feed(dict(params=dict(update=entry)), text_boundary=entry in appended):
+                            emit(kind, text, interaction_seq=seq)
+                    if seq != current_interaction:
+                        for kind, text in target.finish():
+                            emit(kind, text, interaction_seq=seq)
                 previous = history
                 now = time.time()
                 if fresh or any(suffix or boundary for _, suffix, boundary in recovered) or last_semantic_change is None:
@@ -737,18 +947,14 @@ def run_native(store, task, emit, policy):
                         for kind, text in decoder.feed(dict(params=dict(update=update))):
                             emit(kind, text)
                     emit('stage', 'Dialogue '+entry['command_id']+' claimed; not yet sent.')
-                    body_header = 'CALLCLI_DIALOGUE '+json.dumps(dict(task=task['id'], turn=task['turn'],
-                        interaction_seq=current_interaction, command_id=entry['command_id'],
-                        question_id=entry.get('question_id'), question=entry.get('question')))
-                    body_header += ' Continue the same native session; answer the request and remaining questions.'
-                    interaction_body = body_header+'\n\n'+entry['prompt']
+                    interaction_body = dialogue_body(task, entry)
                     if deferred_questions and deferred_questions[-1]['interaction_seq'] == current_interaction-1:
                         deferred_questions[-1].update(replacement_command=entry['command_id'],
                             replacement_body=interaction_body)
                     store.native_dialogue_state(*binding, entry['command_id'], 'send_started')
                     decoder.final_answer = ''
                     response, _ = owner.request('session/prompt', dict(sessionId=owner.session_id,
-                        prompt=[dict(type='text', text=body_header+'\n\n'+entry['prompt'])]), timeout=None,
+                        prompt=[dict(type='text', text=interaction_body)]), timeout=None,
                         check_cancel=check_cancel, on_update=publish_dialogue)
                     if check_cancel():
                         if response.get('stopReason')=='cancelled':
@@ -767,8 +973,7 @@ def run_native(store, task, emit, policy):
                 current = store.get(task['id'])
                 active = any(e.get('status') not in {'completed','failed'} for e in turn_history
                              if e['sessionUpdate']=='tool_call')
-                native_pending = next((e['native_work_pending'] for e in reversed(turn_history)
-                    if type(e.get('native_work_pending')) is bool), native_pending)
+
                 response_history = turn_history
                 if interaction_body is not None:
                     boundary = next((index for index,e in enumerate(turn_history)
@@ -778,7 +983,8 @@ def run_native(store, task, emit, policy):
                         if e['sessionUpdate']=='tool_call'):
                     response_floor = response_history
                 if response_floor:
-                    response_history = first_replay(response_floor, response_history)
+                    response_history = first_replay(response_floor, response_history,
+                        call_site='response_floor_replay', interaction_seq=current_interaction)
                 result_decoder = EventDecoder()
                 for item in response_history:
                     result_decoder.feed(dict(params=dict(update=item)))
@@ -787,11 +993,13 @@ def run_native(store, task, emit, policy):
                 if (not active and not pending_question(decoder) and not pending_question(result_decoder) and not current.get('questions')):
                     result_decoder.finish()
                     # This native response is navigation/progress, not the requested result.
-                    board_hint = result_decoder.final_answer.strip().rstrip('.') == 'Run /swarm board'
+                    board_hint = bool(re.fullmatch(
+                        r'Run /swarm board(?: \(default shortcut [^()\r\n]+\))?'
+                        r'(?: to open the live board)?\.?', result_decoder.final_answer.strip()))
                     handoff_only = bool(response_floor) and not result_decoder.final_answer.strip()
-                    if native_pending or board_hint or handoff_only:
+                    if board_hint or handoff_only:
                         observation = store.get(task['id']).get('native_observation', {})
-                        observation['response_pending_reason'] = ('native_work_pending' if native_pending else
+                        observation['response_pending_reason'] = (
                             'board_navigation_only' if board_hint else 'native_handoff_only')
                         store.update(task['id'],native_observation=observation)
                         review()
@@ -825,15 +1033,21 @@ def run_native(store, task, emit, policy):
                         emit(kind,text)
                     if not store.native_input_seal(*binding, current_interaction):
                         continue
-                    store.update(task['id'], native_result=dict(turn=task['turn'],interaction_seq=current_interaction,
-                        result=result_decoder.final_answer.strip(), source='native-public-response'))
+                    # Content failure does not erase the proven protocol settlement.
+                    # Reuse single-mode policy only after the existing safe boundary.
+                    result_decoder.stop_reason = 'end_turn'
+                    note = outcome_note(result_decoder, 0, 'completed')
+                    state = 'unknown' if note else 'completed'
+                    if not note:
+                        store.update(task['id'], native_result=dict(turn=task['turn'],interaction_seq=current_interaction,
+                            result=result_decoder.final_answer.strip(), source='native-public-response'))
                     unloaded = unload('completion')
                     store.native_cleanup_commit(*binding,cleanup_token,dict(kind='native-mode-settled',mode=mode,
                         task=task['id'],turn=task['turn'],launch_id=task['launch_id'],epoch=task.get('control_epoch',1),
-                        session_id=owner.session_id,session_unloaded=unloaded,outcome='completed',
+                        session_id=owner.session_id,session_unloaded=unloaded,outcome=state,
                         evidence='public-response-and-session-unload',all_descendants_proven_stopped=False))
                     store.update(task['id'],native_phase='settled',native_workers='unobserved')
-                    return TurnResult('completed', 0, 'end_turn')
+                    return TurnResult(state, 0, 'end_turn', note)
                 review()
                 # Observation interval, never an execution deadline or generation prompt.
                 for _ in range(20):
@@ -850,6 +1064,21 @@ def run_native(store, task, emit, policy):
             observation['question_blockers'] = [dict(interaction_seq=d['interaction_seq'], reason=reason,
                 available_actions=['inspect_origin', 'reconcile_hold'], blocks_completion=True) for d in deferred_questions]
             store.update(task['id'], native_observation=observation)
+        note = str(exc)
+        if getattr(exc, 'history_diagnostic', None) is not None:
+            diag = dict(exc.history_diagnostic, turn=task['turn'])
+            if diag.get('interaction_seq') is None and 'current_interaction' in locals():
+                diag['interaction_seq'] = current_interaction
+            observation = dict(store.get(task['id']).get('native_observation') or {})
+            observation.setdefault('turn', task['turn'])
+            observation['history_diagnostic'] = diag
+            if 'binding' in locals():
+                store.native_owner_diagnostics(*binding, native_observation=observation)
+            else:
+                store.update(task['id'], native_observation=observation)
+            formatted = _format_history_diagnostic(diag)
+            if formatted:
+                note = note + ' ' + formatted
         if owner is not None and owner.session_id and not submitted:
             try:
                 unload('preprompt-failure')
@@ -861,7 +1090,7 @@ def run_native(store, task, emit, policy):
             except ProtocolError:
                 pass  # Original failure remains authoritative; cleanup unproven.
         store.update(task['id'], native_phase='unknown', native_workers='unknown' if submitted else 'not_submitted')
-        return TurnResult('unknown', None, None, str(exc))
+        return TurnResult('unknown', None, None, note)
     finally:
         if 'binding' in locals():
             try:

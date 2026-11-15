@@ -28,6 +28,8 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
     interaction = 0
     last_notice = started = time.monotonic()
     approved_tools = {}
+    native_skip = bool(task.get('execution_policy') == 'native-skip'
+                       or task.get('agy_approval') == 'skip-permissions')
 
     def review():
         nonlocal last_notice
@@ -49,6 +51,18 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             raise ProtocolError('Dynamic permission lacks bounded exact Script/tool identity; rejected, retain HOLD')
         ident = uuid.uuid4().hex
         digest = hashlib.sha256(script.encode()).hexdigest()
+        if native_skip:
+            allow_once = [o.get('optionId') for o in params.get('options', [])
+                          if o.get('kind') == 'allow_once' and isinstance(o.get('optionId'), str)]
+            allow_always = [o.get('optionId') for o in params.get('options', [])
+                            if o.get('kind') == 'allow_always' and isinstance(o.get('optionId'), str)]
+            if len(allow_once) > 1 or (not allow_once and len(allow_always) != 1):
+                owner.send(dict(id=frame['id'], result=dict(outcome=dict(outcome='cancelled'))))
+                raise ProtocolError('Dynamic requires unique native-skip approval option')
+            selected = allow_once[0] if allow_once else allow_always[0]
+            approved_tools[safe_tool_id(tool['toolCallId'])] = digest
+            owner.send(dict(id=frame['id'], result=dict(outcome=dict(outcome='selected', optionId=selected))))
+            return
         options = {o.get('kind'):o.get('optionId') for o in params.get('options', [])
                    if o.get('kind') in {'allow_once','reject_once'} and isinstance(o.get('optionId'), str)}
         if len(options)!=2 or len(params.get('options',[]))!=2 or len(set(options.values()))!=2:
@@ -83,8 +97,10 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
     published = []
     command = None
     body = '/run-workflow\n'+protocol_prompt(policy+guidance(task)+
-        'Use native run_workflow, not Swarm. Present each exact Script for single-use approval. '
-        'Workflow child model values are native tiers (inherit/flash_lite/flash/pro), not ACP model family IDs. '
+        'Use native run_workflow, not Swarm. '
+        + ('Execute authorized workflows natively under skip-permissions without redundant script approval prompts. '
+           if native_skip else 'Present each exact Script for single-use approval. ')
+        + 'Workflow child model values are native tiers (inherit/flash_lite/flash/pro), not ACP model family IDs. '
         'Do not infer authorization to change child tiers. Report only observed parent tool status and public answers; '
         'do not claim unseen child/phase/log events. No automatic retries.\n\n'+task['prompt'])
     emit('stage', 'Dynamic observation: parent tool status and parent public answer only; direct child/phase/log output unavailable.',
@@ -129,7 +145,16 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
         published = []
         tools = [e for e in replay if e['sessionUpdate']=='tool_call']
         workflow = [e for e in tools if e.get('title')=='run_workflow']
-        if any(e['toolCallId'] not in approved_tools or e.get('workflow_script_sha256')!=approved_tools[e['toolCallId']] for e in workflow):
+        if any(not e.get('workflow_script_sha256')
+               or e.get('workflow_script_sha256') != owner.workflow_identity.get(e['toolCallId'])
+               for e in workflow):
+            raise ProtocolError('Dynamic workflow lacks exact observed Script identity; retain HOLD')
+        if native_skip:
+            if any(e['toolCallId'] in approved_tools
+                   and e.get('workflow_script_sha256') != approved_tools[e['toolCallId']]
+                   for e in workflow):
+                raise ProtocolError('Dynamic workflow script diverged from native permission; retain HOLD')
+        elif any(e['toolCallId'] not in approved_tools or e.get('workflow_script_sha256')!=approved_tools[e['toolCallId']] for e in workflow):
             raise ProtocolError('Dynamic workflow lacks exact owner-approved script; retain HOLD')
         active = any(e.get('status') not in {'completed','failed'} for e in tools)
         current = store.get(task['id'])

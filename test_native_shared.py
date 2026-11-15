@@ -307,7 +307,9 @@ class NativeSharedTests(unittest.TestCase):
         fixture=pathlib.Path(__file__).with_name('fixtures')/'native_shared_agent.py'
         with tempfile.TemporaryDirectory(dir=pathlib.Path.home()/'.hermes/cache/scratch') as tmp:
             work=pathlib.Path(tmp);home=work/'home';home.mkdir();trace=work/'wire.jsonl'
-            agent=shlex.join([sys.executable,'-B',str(fixture),str(trace),'questions'])
+            argv=[sys.executable,'-B',str(fixture),str(trace),'questions']
+            (work/'.acpxrc.json').write_text(json.dumps({'agents':{'omp':{'argv':argv}}}))
+            agent=shlex.join(argv+['acp','--auto-approve','--allow-home'])
             def control(task,action,timeout=20):
                 args=['acpx','--agent',agent,'--cwd',task['cwd'],'--format','json']
                 if action=='new':args+=['sessions','new','--name',task['session']]
@@ -357,7 +359,9 @@ class NativeSharedTests(unittest.TestCase):
                     self.assertEqual(sum(e.get('method')=='session/new' for e in wire),1)
                     print('NATIVE_QUESTION_EVIDENCE '+json.dumps(dict(turns=4,prompts=4,session_creations=1,one_reply_continued=True,independent_questions=5,conflict_continued=True,long_tail_preserved=True,state=final['state'])))
                 finally:
-                    c.close(client,task['id'])
+                    closed=c.close(client,task['id'])
+                    self.assertEqual((closed['state'],closed['close_receipt']['state']),('closed','released'))
+                    self.assertTrue(json.loads(control(c.store.get(task['id']),'show').stdout)['closed'])
                     self.assertEqual(json.loads(control(c.store.get(task['id']),'status').stdout)['status'],'no-session')
 
 if __name__=='__main__':unittest.main()

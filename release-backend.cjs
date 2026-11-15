@@ -1,6 +1,6 @@
 'use strict';
 // Public Shared Runtime only. Never load authentication or submit/resume a turn.
-const {loadRuntime} = require('./shared-prompt.cjs');
+const {loadRuntime, resolveConfiguredAgentArgv, renderArgvIdentity, splitCommandLine} = require('./shared-prompt.cjs');
 
 const MATCH_FIELDS = ['record_lookup_found','record_id_match','backend_session_match','cwd_match',
   'request_match','closed_expected','closed_observed','name_lookup_found','name_scope_match'];
@@ -34,17 +34,63 @@ async function getStatus(runtime, handle, context) {
     throw error;
   }
 }
+const AGENT_SCOPES = {
+  omp: ['omp', 'omp acp --auto-approve --allow-home'],
+  agy: ['agy', 'agy acp', 'agy acp --dangerously-skip-permissions'],
+};
+const AGENT_DEFAULT_ARGVS = {
+  omp: ['omp', 'acp', '--auto-approve', '--allow-home'],
+  agy: ['agy', 'acp', '--dangerously-skip-permissions'],
+};
+async function findTargetSession(runtime, target, candidates) {
+  const scopes = candidates ?? AGENT_SCOPES[target.agent] ?? [target.agent];
+  let last;
+  for (const agent of scopes) {
+    last = await runtime.findSession({sessionKey: target.session, agent, cwd: target.cwd});
+    if (last !== undefined) return last;
+  }
+  return last;
+}
 async function withRuntime(target, deps, operation, body) {
   let runtime, primary;
   const context = {operation, stage:'load', substep:'load_runtime'};
   try {
     const sdk = await (deps.loadRuntime ?? loadRuntime)('0.22.0');
     context.stage='registry'; context.substep='create_registry';
-    const agentRegistry=sdk.createAgentRegistry({overrides:{omp:'omp acp'}});
+    const win = (deps.platform ?? process.platform) === 'win32';
+    const defaultScopes = AGENT_SCOPES[target.agent] ?? [target.agent];
+    const configuredScopes = new Map();
+    const candidates = [...defaultScopes];
+    const requestedArgv = AGENT_DEFAULT_ARGVS[target.agent];
+    if (requestedArgv) {
+      let configured;
+      try {
+        configured = await (deps.resolveConfiguredAgentArgv ?? resolveConfiguredAgentArgv)(
+          target.agent, requestedArgv, target.cwd, deps.home);
+      } catch {}
+      if (Array.isArray(configured) && configured.length > 0) {
+        const configuredId = renderArgvIdentity(configured);
+        if (!candidates.includes(configuredId)) {
+          candidates.push(configuredId);
+          configuredScopes.set(configuredId, configured);
+        } else if (win) {
+          configuredScopes.set(configuredId, configured);
+        }
+      }
+    }
+    const overrides = win ? {omp: ['omp', 'acp'], agy: ['agy', 'acp']} : {omp: 'omp acp', agy: 'agy acp'};
+    const baseRegistry = sdk.createAgentRegistry({overrides});
+    const agentRegistry = typeof baseRegistry?.resolve === 'function'
+      ? {...baseRegistry, resolve: a => {
+        if (configuredScopes.has(a)) return configuredScopes.get(a);
+        if (win && a.includes(' ')) return splitCommandLine(a);
+        return a.includes(' ') ? a : baseRegistry.resolve(a);
+      }}
+      : baseRegistry;
     context.stage='create'; context.substep='create_runtime';
     runtime=sdk.createSharedAcpRuntime({cwd:target.cwd,agentRegistry,
       permissionMode:'approve-reads',nonInteractivePermissions:'deny',authCredentials:{},authPolicy:'skip',timeoutMs:15000});
-    return await body(runtime, context);
+    return await body(runtime, context, candidates);
   } catch (error) {
     primary=error instanceof Error ? error : Error('BACKEND_FAILURE');
     Object.assign(primary,context);
@@ -61,7 +107,7 @@ async function withRuntime(target, deps, operation, body) {
   }
 }
 async function closeTarget(target, deps = {}) {
-  return withRuntime(target,deps,'close',async(runtime,context)=>{
+  return withRuntime(target,deps,'close',async(runtime,context,candidates)=>{
   const handle = {backend: 'acpx-shared', acpxRecordId: target.record,
     runtimeSessionName: target.record, sessionKey: target.session, cwd: target.cwd};
   function exact(status, closed) {
@@ -74,7 +120,7 @@ async function closeTarget(target, deps = {}) {
     const before = await getStatus(runtime, handle, context);
     exact(before, false);
     context.substep='find_before';
-    const selected = await runtime.findSession({sessionKey: target.session, agent: target.agent, cwd: target.cwd});
+    const selected = await findTargetSession(runtime, target, candidates);
     observeLookup(context, selected, target);
     if (selected?.acpxRecordId !== target.record || selected.backendSessionId !== target.acp
         || selected.cwd !== target.cwd || selected.sessionKey !== target.session) throw Error('NAME_SCOPE_MISMATCH');
@@ -84,7 +130,7 @@ async function closeTarget(target, deps = {}) {
     const after = await getStatus(runtime, handle, context);
     exact(after, true);
     context.substep='find_after';
-    const active = await runtime.findSession({sessionKey: target.session, agent: target.agent, cwd: target.cwd});
+    const active = await findTargetSession(runtime, target, candidates);
     observeLookup(context, active, target);
     if (active !== undefined) throw Error('NAME_SCOPE_REPLACED_OR_REOPENED');
     context.substep='status_confirm';
@@ -101,7 +147,7 @@ async function closeTarget(target, deps = {}) {
   });
 }
 async function probeTarget(target, deps = {}, resolve = false) {
-  return withRuntime(target,deps,resolve ? 'resolve' : 'probe',async(runtime,context)=>{
+  return withRuntime(target,deps,resolve ? 'resolve' : 'probe',async(runtime,context,candidates)=>{
   const handle = {backend:'acpx-shared',acpxRecordId:target.record,
     runtimeSessionName:target.record,sessionKey:target.session,cwd:target.cwd};
   function exact(status) {
@@ -121,7 +167,7 @@ async function probeTarget(target, deps = {}, resolve = false) {
     }
     exact(await getStatus(runtime, handle, context));
     context.substep='find_session';
-    const selected = await runtime.findSession({sessionKey:target.session,agent:target.agent,cwd:target.cwd});
+    const selected = await findTargetSession(runtime, target, candidates);
     observeLookup(context, selected, target);
     if (selected !== undefined) throw Error('NAME_SCOPE_REPLACED_OR_REOPENED');
     context.substep='status_confirm';

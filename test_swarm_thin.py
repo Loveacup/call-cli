@@ -168,11 +168,11 @@ class SwarmThinTests(unittest.TestCase):
             self.assertEqual((root/'result.txt').read_text(),'revised')
             self.assertEqual(c.close(client,task['id'])['state'],'closed')
 
-    def test_structured_pending_and_board_only_each_keep_dialogue_open(self):
+    def test_stage_only_and_board_only_each_keep_dialogue_open(self):
         for fault in ('status-working','board-only'):
             with self.subTest(fault=fault),self.workspace(fault) as (root,c,client,task,thread):
                 deadline=time.monotonic()+4
-                while not c.events(client,task['id']) or not any(e['kind']=='answer' for e in c.events(client,task['id'])):
+                while not any(e['kind']=='stage' if fault=='status-working' else e['kind']=='answer' for e in c.events(client,task['id'])):
                     if time.monotonic()>deadline: self.fail('Native progress missing')
                     time.sleep(.01)
                 time.sleep(.15)

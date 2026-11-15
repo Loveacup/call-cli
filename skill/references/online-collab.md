@@ -23,6 +23,24 @@ python3 /absolute/collab.py --db /absolute/tasks.sqlite3 --client CLIENT_ID star
 
 按实际发起端选择 runtime 标签；支持的标签从当前帮助读取。client_id 是私有协作句柄，声明的 runtime 不是认证过的原生 CLI 身份。原生身份验证另从真实运行时取证，不由模型编造 session ID 或 Telegram 来源。有长期责任方时由该方创建并保存跨轮任务句柄；短命发起方须先明确宿主支持的持续协调与收尾路径，不能靠新 connect 或父子关系自动接管。目标为 Windows 时设置 powershell；只有已获写入授权才启用 write。保留 client、task、目标 session 与 turn，不用最近会话猜目标。
 
+### Python 库形式（同源脚本派发）
+
+在已装 call-cli 源码的宿主上直接从 Python 派任务：
+
+```python
+import sys; sys.path.insert(0, '/absolute/call-cli')
+from collab import Collaboration   # 类名是 Collaboration，没有 Collab 别名
+
+c = Collaboration()
+t = c.start(client, prompt='目标、范围、产物和验证方法', cwd='/absolute/workspace',
+            agent='agy', model='gemini-4-argon', write=True)
+# t['id'] 即 task id
+```
+
+- `client` 是 **clients 表里的字符串句柄**（`sqlite3 tasks.sqlite3 "SELECT id FROM clients WHERE declared_runtime='...'"` 查），传 dict 会在参数绑定时崩；句柄不存在报 `PermissionError: Unknown client handle`。
+- OMP 新启动在 POSIX 与 Windows（经 `acpx/runtime` 结构化 `agentArgv`）均默认启用 `--auto-approve --allow-home` 原生跳过 `~/` 目录限制；但实证 ACPX Shared Runtime（`0.21.1`/`0.22.0`）的 `fs/read_text_file` / `fs/write_text_file` 回调本身由 `FileSystemHandlers.resolvePathWithinRoot` 硬性限定在 `cwd` 子树内且不支持覆写 `fs` 回调（`ACP_INVALID_RUNTIME_OPTION`），此项属于待 PM/用户决策（Option A 维持现有共享架构依赖 CLI 原生工具读写跨目录，或 Option B 后续专项改上游/直接 ACP）的公开上游缺口，而非已接受例外；跨目录写入建议在授权范围内或写 cwd 内 `./out/` 验收后搬移。
+- 跨轮 reply/cancel/close 必须复用派发时的 owner 句柄（task `origin.session_id`），换句柄会被锁拒。
+
 常规任务省略执行 timeout，先复核再决定介入/取消。Hermes/OMP 模型工具拒绝该参数；旧 CLI start --timeout SECONDS|none 与 Python timeout= 仅保留非常规显式硬预算兼容，旧值未清除仍会到期，不是软提醒。wait --timeout 5 只是轮询。clear_timeout/--clear-timeout 仅通过受支持 reply/intervene 对下一轮生效，queued 一律拒绝清除，unknown 保留占用；多问与介入替换规则见调用手册。
 
 中继只派工和消费事件时保持 `write:false`，即使内层任务会修改同一 cwd；只有实际编辑者传 `--write`。中继误声明写入会在内层任务创建前正确触发冲突，不是锁泄漏。使用同一个任务库对账，不新增父子交接或绕过锁；另选 scratch cwd 只做职责隔离。

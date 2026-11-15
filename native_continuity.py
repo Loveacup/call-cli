@@ -27,7 +27,22 @@ class NativeStore(Store):
         self.hermes_home = Path(hermes_home) if hermes_home is not None else None
         self.hermes_root = Path(hermes_root) if hermes_root is not None else None
         self.action = action
-        super().__init__(path)
+        if action == 'recovery_status':
+            self.path = Path(path)  # No mkdir, schema initialization or chmod on reads.
+        else:
+            super().__init__(path)
+
+    @contextmanager
+    def connect(self):
+        if self.action != 'recovery_status':
+            with super().connect() as db:
+                yield db
+            return
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro',
+                                     uri=True, timeout=15)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA query_only=ON')
+            yield db
 
     def _same_principal(self, owner, origin):
         if super()._allows(owner, origin):
@@ -97,6 +112,30 @@ class NativeStore(Store):
             raise ValueError('Partial answers belong to previous controller; explicit intervention required')
         task.update(controller=dataclasses.asdict(origin),
                     control_epoch=task.get('control_epoch', 1)+1)
+
+    def recovery_snapshot(self, task_id, origin):
+        with self.connect() as db:
+            db.execute('BEGIN')
+            row = db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                raise KeyError('Unknown call-cli task')
+            task = self._release_authorized(json.loads(row[0]), origin)
+            receipt = None
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_fences'").fetchone():
+                row = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
+                if row:
+                    receipt = json.loads(row[0])
+            return task, receipt
+
+    def release_target(self, task_id, origin):
+        return self._release_authorized(super().get(task_id), origin)
+
+    @staticmethod
+    def _release_authorized(task, origin):
+        if (task['origin']['profile'] not in {'standalone', 'omp-extension', origin.profile}
+                or origin.profile in {'standalone', 'omp-extension'}):
+            raise PermissionError('Release-only requires the current trusted host profile')
+        return task
 
     def get(self, task_id, origin=None):
         task = super().get(task_id)

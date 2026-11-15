@@ -31,6 +31,12 @@ class _Store(Store):
                 db.execute('PRAGMA busy_timeout=0')
             yield db
 
+    def release_target(self, task_id, origin):
+        # The public facade validates a device-local client/host capability first.
+        if origin.profile not in {'standalone', 'omp-extension'}:
+            raise PermissionError('Local recovery capability required')
+        return self.get(task_id)
+
 
 class Collaboration:
     def __init__(self, db=DEFAULT_DB, *, launch=None, control=None, lock=None):
@@ -181,6 +187,15 @@ class Collaboration:
         self.store.request_cancel(task_id, self.origin(client))
         return self.status(client, task_id)
 
+    def release_only(self, client, task_id, *, expected_turn, abandon=False):
+        from release import release_only_task
+        from recovery import recovery_card, public_close_receipt
+        origin = self.origin(client)
+        receipt = release_only_task(self.store, origin, task_id, expected_turn, abandon=abandon)
+        task = self.store.release_target(task_id, origin)
+        host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
+        return dict(task, recovery=recovery_card(task, host=host), close_receipt=public_close_receipt(receipt))
+
     def close(self, client, task_id):
         from release import close_task
         origin = self.origin(client)
@@ -213,14 +228,15 @@ def main(argv=None):
     start.add_argument('--agent', choices=list(BACKENDS), default='codex')
     start.add_argument('--model', help='AGY oc/oa/4c/4a/4h: bare=single, s=Swarm, t=Teamwork; omitted=ocs. Advertised IDs supported; shorthand/mode conflicts reject')
     start.add_argument('--effort', help='Exact advertised thought_level for AGY; standalone OC/OA have no effort option')
-    start.add_argument('--agy-approval', choices=['approve-all', 'approve-reads'],
-                       help='AGY only: new tasks default to approve-all; approve-reads denies shell/write requests')
+    start.add_argument('--agy-approval', choices=['skip-permissions', 'approve-all', 'approve-reads'],
+                       help='AGY only: default native-skip uses skip-permissions; approve-all/approve-reads keep explicit non-skip gates')
     start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY route override for advertised IDs; must match shorthand (bare=off, s=native)')
     start.add_argument('--agy-mode', choices=['single', 'swarm', 'teamwork', 'dynamic'], help='Explicit AGY execution mode; native modes require their advertised command')
     start.add_argument('--agy-worker-model', help='Optional native worker-model preference forwarded to AGY; no per-member completion gate')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
-    start.add_argument('--write', action='store_true')
+    start.add_argument('--write', action='store_true',
+                       help='Reserve exclusive Call-CLI single-writer workspace/resource lock for this task')
     start.add_argument('--resource', default='')
     start.add_argument('--timeout', type=lambda value: None if value == 'none' else float(value),
                        help='Uncommon explicit hard execution limit in seconds, not a review reminder; omitted or none means no execution deadline')
@@ -229,9 +245,13 @@ def main(argv=None):
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
     start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
     sub.add_parser('list')
-    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close']:
+    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']:
         p = sub.add_parser(action)
         p.add_argument('--task', required=True)
+        if action == 'release_only':
+            p.add_argument('--expected-turn', type=int, required=True,
+                           help='Explicitly abandon unknown task ownership; native/detached work may still be active')
+            p.add_argument('--abandon', action='store_true', help='Explicitly release ownership without stop proof after reviewing active-work risk')
         if action in {'events', 'wait'}:
             p.add_argument('--after', type=int, default=0)
         if action == 'wait':

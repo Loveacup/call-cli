@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { run } = require('./shared-prompt.cjs');
+const { run, control, resolveConfiguredAgentArgv } = require('./shared-prompt.cjs');
 const options = {cwd: '/test/work', sessionId: '11111111-1111-4111-8111-111111111111', sessionName: 'call-owned', requestId: 'owned:1', write: false, timeoutMs: 12000};
 
 test('omitted deadline allows a turn to remain active until explicit cancellation', async () => {
@@ -440,4 +440,173 @@ test('iterator return rejection or pending cleanup cannot delay the failed frame
     assert.deepEqual(frames,[{type:'callcli.shared.result',requestId:options.requestId,status:'failed',stopReason:null,
       stage:'prompt_result',reasonCode:'turn_failed'}]);
   }
+});
+
+test('agentEnv sets allowed INITIAL_AGENT_MODE during runtime creation and restores process.env cleanly', async () => {
+  const prev = Object.hasOwn(process.env, 'INITIAL_AGENT_MODE') ? process.env.INITIAL_AGENT_MODE : undefined;
+  delete process.env.INITIAL_AGENT_MODE;
+  try {
+    let observedEnv;
+    const frames = [];
+    const code = await run({...options, permissionMode: 'approve-all', agentEnv: {INITIAL_AGENT_MODE: 'agent-full-access'}}, 'task', {
+      loadAuth: async () => ({authCredentials: {}, authPolicy: 'skip'}),
+      loadRuntime: async () => ({createSharedAcpRuntime: () => {
+        observedEnv = process.env.INITIAL_AGENT_MODE;
+        return {
+          startTurn: () => ({events: (async function* () {})(), result: Promise.resolve({status: 'completed', stopReason: 'end_turn'})}),
+          shutdown: async () => {}
+        };
+      }}),
+      send: async frame => frames.push(frame)
+    });
+    assert.equal(code, 0);
+    assert.equal(observedEnv, 'agent-full-access');
+    assert.equal(Object.hasOwn(process.env, 'INITIAL_AGENT_MODE'), false);
+    for (const badEnv of [null, [], 'str', {OTHER: 'agent-full-access'}, {INITIAL_AGENT_MODE: 'plan'}]) {
+      let loads = 0;
+      const errFrames = [];
+      const badCode = await run({...options, agentEnv: badEnv}, 'task', {
+        loadAuth: async () => ({authCredentials: {}, authPolicy: 'skip'}),
+        loadRuntime: async () => {loads++; throw Error('unexpected');},
+        send: async frame => errFrames.push(frame)
+      });
+      assert.equal(badCode, 1);
+      assert.equal(loads, 0);
+      assert.equal(errFrames.at(-1).status, 'failed');
+    }
+  } finally {
+    if (prev === undefined) delete process.env.INITIAL_AGENT_MODE;
+    else process.env.INITIAL_AGENT_MODE = prev;
+  }
+});
+
+test('resolveConfiguredAgentArgv merges configured executable/argv with native-skip flags without mutating config files', async () => {
+  const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+  const root = fs.mkdtempSync(path.join(os.homedir(), '.hermes/cache/scratch/shared-argv-'));
+  try {
+    const home = path.join(root, 'home'), cwd = path.join(root, 'work');
+    fs.mkdirSync(path.join(home, '.acpx'), {recursive: true}); fs.mkdirSync(cwd);
+    const globalFile = path.join(home, '.acpx/config.json'), projectFile = path.join(cwd, '.acpxrc.json');
+    const globalRaw = JSON.stringify({agents: {omp: {argv: ['C:\\Users\\example\\AppData\\Local\\omp\\omp.exe', 'acp']}}});
+    fs.writeFileSync(globalFile, globalRaw);
+    assert.deepEqual(
+      await resolveConfiguredAgentArgv('omp', ['omp', 'acp', '--auto-approve', '--allow-home'], cwd, home),
+      ['C:\\Users\\example\\AppData\\Local\\omp\\omp.exe', 'acp', '--auto-approve', '--allow-home']
+    );
+    fs.writeFileSync(projectFile, JSON.stringify({agents: {omp: {command: '"/opt/Custom App/omp" acp --auto-approve'}}}));
+    assert.deepEqual(
+      await resolveConfiguredAgentArgv('omp', ['omp', 'acp', '--auto-approve', '--allow-home'], cwd, home),
+      ['/opt/Custom App/omp', 'acp', '--auto-approve', '--allow-home']
+    );
+    assert.equal(fs.readFileSync(globalFile, 'utf8'), globalRaw);
+  } finally {fs.rmSync(root, {recursive: true, force: true});}
+});
+
+test('control executes structured-argv lifecycle actions via SharedAcpRuntime with idle fallback and secret-free failure', async () => {
+  const calls = [];
+  let closedOld = false, shutdownCount = 0, embeddedShutdownCount = 0, existingPresent = true;
+  const oldId = '22222222-2222-4222-8222-222222222222';
+  const newId = '33333333-3333-4333-8333-333333333333';
+  const records = {
+    [oldId]: {acpxRecordId: oldId, acpSessionId: 'acp-old', agentSessionId: 'ag-old', cwd:'C:/work', name:'call-1', agentArgv:['C:\\omp.exe','acp']},
+    [newId]: {acpxRecordId: newId, acpSessionId: 'acp-new', agentSessionId: 'ag-new', pid: process.pid, cwd:'C:/work', name:'call-1', agentArgv:['C:\\omp.exe','acp','--auto-approve','--allow-home']}
+  };
+  for (const record of Object.values(records)) record.agentCommand = require('./shared-prompt.cjs').renderArgvIdentity(record.agentArgv);
+  const makeSdk = () => ({
+    ACPX_BACKEND_ID: 'acpx',
+    encodeAcpxRuntimeHandleState: s => `acpx:v2:${Buffer.from(JSON.stringify(s)).toString('base64url')}`,
+    createAgentRegistry: ({overrides}) => {calls.push(['registry', overrides]); return {overrides,resolve:agent=>overrides[agent]};} ,
+    createSharedAcpRuntime: cfg => {
+      calls.push(['shared', cfg]);
+      return {
+        findSession: async ({agent}) => existingPresent
+          ? {backend: 'acpx-shared', acpxRecordId: existingPresent === 'old' ? oldId : newId,
+             runtimeSessionName: existingPresent === 'old' ? oldId : newId,
+             backendSessionId: existingPresent === 'old' ? 'acp-old' : 'acp-new', sessionKey: 'call-1', cwd: cfg.cwd, agent}
+          : undefined,
+        close: async ({handle}) => {
+          calls.push(['close', handle.acpxRecordId]);
+          if (handle.acpxRecordId === oldId) {closedOld = true; existingPresent = false;}
+          else existingPresent = false;
+        },
+        ensureSession: async input => {
+          calls.push(['ensure', input]);
+          existingPresent = true;
+          return {backend: 'acpx-shared', acpxRecordId: newId, runtimeSessionName: newId,
+            backendSessionId: 'acp-new', sessionKey: input.sessionKey, cwd: input.cwd};
+        },
+        getStatus: async () => ({acpxRecordId: newId, backendSessionId: 'acp-new', summary: 'session=' + newId + ' open'}),
+        setModel: async () => {throw Object.assign(Error('No running owner'), {code:'ACP_BACKEND_UNAVAILABLE'});},
+        setConfigOption: async input => {calls.push(['shared_cfg', input]);},
+        setMode: async input => {calls.push(['shared_mode', input]);},
+        cancel: async ({handle}) => {calls.push(['cancel', handle.acpxRecordId]);},
+        shutdown: async () => {shutdownCount++;}
+      };
+    },
+    createAcpRuntime: cfg => {
+      calls.push(['embedded', cfg.permissionMode]);
+      return {
+        ensureSession: async input => {
+          calls.push(['embedded_restore', input]);
+          return {acpxRecordId:input.sessionKey,backendSessionId:input.resumeSessionId};
+        },
+        setModel: async input => {calls.push(['embedded_model', input.model, input.handle.acpxRecordId]);},
+        shutdown: async () => {embeddedShutdownCount++;}
+      };
+    }
+  });
+  const base = {cwd: 'C:/work', session: 'call-1', agent: 'omp',
+    agentArgv: ['omp', 'acp', '--auto-approve', '--allow-home'], permissionMode: 'approve-all', timeoutMs: 20000};
+  const sharedDeps = out => ({
+    loadRuntime: async () => makeSdk(),
+    loadAuth: async () => ({authCredentials: {}, authPolicy: 'skip'}),
+    resolveConfiguredAgentArgv: async (_a, req) => ['C:\\omp.exe', ...req.slice(1)],
+    controlStatus: async record => ({status:'idle',acpxRecordId:record.acpxRecordId,acpxSessionId:record.acpSessionId}),
+    createSessionStore: () => ({load: async id => records[id]}),
+    send: async frame => out.push(frame)
+  });
+
+  existingPresent = 'old';
+  let frames = [];
+  assert.equal(await control({...base, action: 'new', model: 'm-1'}, sharedDeps(frames)), 0);
+  assert.equal(closedOld, true);
+  assert.deepEqual(calls.find(c => c[0] === 'registry')[1], {omp: ['C:\\omp.exe', 'acp', '--auto-approve', '--allow-home']});
+  assert.equal(frames[0].action, 'session_ensured');
+  assert.equal(frames[0].replacedSessionId, oldId);
+
+  frames = [];
+  assert.equal(await control({...base, action: 'show'}, sharedDeps(frames)), 0);
+  assert.equal(frames[0].acpxRecordId, newId);
+
+  frames = [];
+  assert.equal(await control({...base, action: 'status'}, sharedDeps(frames)), 0);
+  assert.equal(frames[0].action, 'status_snapshot');
+  assert.equal(frames[0].status, 'alive');
+
+  frames = [];
+  assert.equal(await control({...base, action: 'model', value: 'gpt-x'}, sharedDeps(frames)), 0);
+  assert.deepEqual(frames[0], {action: 'model_set', acpxRecordId: newId, acpxSessionId: 'acp-new', agentSessionId: 'ag-new'});
+  assert.ok(calls.some(c => c[0] === 'embedded_model' && c[1] === 'gpt-x' && c[2] === newId));
+  assert.equal(embeddedShutdownCount, 1);
+
+  frames = [];
+  assert.equal(await control({...base, action: 'cancel'}, sharedDeps(frames)), 0);
+  assert.equal(frames[0].cancelled, true);
+
+  frames = [];
+  assert.equal(await control({...base, action: 'close'}, sharedDeps(frames)), 0);
+  assert.equal(frames[0].action, 'session_closed');
+
+  frames = [];
+  assert.equal(await control({...base, action: 'status'}, sharedDeps(frames)), 0);
+  assert.equal(frames[0].status, 'no-session');
+  assert.equal(shutdownCount, 7);
+
+  // Secret-free failure returns code 1 and emits nothing on failure.
+  frames = [];
+  assert.equal(await control({...base, action: 'new'}, {
+    ...sharedDeps(frames),
+    loadRuntime: async () => {throw Error('SECRET_TOKEN_LEAK');}
+  }), 1);
+  assert.equal(frames.length, 0);
 });

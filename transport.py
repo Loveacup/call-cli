@@ -17,17 +17,27 @@ def local_toolchain_env(bin_dir):
     return dict(os.environ, PATH=bin_dir + os.pathsep + os.environ.get('PATH', ''))
 
 
-def command(device, shell, argv):
+def command(device, shell, argv, *, env=None):
+    env_items = []
+    if env:
+        for k, v in env.items():
+            if not isinstance(k, str) or not re.fullmatch(r'[A-Z_][A-Z0-9_]*', k):
+                raise ValueError('Invalid environment variable name')
+            env_items.append((k, str(v)))
     if device == 'local':
-        return argv
+        if not env_items or shell == 'powershell':
+            return argv
+        return ['env', *(f'{k}={v}' for k, v in env_items), *argv]
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',device):
         raise ValueError('Use an existing SSH host alias, not shell text')
     if shell == 'powershell':
         literal = lambda v: "'"+str(v).replace("'","''")+"'"
-        script = "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & "+' '.join(literal(v) for v in argv)+"; exit $LASTEXITCODE"
+        prefix = ''.join(f'$env:{k}={literal(v)}; ' for k, v in env_items)
+        script = "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "+prefix+"& "+' '.join(literal(v) for v in argv)+"; exit $LASTEXITCODE"
         remote = 'powershell -NoProfile -EncodedCommand '+base64.b64encode(script.encode('utf-16le')).decode()
     else:
-        remote = 'export PATH=/opt/homebrew/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH; exec '+shlex.join(argv)
+        exports = (' ' + ' '.join(f'{k}={shlex.quote(v)}' for k, v in env_items)) if env_items else ''
+        remote = 'export PATH=/opt/homebrew/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH'+exports+'; exec '+shlex.join(argv)
     return ['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=8',device,remote]
 
 

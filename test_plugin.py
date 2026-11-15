@@ -142,7 +142,8 @@ class PluginTests(unittest.TestCase):
             self.assertEqual(resumed['session'], task['session'])
             self.assertEqual(resumed['agy_approval'], 'approve-reads')
             default = c.handle({'action':'start','agent':'agy','cwd':d,'prompt':'inspect','model':'live-family'})['task']
-            self.assertEqual(default['agy_approval'], 'approve-all')
+            self.assertEqual(default['agy_approval'], 'skip-permissions')
+            self.assertEqual(default['execution_policy'], 'native-skip')
             with self.assertRaises(ValueError):
                 c.handle({'action':'start','agent':'omp','cwd':d,'prompt':'inspect','agy_approval':'approve-all'})
 

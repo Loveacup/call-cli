@@ -70,6 +70,7 @@ test('registered OMP tool advertises dialogue without host identity fields', () 
   assert.equal(registered.name,'call_cli_omp');
   assert.ok(enums.some(values=>values.includes('dialogue')));
   assert.ok(enums.some(values=>values.includes('teamwork')));
+  assert.ok(enums.some(values=>values.includes('skip-permissions') && values.includes('approve-all') && values.includes('approve-reads')));
 });
 
 test('model timeout is refused before binding and continuation clear remains available', async () => {
@@ -491,4 +492,15 @@ test('unattributed legacy unknown events stay visible without repeated snapshot 
   f.setPacket({task,events:[]});
   await f.timers.shift()();
   assert.equal(f.sent.length,2);
+});
+
+test('current host can explicitly release an old unknown task without a start or old identity', async () => {
+  const f=fixture();
+  f.setPacket({task:{id:'old-task',state:'unknown',resource_state:'released',close_receipt:{operation:'explicit-abandonment',risk:'may still be active'}}});
+  await f.adapter.execute({action:'release_only',task_id:'old-task',expected_turn:1,abandon:true},f.ctx);
+  assert.equal(f.calls[0].action,'bind');
+  assert.equal(f.calls[1].host.session_id,'host-a');
+  assert.equal(f.calls[1].args.abandon,true);
+  assert.equal(f.timers.length,0);
+  f.adapter.detach();
 });

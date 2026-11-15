@@ -25,7 +25,7 @@ class CollaborationTests(unittest.TestCase):
         from io import StringIO
         client=self.c.connect('omp')['client_id']
         for args,reason in ((['--model','ocs','--agy-swarm','off'],'conflict'),
-                            (['--model','oct'],'unsupported'),(['--model','ocss'],'Invalid AGY shorthand')):
+                            (['--model','oct','--agy-swarm','off'],'conflict'),(['--model','ocss'],'Invalid AGY shorthand')):
             with self.subTest(args=args):
                 output=StringIO()
                 with patch.object(collab,'Collaboration',return_value=self.c),redirect_stdout(output):
@@ -35,6 +35,20 @@ class CollaborationTests(unittest.TestCase):
                 self.assertIn(reason,json.loads(output.getvalue())['message'])
         self.assertEqual(self.c.list(client),[])
         self.assertEqual(self.launches,[])
+
+    def test_cli_teamwork_shorthand_is_supported(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stdout
+        from io import StringIO
+        client=self.c.connect('omp')['client_id']
+        with patch.object(collab,'Collaboration',return_value=self.c),redirect_stdout(StringIO()):
+            rc=collab.main(['--db',str(self.db),'--client',client,'start','--agent','agy',
+                           '--cwd',self.tmp.name,'--prompt','synthetic','--model','oct'])
+        self.assertEqual(rc,0)
+        self.assertEqual(len(self.launches),1)
+        task=self.c.list(client)[0]
+        self.assertEqual((task['model'],task['agy_mode'],task['agy_swarm']),
+                         ('gemini-pro-orchestrator','teamwork','native'))
 
     def test_cli_shorthand_start_persists_resolved_selection(self):
         from unittest.mock import patch
