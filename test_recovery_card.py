@@ -92,5 +92,17 @@ class RecoveryCardTests(unittest.TestCase):
                         self.assertEqual(c.close(client,task['id'])['state'],'closed')
                     self.assertEqual(backend.closes,0)
 
+    def test_settled_missing_final_recovery_card_guides_strict_release_without_abandon(self):
+        task=dict(id='settled-missing',device='local',state='unknown',turn=1,session='logical',
+            acpx_record_id='synthetic-record',backend_request_id='req-1',origin={},write=True,cwd='/work',
+            turn_settlement=dict(turn=1,request_id='req-1',protocol_settled=True,reason_code='no_post_tool_final_answer'))
+        card=recovery_card(task,host='omp-extension')
+        self.assertTrue(card['capabilities']['exact_record_reconcile'])
+        self.assertTrue(card['capabilities']['release_only'])
+        self.assertIn('end_turn',card['next_action'])
+        self.assertIn('release_only(task_id, expected_turn)',card['next_action'])
+        self.assertIn('without abandon=true',card['next_action'])
+        self.assertNotIn('close (probe-only)',card['next_action'])
+
 
 if __name__=='__main__': unittest.main()

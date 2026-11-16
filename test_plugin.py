@@ -105,6 +105,15 @@ class PluginTests(unittest.TestCase):
                 missing = dict(args); missing.pop(field)
                 with self.assertRaises(ValueError):
                     c.handle(missing)
+            sup = c.handle(dict(action='dialogue', task_id=task['id'], prompt='revise 2', expected_turn=1,
+                                command_id='d2', target_command_id='d1'))['task']
+            self.assertEqual(sup['commands']['d1']['status'], 'superseded')
+            self.assertEqual(sup['commands']['d2']['status'], 'accepted')
+            wd = c.handle(dict(action='dialogue', task_id=task['id'], expected_turn=1,
+                               command_id='w2', target_command_id='d2', withdraw=True))['task']
+            self.assertEqual(wd['commands']['d2']['status'], 'withdrawn')
+            with self.assertRaises(ValueError):
+                c.handle(dict(action='status', task_id=task['id'], withdraw=True))
 
     def test_launch_reuses_native_notification_route_without_model_supplied_origin(self):
         mod=load_plugin()
@@ -378,6 +387,72 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(ctx.registration['check_fn']())
         ctx.enabled=False
         self.assertFalse(ctx.registration['check_fn']())
+
+    def test_hermes_origin_context_runtime_links_and_intra_origin_group_isolation(self):
+        import sqlite3
+        from contextlib import closing
+        mod = load_plugin()
+        self.assertIn('group', mod.SCHEMA['parameters']['properties'])
+        self.assertEqual(mod.SCHEMA['parameters']['properties']['group']['type'], 'string')
+        self.assertNotIn('origin', mod.SCHEMA['parameters']['properties'])
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            hermes_home = root / 'hermes-home'
+            hermes_home.mkdir()
+            with closing(sqlite3.connect(hermes_home / 'state.db')) as db:
+                db.executescript('''
+                    CREATE TABLE schema_version(version INTEGER NOT NULL);
+                    INSERT INTO schema_version VALUES (32);
+                    CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT,
+                        end_reason TEXT, ended_at REAL, model_config TEXT, source TEXT,
+                        profile_name TEXT);
+                    INSERT INTO sessions VALUES ('s1', NULL, 'compression', 1.0, NULL, 'telegram', NULL);
+                    INSERT INTO sessions VALUES ('s2', 's1', NULL, NULL, '{}', 'telegram', NULL);
+                ''')
+            env = {
+                'HERMES_SESSION_ID': 's1', 'HERMES_SESSION_KEY': 'k-shared',
+                'HERMES_SESSION_PLATFORM': 'telegram', 'HERMES_SESSION_CHAT_ID': 'chat1',
+                'HERMES_SESSION_THREAD_ID': 'topic1', 'HERMES_SESSION_SOURCE': 'telegram',
+                'HERMES_SESSION_CHAT_TYPE': 'forum',
+                'HERMES_SESSION_CHAT_NAME': '\x1b[31mOps Room\x1b[0m',
+                'HERMES_SESSION_TOPIC_NAME': '  Trace  Topic  ',
+                'HERMES_SESSION_TITLE': 'Thread Title',
+            }
+            ctx = Ctx()
+            c = mod.Coordinator(ctx, root / 'plugin-data', lambda k, x='': env.get(k, x),
+                                hermes_home=hermes_home, hermes_root=hermes_home)
+            t1 = c.handle({'action': 'start', 'agent': 'omp', 'cwd': str(root),
+                           'prompt': 'first', 'group': ' ops '})['task']
+            c.handle({'action': 'start', 'agent': 'omp', 'cwd': str(root),
+                      'prompt': 'second', 'group': 'other'})
+            self.assertEqual(t1['group'], 'ops')
+            self.assertEqual(t1['origin_context']['surface'], 'hermes-native')
+            self.assertEqual(t1['origin_context']['display_name'], 'Trace Topic')
+            self.assertEqual(t1['runtime_links']['process_id'], 'proc-owned-1')
+            self.assertEqual(t1['runtime_links']['task_id'], t1['id'])
+
+            env_other = dict(env, HERMES_SESSION_ID='foreign-s', HERMES_SESSION_KEY='k-other', HERMES_SESSION_THREAD_ID='topic2')
+            c_other = mod.Coordinator(ctx, root / 'plugin-data', lambda k, x='': env_other.get(k, x),
+                                      hermes_home=hermes_home, hermes_root=hermes_home)
+            t_foreign = c_other.handle({'action': 'start', 'agent': 'omp', 'cwd': str(root),
+                                        'prompt': 'foreign', 'group': 'ops'})['task']
+
+            env['HERMES_SESSION_ID'] = 's2'
+            listed = c.handle({'action': 'list', 'group': 'ops'})['tasks']
+            self.assertEqual([t['id'] for t in listed], [t1['id']])
+            self.assertEqual(listed[0]['runtime_links']['task_id'], t1['id'])
+            self.assertNotIn(t_foreign['id'], [t['id'] for t in listed])
+
+            rec = c.handle({'action': 'recovery_status', 'task_id': t1['id']})['resource_recovery']
+            self.assertEqual(set(rec), {'task_id', 'turn', 'business_state', 'resource_state', 'write', 'receipt'})
+
+            for bad_action in ('status', 'cancel', 'recovery_status'):
+                with self.assertRaises(ValueError):
+                    c.handle({'action': bad_action, 'task_id': t1['id'], 'group': 'ops'})
+            for bad_action_args in ({'action': 'start', 'agent': 'omp', 'cwd': str(root), 'prompt': 'x', 'group': '   '},
+                                    {'action': 'list', 'group': ''}):
+                with self.assertRaises(ValueError):
+                    c.handle(bad_action_args)
 
 
 if __name__=='__main__':unittest.main()

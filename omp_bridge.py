@@ -5,7 +5,7 @@ import secrets
 import sqlite3
 import sys
 import time
-from bridge import Origin
+from bridge import Origin, build_origin_context, build_runtime_links, sanitize_label
 from collab import Collaboration, DEFAULT_DB, _polling, _wait_deadline
 from backends import ModelSelectionError
 
@@ -50,18 +50,20 @@ class HostBridge(Collaboration):
                   if key not in {'origin','prompt','reply_commands','controller','native_snapshot'}}
         if 'id' in value:
             result['host_binding'] = 'omp-extension'
+        if 'id' in value and 'session' in value and 'turn' in value:
+            result['runtime_links'] = build_runtime_links(value)
         if 'controller' in value:
             result['controller'] = {'host_binding':'omp-extension'}
         return result
 
-    def handle(self, host, capability, args):
+    def handle(self, host, capability, args, *, host_context=None):
         self.binding = self.identity(host)
         self.origin(capability)
         allowed = {
-            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'skills'},
-            'list': set(), 'status': {'task_id'}, 'events': {'task_id', 'after'},
+            'start': {'prompt', 'cwd', 'device', 'agent', 'remote_shell', 'write', 'resource', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'skills', 'group'},
+            'list': {'group'}, 'status': {'task_id'}, 'events': {'task_id', 'after'},
             'wait': {'task_id', 'after', 'timeout'}, 'reply': {'task_id', 'question_id', 'prompt', 'clear_timeout', 'expected_turn', 'command_id'},
-            'dialogue': {'task_id', 'prompt', 'command_id', 'expected_turn', 'question_id'},
+            'dialogue': {'task_id', 'prompt', 'command_id', 'expected_turn', 'question_id', 'target_command_id', 'withdraw'},
             'permission': {'task_id', 'expected_turn', 'command_id', 'permission_id', 'script_sha256', 'decision'},
             'intervene': {'task_id', 'prompt', 'command_id', 'clear_timeout', 'expected_turn'}, 'cancel': {'task_id'}, 'close': {'task_id'},
             'release_only': {'task_id', 'expected_turn', 'abandon'},
@@ -76,6 +78,28 @@ class HostBridge(Collaboration):
             raise ValueError('Stable command_id required')
         if action == 'dialogue' and (not args.get('command_id') or type(args.get('expected_turn')) is not int):
             raise ValueError('dialogue requires expected_turn and stable command_id')
+        if action == 'start':
+            raw_session_name = host_context.get('session_name', '') if isinstance(host_context, dict) else ''
+            normalized_session_name = (
+                sanitize_label(raw_session_name, default='', max_len=None)
+                if isinstance(raw_session_name, str) else ''
+            )
+            session_name = normalized_session_name[:160].strip()
+            secrets_to_hide = (host.get('session_id', ''), host.get('agent_id', ''), capability)
+            if not isinstance(raw_session_name, str) or any(
+                secret and (secret in raw_session_name or secret in normalized_session_name)
+                for secret in secrets_to_hide
+            ):
+                session_name = ''
+            origin_context = build_origin_context(
+                surface='omp-extension', platform='omp', source='omp', session_name=session_name)
+            if any(
+                secret and any(secret in str(value) for value in origin_context.values())
+                for secret in secrets_to_hide
+            ):
+                origin_context = build_origin_context(
+                    surface='omp-extension', platform='omp', source='omp', session_name='')
+            args['_origin_context'] = origin_context
         result = getattr(self, action)(capability, **args)
         if action == 'list':
             return {'tasks': [self.public(t) for t in result]}
@@ -100,7 +124,8 @@ def main():
         if request.get('action') == 'bind':
             result = {'capability': bridge.bind(request['host'])}
         else:
-            result = bridge.handle(request['host'], request['capability'], request['args'])
+            result = bridge.handle(request['host'], request['capability'], request['args'],
+                                   host_context=request.get('host_context'))
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

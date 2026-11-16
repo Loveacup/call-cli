@@ -216,5 +216,68 @@ class ReleaseOnlyTests(unittest.TestCase):
         self.assertEqual(recovered['receipt']['attempts'][-1]['actor']['session_id'], 'current')
         self.assertEqual(recovered['receipt']['business_state'], 'unknown')
 
+    def test_settled_missing_final_allows_single_strict_close_after_probe_fence(self):
+        task = self.start(write=True)
+        settlement = dict(turn=1, request_id='req-1', launch_id=task.get('launch_id') or 'launch-1',
+                          protocol_settled=True, reason_code='no_post_tool_final_answer')
+        self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record',
+                          backend_request_id='req-1', launch_id=settlement['launch_id'],
+                          turn_settlement=settlement)
+        class StatefulBackend(CloseBackend):
+            def __init__(self):
+                super().__init__(verified=False)
+            def close(self, policy):
+                result = super().close(policy)
+                self.verified = True
+                return result
+        backend = StatefulBackend()
+        release = importlib.import_module('callcli_plugin.release')
+        with patch.object(release, 'NativeBackend', return_value=backend):
+            held = self.action('close', task, expected_turn=1)
+            self.assertEqual(held['task']['state'], 'unknown')
+            self.assertEqual((backend.closes, backend.probes), (0, 1))
+            released = self.action('release_only', task, expected_turn=1)
+        self.assertEqual(released['task']['state'], 'closed')
+        self.assertEqual(released['receipt']['business_state'], 'unknown')
+        self.assertEqual((backend.closes, backend.probes), (1, 2))
+        self.start(write=True)
+
+    def test_settled_missing_final_failed_close_never_replays_close(self):
+        task = self.start(write=True)
+        settlement = dict(turn=1, request_id='req-1', launch_id=task.get('launch_id') or 'launch-1',
+                          protocol_settled=True, reason_code='no_post_tool_final_answer')
+        self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record',
+                          backend_request_id='req-1', launch_id=settlement['launch_id'],
+                          turn_settlement=settlement)
+        def fail(policy):
+            raise TimeoutError('synthetic close timeout')
+        backend = CloseBackend(on_close=fail, verified=False)
+        release = importlib.import_module('callcli_plugin.release')
+        with patch.object(release, 'NativeBackend', return_value=backend):
+            first = self.action('release_only', task, expected_turn=1)
+            second = self.action('release_only', task, expected_turn=1)
+        self.assertEqual(first['task']['state'], 'unknown')
+        self.assertEqual(second['task']['state'], 'unknown')
+        self.assertEqual((backend.closes, backend.probes), (1, 2))
+
+    def test_stale_turn_or_wrong_request_or_launch_never_authorizes_close_after_probe(self):
+        for bad_field, bad_val in (('turn', 0), ('request_id', 'wrong-req'), ('launch_id', 'wrong-launch')):
+            with self.subTest(bad_field=bad_field):
+                task = self.start(write=True)
+                settlement = dict(turn=1, request_id='req-1', launch_id=task.get('launch_id') or 'launch-1',
+                                  protocol_settled=True, reason_code='no_post_tool_final_answer')
+                settlement[bad_field] = bad_val
+                self.store.update(task['id'], state='unknown', runner_pid=0, acpx_record_id='fixture-record',
+                                  backend_request_id='req-1', launch_id=task.get('launch_id') or 'launch-1',
+                                  turn_settlement=settlement)
+                backend = CloseBackend(verified=False)
+                release = importlib.import_module('callcli_plugin.release')
+                with patch.object(release, 'NativeBackend', return_value=backend):
+                    self.action('close', task, expected_turn=1)
+                    self.action('release_only', task, expected_turn=1)
+                self.assertEqual((backend.closes, backend.probes), (0, 2))
+                self.assertEqual(self.store.get(task['id'])['state'], 'unknown')
+                self.action('release_only', task, expected_turn=1, abandon=True)
+
 if __name__ == '__main__':
     unittest.main()

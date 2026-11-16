@@ -54,6 +54,20 @@ class HostBridgeTests(unittest.TestCase):
         self.assertEqual(self.call('dialogue', **args)['task'], result)
         with self.assertRaises(ValueError):
             self.call('dialogue', **dict(args, expected_turn=2, command_id='stale'))
+        sup = self.call('dialogue', task_id=task['id'], prompt='revise 2', command_id='d2',
+                        expected_turn=1, target_command_id='d1')['task']
+        self.assertEqual((sup['commands']['d1']['status'], sup['commands']['d2']['status']), ('superseded', 'accepted'))
+        wd = self.call('dialogue', task_id=task['id'], command_id='w2', expected_turn=1,
+                       target_command_id='d2', withdraw=True)['task']
+        self.assertEqual(wd['commands']['d2']['status'], 'withdrawn')
+        self.assertEqual(self.call('dialogue', task_id=task['id'], command_id='w2', expected_turn=1,
+                                   target_command_id='d2', withdraw=True)['task'], wd)
+        for bad in (dict(action='status', task_id=task['id'], target_command_id='d1'),
+                    dict(action='status', task_id=task['id'], withdraw=True),
+                    dict(action='dialogue', task_id=task['id'], command_id='bad', expected_turn=1,
+                         target_command_id='d1', withdraw='yes')):
+            with self.assertRaises(ValueError):
+                self.call(bad.pop('action'), **bad)
 
     def test_model_limits_rejected_but_legacy_budget_can_be_cleared(self):
         for value in (300, None):
@@ -189,6 +203,204 @@ class CloseReceiptPrivacyTests(unittest.TestCase):
                     self.assertEqual(projected,{key:value for key,value in receipt.items() if key in public_fields})
                 for private in ('target','owner','actor','attempts','proof',*host.values(),client,'fixture-record'):
                     self.assertNotIn(private,json.dumps(nested))
+
+
+class GroupAndOriginContextPrivacyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.bridge = HostBridge(Path(self.tmp.name) / 'tasks.db', launch=lambda t: None)
+        self.a = dict(session_id='secret-omp-sess-a', agent_id='secret-omp-agent-a')
+        self.b = dict(session_id='secret-omp-sess-b', agent_id='secret-omp-agent-b')
+        self.ka = self.bridge.bind(self.a)
+        self.kb = self.bridge.bind(self.b)
+
+    def test_host_context_group_runtime_links_and_privacy_scrubbing(self):
+        res_a1 = self.bridge.handle(
+            self.a, self.ka,
+            dict(action='start', cwd=self.tmp.name, prompt='one', group=' grp '),
+            host_context={'session_name': '\x1b[31mRefactor\x1b[0m Auth\u202e'},
+        )
+        task_a1 = res_a1['task']
+        self.assertEqual(task_a1['group'], 'grp')
+        self.assertEqual(task_a1['origin_context']['surface'], 'omp-extension')
+        self.assertEqual(task_a1['origin_context']['display_name'], 'Refactor Auth')
+        self.assertEqual(task_a1['runtime_links']['task_id'], task_a1['id'])
+        self.assertNotIn('origin', task_a1)
+
+        task_b1 = self.bridge.handle(
+            self.b, self.kb,
+            dict(action='start', cwd=self.tmp.name, prompt='other', group='grp'),
+            host_context={'session_name': f"Leak {self.b['session_id']} {self.b['agent_id']} {self.kb}"},
+        )['task']
+        self.assertEqual(task_b1['origin_context']['session_name'], 'unknown')
+        self.assertEqual(task_b1['origin_context']['display_name'], 'unknown')
+        for secret in (self.b['session_id'], self.b['agent_id'], self.kb):
+            self.assertNotIn(secret, json.dumps(task_b1))
+
+        self.bridge.handle(self.a, self.ka, dict(action='start', cwd=self.tmp.name, prompt='two', group='other'))
+        listed_a = self.bridge.handle(self.a, self.ka, dict(action='list', group='grp'))['tasks']
+        self.assertEqual([t['id'] for t in listed_a], [task_a1['id']])
+        listed_b = self.bridge.handle(self.b, self.kb, dict(action='list', group='grp'))['tasks']
+        self.assertEqual([t['id'] for t in listed_b], [task_b1['id']])
+
+        for bad_args in (dict(action='status', task_id=task_a1['id'], group='grp'),
+                         dict(action='start', cwd=self.tmp.name, prompt='bad', group='   '),
+                         dict(action='list', group='')):
+            with self.assertRaises(ValueError):
+                self.bridge.handle(self.a, self.ka, bad_args)
+
+        from io import StringIO
+        from unittest.mock import patch
+        import omp_bridge
+        req = dict(db=str(self.bridge.store.path), host=self.a, capability=self.ka,
+                   host_context={'session_name': 'CLI Subprocess Title'},
+                   args=dict(action='start', cwd=self.tmp.name, prompt='via main', group='sub'))
+        out = StringIO()
+        with patch.object(HostBridge, '_launch', lambda self, task: None), \
+             patch('sys.stdin', StringIO(json.dumps(req))), \
+             patch('sys.stdout', out):
+            rc = omp_bridge.main()
+        self.assertEqual(rc, 0, out.getvalue())
+        started = json.loads(out.getvalue())
+        self.assertEqual(started['task']['origin_context']['display_name'], 'CLI Subprocess Title')
+        self.assertEqual(started['task']['group'], 'sub')
+        self.assertEqual(started['task']['runtime_links']['task_id'], started['task']['id'])
+
+        list_req = dict(db=str(self.bridge.store.path), host=self.a, capability=self.ka,
+                        args=dict(action='list', group='sub'))
+        proc = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('omp_bridge.py'))],
+                              input=json.dumps(list_req), text=True, capture_output=True, timeout=5)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        listed_sub = json.loads(proc.stdout)['tasks']
+        self.assertEqual([t['id'] for t in listed_sub], [started['task']['id']])
+        self.assertEqual(listed_sub[0]['origin_context']['display_name'], 'CLI Subprocess Title')
+        self.assertEqual(listed_sub[0]['runtime_links']['task_id'], started['task']['id'])
+        for secret in (self.a['session_id'], self.a['agent_id'], self.ka):
+            self.assertNotIn(secret, proc.stdout)
+
+    def test_ansi_and_control_split_private_tokens_never_reassemble_in_public_context(self):
+        host = dict(session_id='fixture-session-private', agent_id='fixture-agent-private')
+        cap = self.bridge.bind(host)
+
+        # Report §66 counterexample: ANSI CSI split inside private session_id
+        res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='counterexample', group='sec'),
+            host_context={'session_name': 'fixture-session-\x1b[0mprivate'},
+        )
+        task = res['task']
+        self.assertEqual(task['origin_context']['session_name'], 'unknown')
+        self.assertEqual(task['origin_context']['display_name'], 'unknown')
+        self.assertNotIn('fixture-session-private', json.dumps(res))
+        self.assertEqual(self.bridge.store.get(task['id'])['origin_context']['display_name'], 'unknown')
+
+        # Bidi + NUL split agent_id
+        bidi_res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='bidi-nul', group='sec'),
+            host_context={'session_name': 'Room fixture-agent-\u202e\x00private'},
+        )
+        self.assertEqual(bidi_res['task']['origin_context']['session_name'], 'unknown')
+        self.assertEqual(bidi_res['task']['origin_context']['display_name'], 'unknown')
+        self.assertNotIn('fixture-agent-private', json.dumps(bidi_res))
+        self.assertEqual(self.bridge.store.get(bidi_res['task']['id'])['origin_context']['display_name'], 'unknown')
+
+        # OSC + C1 CSI split capability
+        osc_res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='osc-csi', group='sec'),
+            host_context={'session_name': f'Room {cap[:8]}\x1b]0;t\x07{cap[8:16]}\x9b31m{cap[16:]}'},
+        )
+        self.assertEqual(osc_res['task']['origin_context']['session_name'], 'unknown')
+        self.assertEqual(osc_res['task']['origin_context']['display_name'], 'unknown')
+        self.assertNotIn(cap, json.dumps(osc_res))
+        self.assertEqual(self.bridge.store.get(osc_res['task']['id'])['origin_context']['display_name'], 'unknown')
+
+        # 160-char truncation-straddling split session_id (no truncated prefix leaks)
+        trunc_res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='trunc-split', group='sec'),
+            host_context={'session_name': ('A' * 150) + ' fixture-session-\x1b[0mprivate'},
+        )
+        self.assertEqual(trunc_res['task']['origin_context']['session_name'], 'unknown')
+        self.assertEqual(trunc_res['task']['origin_context']['display_name'], 'unknown')
+        self.assertNotIn('fixture-session-private', json.dumps(trunc_res))
+        self.assertNotIn('fixture-', json.dumps(trunc_res))
+        self.assertEqual(self.bridge.store.get(trunc_res['task']['id'])['origin_context']['display_name'], 'unknown')
+
+        # Positive preservation: plain and styled normal titles are preserved cleanly
+        plain_res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='plain-title', group='norm'),
+            host_context={'session_name': 'Normal Session Title'},
+        )
+        self.assertEqual(plain_res['task']['origin_context']['session_name'], 'Normal Session Title')
+        self.assertEqual(plain_res['task']['origin_context']['display_name'], 'Normal Session Title')
+
+        styled_res = self.bridge.handle(
+            host, cap,
+            dict(action='start', cwd=self.tmp.name, prompt='styled-title', group='norm'),
+            host_context={'session_name': '\x1b[32mSprint\x1b[0m \u200eBoard'},
+        )
+        self.assertEqual(styled_res['task']['origin_context']['session_name'], 'Sprint Board')
+        self.assertEqual(styled_res['task']['origin_context']['display_name'], 'Sprint Board')
+
+        # Subprocess seam: start (with _launch stubbed) and list across ANSI-split secret and styled normal title
+        bridge_dir = str(Path(__file__).resolve().parent)
+        wrapper = (
+            f'import sys; sys.path.insert(0, {bridge_dir!r}); '
+            'import collab, omp_bridge; '
+            'collab.Collaboration._launch = lambda self, task: None; '
+            'raise SystemExit(omp_bridge.main())'
+        )
+        sub_split_req = dict(
+            db=str(self.bridge.store.path), host=host, capability=cap,
+            host_context={'session_name': 'fixture-session-\x1b[0mprivate'},
+            args=dict(action='start', cwd=self.tmp.name, prompt='sub split', group='subsec'),
+        )
+        proc_split = subprocess.run(
+            [sys.executable, '-B', '-c', wrapper],
+            input=json.dumps(sub_split_req), text=True, capture_output=True, timeout=5,
+        )
+        self.assertEqual(proc_split.returncode, 0, proc_split.stdout + proc_split.stderr)
+        sub_split = json.loads(proc_split.stdout)
+        self.assertEqual(sub_split['task']['origin_context']['session_name'], 'unknown')
+        self.assertEqual(sub_split['task']['origin_context']['display_name'], 'unknown')
+        for secret in (host['session_id'], host['agent_id'], cap):
+            self.assertNotIn(secret, proc_split.stdout)
+
+        sub_styled_req = dict(
+            db=str(self.bridge.store.path), host=host, capability=cap,
+            host_context={'session_name': '\x1b[32mSprint\x1b[0m \u200eBoard'},
+            args=dict(action='start', cwd=self.tmp.name, prompt='sub styled', group='subnorm'),
+        )
+        proc_styled = subprocess.run(
+            [sys.executable, '-B', '-c', wrapper],
+            input=json.dumps(sub_styled_req), text=True, capture_output=True, timeout=5,
+        )
+        self.assertEqual(proc_styled.returncode, 0, proc_styled.stdout + proc_styled.stderr)
+        sub_styled = json.loads(proc_styled.stdout)
+        self.assertEqual(sub_styled['task']['origin_context']['session_name'], 'Sprint Board')
+        self.assertEqual(sub_styled['task']['origin_context']['display_name'], 'Sprint Board')
+
+        for group_name, expected_id, expected_name in (
+            ('subsec', sub_split['task']['id'], 'unknown'),
+            ('subnorm', sub_styled['task']['id'], 'Sprint Board'),
+        ):
+            list_proc = subprocess.run(
+                [sys.executable, '-B', str(Path(__file__).with_name('omp_bridge.py'))],
+                input=json.dumps(dict(db=str(self.bridge.store.path), host=host, capability=cap,
+                                      args=dict(action='list', group=group_name))),
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(list_proc.returncode, 0, list_proc.stdout + list_proc.stderr)
+            listed = json.loads(list_proc.stdout)['tasks']
+            self.assertEqual([t['id'] for t in listed], [expected_id])
+            self.assertEqual(listed[0]['origin_context']['session_name'], expected_name)
+            self.assertEqual(listed[0]['origin_context']['display_name'], expected_name)
+            for secret in (host['session_id'], host['agent_id'], cap):
+                self.assertNotIn(secret, list_proc.stdout)
 
 
 if __name__ == '__main__':

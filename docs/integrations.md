@@ -92,7 +92,7 @@ hermes config set plugins.entries.call-cli.settings.local_toolchain_bin "$VERIFI
 
 上例无执行预算；Hermes 模型工具拒绝 timeout，OMP 模型工具同样收口，旧缓存字段会明确报错。非常规显式硬预算仍可通过原 CLI/Python start 接口表达，shell 不受此 schema 约束；存量显式值在受支持续轮清除前继续生效。保留真实返回的 task.id 和 process ID，后续动作只用该 ID。宿主捕获 profile/session/platform/chat/topic，模型不能填造来源。
 
-Hermes 源码候选动作是 `start/list/status/events/reply/dialogue/permission/intervene/cancel/close/reconcile/release_only/recovery_status`；`recovery_status` 是精确 task_id 的最小只读资源快照，不授予业务内容读取或控制权限；以实际加载 schema 为准。`dialogue` 要求 observed expected_turn/稳定 command_id，限有能力的 AGY native 原 owner；普通 `reconcile` 沿原 controller/证明门禁。显式 `release_only` 见[权威恢复合同](../skill/references/core-requirements.md#写占用恢复合同)，不续派业务。`intervene` 保持 cancel+resume，unknown 不续派；通用 `--runtime hermes` 不产生原生来源绑定或通知。
+Hermes 源码候选动作是 `start/list/status/events/reply/dialogue/permission/intervene/cancel/close/reconcile/release_only`；以实际加载 schema 为准。`dialogue` 要求 observed expected_turn/稳定 command_id，限有能力的 AGY native 原 owner；普通 `reconcile` 沿原 controller/证明门禁。显式 `release_only` 见[权威恢复合同](../skill/references/core-requirements.md#写占用恢复合同)，不续派业务。`intervene` 保持 cancel+resume，unknown 不续派；通用 `--runtime hermes` 不产生原生来源绑定或通知。
 
 **Hermes 的 `status` / `events` 不是纯读操作**：它们会推进此前已由 `intervene` 授权、仍为 pending 的介入；旧轮确认结算后，查询可能启动同 session 的下一轮。没有已授权 pending 介入时不会自行派工；`unknown` 保留不确定结果，不自动重试。终端 dispatch 的迟到回执按 turn 与 launch identity 条件写回，不能覆盖新轮的状态或 process ID。
 
@@ -115,7 +115,7 @@ Windows structured-argv controls bind existing tasks to their saved `acpx_record
 Model/mode/effort control errors are not permission to retry through a second connection. Only `ACP_BACKEND_UNAVAILABLE` plus ACPX CLI's exact-record `idle` status permits direct control. The public embedded SDK restores the saved record with `resumeSessionId` before applying control; rejection, timeout, uncertain acknowledgement, non-idle status or failed restore returns failure without a success frame. Exact idle restore requires ACPX 0.22.0: 0.21.1 lacks its strict-resume record guard. The strict release adapter also remains pinned to 0.22.0; a 0.21.1 Windows installation needs a separately authorized upgrade before relying on these paths. No automatic upgrade is implied.
 Before idle restore, reset-on-next-ensure records and registry identities that differ from the saved command/argv are refused before calling `ensureSession`; its replacement semantics are not a recovery fallback.
 
-ACPX's cross-cwd `fs/*` callback restriction remains an upstream limitation. Native history reconciliation is separate from structured-argv control: append-only background growth and compatible tool enrichment are covered by synthetic regressions; incompatible rewrites still fail closed and require reconciliation.
+ACPX's cross-cwd `fs/*` callback restriction and native history-prefix failures remain separate unresolved issues; these control repairs do not change either contract.
 
 
 ### Ended-owner controller recovery (source candidate)

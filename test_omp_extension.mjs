@@ -54,21 +54,31 @@ test('dialogue keeps native owner polling and requires explicit stable intent', 
     delete args[missing];
     await assert.rejects(f.adapter.execute(args,f.ctx),/dialogue requires/);
   }
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',prompt:'revise 2',command_id:'d2',expected_turn:1,target_command_id:'d1'},f.ctx);
+  assert.deepEqual(f.calls.at(-1).args,{action:'dialogue',task_id:'task-a',prompt:'revise 2',command_id:'d2',expected_turn:1,target_command_id:'d1'});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'w2',expected_turn:1,target_command_id:'d2',withdraw:true},f.ctx);
+  assert.deepEqual(f.calls.at(-1).args,{action:'dialogue',task_id:'task-a',command_id:'w2',expected_turn:1,target_command_id:'d2',withdraw:true});
+  await assert.rejects(f.adapter.execute({action:'status',task_id:'task-a',target_command_id:'d1'},f.ctx),/target_command_id requires dialogue/);
+  await assert.rejects(f.adapter.execute({action:'status',task_id:'task-a',withdraw:true},f.ctx),/withdraw requires dialogue/);
+  await assert.rejects(f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'w3',expected_turn:1,target_command_id:'d2',withdraw:'yes'},f.ctx),/withdraw requires dialogue/);
   assert.ok(!f.calls.some(c=>c.args?.action==='cancel'));
   f.adapter.detach();
 });
 
 test('registered OMP tool advertises dialogue without host identity fields', () => {
   const enums=[];
+  const shapes=[];
   const chain=new Proxy({}, {get:()=>()=>chain});
   const z=new Proxy({}, {get:(_target,name)=>(...args)=>{
     if(name==='enum') enums.push(args[0]);
+    if(name==='object') shapes.push(Object.keys(args[0]));
     return chain;
   }});
   let registered;
   register({zod:z,registerTool:tool=>{registered=tool;},on:()=>{}});
   assert.equal(registered.name,'call_cli_omp');
   assert.ok(enums.some(values=>values.includes('dialogue')));
+  assert.ok(shapes.some(keys=>keys.includes('target_command_id') && keys.includes('withdraw')));
   assert.ok(enums.some(values=>values.includes('teamwork')));
   assert.ok(enums.some(values=>values.includes('skip-permissions') && values.includes('approve-all') && values.includes('approve-reads')));
 });
@@ -503,4 +513,122 @@ test('current host can explicitly release an old unknown task without a start or
   assert.equal(f.calls[1].args.abandon,true);
   assert.equal(f.timers.length,0);
   f.adapter.detach();
+});
+
+test('diagnostic events forward in follow-ups without stalling cursor', async () => {
+  const f=fixture();
+  await f.adapter.execute({action:'start',agent:'codex',cwd:'/work',prompt:'inspect'},f.ctx);
+  f.setPacket({task:{id:'task-a',state:'running'},events:[{seq:5,turn:1,kind:'diagnostic',text:'ACPX runtime diagnostic detail'}],after:5});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  assert.equal(f.sent[0].options.deliverAs,'followUp');
+  const payload=JSON.parse(f.sent[0].message.content);
+  assert.equal(payload.events.length,1);
+  assert.equal(payload.events[0].kind,'diagnostic');
+  assert.match(payload.events[0].text,/ACPX runtime diagnostic detail/);
+  f.setPacket({task:{id:'task-a',state:'running'},events:[],after:5});
+  await f.timers.shift()();
+  assert.equal(f.sent.length,1);
+  assert.equal(f.calls.at(-1).args.after,5);
+  f.adapter.detach();
+});
+
+test('start forwards host_context.session_name safely and validates optional group', async () => {
+  const fields=[];
+  const chain=new Proxy({}, {get:()=>()=>chain});
+  const z=new Proxy({}, {get:(_target,name)=>(...args)=>{
+    if(name==='object') fields.push(...Object.keys(args[0]));
+    return chain;
+  }});
+  let registered;
+  register({zod:z,registerTool:tool=>{registered=tool;},on:()=>{}});
+  assert.ok(fields.includes('group'));
+  assert.equal(registered.name,'call_cli_omp');
+
+  const calls=[];
+  const f=fixture(value=>{
+    calls.push(value);
+    if(value.action==='bind') return {capability:'cap'};
+    if(value.args.action==='start') return {task:{id:'task-g',state:'queued'}};
+    return {tasks:[{id:'task-g',group:'alpha'}]};
+  });
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'fallback-name'},f.ctx);
+  assert.deepEqual(calls.at(-1).host,{session_id:'host-a',agent_id:'main'});
+  assert.deepEqual(calls.at(-1).host_context,{session_name:''});
+  assert.ok(!Object.hasOwn(calls.at(-1).args,'host_context'));
+
+  f.ctx.sessionManager.getSessionName=()=>'Sprint Board';
+  await f.adapter.execute({action:'start',cwd:'/work',prompt:'grouped',group:'alpha'},f.ctx);
+  assert.deepEqual(calls.at(-1).host,{session_id:'host-a',agent_id:'main'});
+  assert.deepEqual(calls.at(-1).host_context,{session_name:'Sprint Board'});
+  assert.equal(calls.at(-1).args.group,'alpha');
+
+  await f.adapter.execute({action:'list',group:'alpha'},f.ctx);
+  assert.equal(calls.at(-1).args.group,'alpha');
+  assert.ok(!Object.hasOwn(calls.at(-1),'host_context'));
+
+  const beforeRejects=calls.length;
+  await assert.rejects(f.adapter.execute({action:'status',task_id:'task-g',group:'alpha'},f.ctx),/group requires start or list/);
+  for(const bad of ['', '   ', null, 123]) {
+    await assert.rejects(f.adapter.execute({action:'start',cwd:'/work',prompt:'bad',group:bad},f.ctx),/group must be a non-empty string/);
+  }
+  assert.equal(calls.length,beforeRejects);
+  f.adapter.detach();
+});
+
+test('real omp_bridge roundtrip preserves group, origin_context, runtime_links, and secrets without launching runner', async () => {
+  const {mkdtemp,writeFile,rm}=await import('node:fs/promises');
+  const {tmpdir}=await import('node:os');
+  const {join,dirname}=await import('node:path');
+  const {fileURLToPath}=await import('node:url');
+  const root=await mkdtemp(join(tmpdir(),'callcli-omp-real-bridge-'));
+  const previous=process.env.CALL_CLI_PYTHON;
+  const implDir=dirname(fileURLToPath(import.meta.url));
+  try {
+    const wrapper=join(root,'no-launch-python.sh');
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nPYTHONPATH=${JSON.stringify(implDir)} exec python3 -B -c 'import sys,collab,omp_bridge; collab.Collaboration._launch=lambda self,t:None; sys.argv[0]=sys.argv[1]; raise SystemExit(omp_bridge.main())' "$2"\n`,
+      {mode:0o700},
+    );
+    process.env.CALL_CLI_PYTHON=wrapper;
+    const f=fixture();
+    f.ctx.sessionManager.getSessionName=()=>'Cross Process Room';
+    const adapter=createAdapter({sendMessage:()=>{}},{db:join(root,'tasks.db'),pollMs:60000});
+    const started=await adapter.execute({action:'start',cwd:root,prompt:'cross process',group:'ops'},f.ctx);
+    assert.equal(started.task.group,'ops');
+    assert.equal(started.task.origin_context.surface,'omp-extension');
+    assert.equal(started.task.origin_context.display_name,'Cross Process Room');
+    assert.equal(started.task.runtime_links.task_id,started.task.id);
+    assert.equal(started.task.runtime_links.session,started.task.session);
+    assert.ok(!JSON.stringify(started).includes('host-a'));
+
+    const listed=await adapter.execute({action:'list',group:'ops'},f.ctx);
+    assert.deepEqual(listed.tasks.map(t=>t.id),[started.task.id]);
+    assert.equal(listed.tasks[0].runtime_links.task_id,started.task.id);
+    const otherListed=await adapter.execute({action:'list',group:'other'},f.ctx);
+    assert.deepEqual(otherListed.tasks,[]);
+
+    f.ctx.sessionManager.getSessionName=()=>'\x1b[32mStyled\x1b[0m Cross Room';
+    const startedStyled=await adapter.execute({action:'start',cwd:root,prompt:'styled cross process',group:'styled-ops'},f.ctx);
+    assert.equal(startedStyled.task.origin_context.session_name,'Styled Cross Room');
+    assert.equal(startedStyled.task.origin_context.display_name,'Styled Cross Room');
+
+    f.ctx.sessionManager.getSessionName=()=>'Leak host-\x1b[0ma';
+    const startedSplit=await adapter.execute({action:'start',cwd:root,prompt:'split secret cross process',group:'split-ops'},f.ctx);
+    assert.equal(startedSplit.task.origin_context.session_name,'unknown');
+    assert.equal(startedSplit.task.origin_context.display_name,'unknown');
+    assert.ok(!JSON.stringify(startedSplit).includes('host-a'));
+
+    const listedSplit=await adapter.execute({action:'list',group:'split-ops'},f.ctx);
+    assert.deepEqual(listedSplit.tasks.map(t=>t.id),[startedSplit.task.id]);
+    assert.equal(listedSplit.tasks[0].origin_context.session_name,'unknown');
+    assert.equal(listedSplit.tasks[0].origin_context.display_name,'unknown');
+    assert.ok(!JSON.stringify(listedSplit).includes('host-a'));
+
+    adapter.detach();
+  } finally {
+    if(previous===undefined)delete process.env.CALL_CLI_PYTHON;else process.env.CALL_CLI_PYTHON=previous;
+    await rm(root,{recursive:true,force:true});
+  }
 });

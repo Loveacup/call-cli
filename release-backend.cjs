@@ -119,6 +119,11 @@ async function closeTarget(target, deps = {}) {
   context.stage='resolve'; context.substep='status_before';
     const before = await getStatus(runtime, handle, context);
     exact(before, false);
+    const statusState = before.details?.status;
+    if (statusState === 'running' || statusState === 'alive') throw Error('SESSION_RUNNING');
+    if (statusState !== undefined && !['idle', 'dead', 'exited', 'stopped', 'closed'].includes(statusState)) {
+      throw Error('SESSION_STATUS_UNKNOWN');
+    }
     context.substep='find_before';
     const selected = await findTargetSession(runtime, target, candidates);
     observeLookup(context, selected, target);
@@ -182,6 +187,7 @@ async function probeTarget(target, deps = {}, resolve = false) {
 function failureReason(error) {
   if (error?.name === 'SessionNotFoundError' && error.record_lookup_found === false) return 'record_not_found';
   if (['RECORD_BINDING_MISMATCH','NAME_SCOPE_MISMATCH','NAME_SCOPE_REPLACED_OR_REOPENED',
+       'SESSION_RUNNING','SESSION_STATUS_UNKNOWN',
        'ACPX_VERSION_MISMATCH','SHARED_RUNTIME_UNAVAILABLE'].includes(error?.message))
     return error.message.toLowerCase();
   if (error?.code === 'MODULE_NOT_FOUND' &&

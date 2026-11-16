@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from bridge import Store, Origin
+from bridge import Store, Origin, build_origin_context, build_runtime_links
 from runner import control as runner_control
 from updates import device_lock
 from backends import BACKENDS, ModelSelectionError, prepare_start
@@ -81,7 +81,8 @@ class Collaboration:
 
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
               remote_shell='posix', write=False, resource='', timeout=None, model=None, effort=None,
-              agy_approval=None, agy_swarm=None, agy_worker_model=None, agy_mode=None, skills=None):
+              agy_approval=None, agy_swarm=None, agy_worker_model=None, agy_mode=None, skills=None,
+              group=None, _origin_context=None):
         from transport import device_identity
         origin = self.origin(client)
         if remote_shell not in {'posix', 'powershell'}:
@@ -97,9 +98,12 @@ class Collaboration:
         path_type=Path if device=='local' else (PureWindowsPath if remote_shell=='powershell' else PurePosixPath)
         if not path_type(cwd).is_absolute():
             raise ValueError('cwd must be absolute on the execution device; disable shell path conversion')
+        surface = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
+        context = (_origin_context if isinstance(_origin_context, dict) else
+                   build_origin_context(surface=surface, platform=origin.platform, source=origin.platform))
         task = self.store.create(origin, device, agent, cwd, prompt, write, resource,
                                  device_key=device_identity(device), skills=skills,
-                                 initiating_surface='omp-extension' if origin.profile == 'omp-extension' else 'standalone')
+                                 initiating_surface=surface, group=group, origin_context=context)
         task = self.store.update(task['id'], shell=remote_shell, timeout=timeout,
                                  needs_session=True, acpx_created=False, session_creation_attempted=False, **fields)
         self._dispatch(task)
@@ -110,13 +114,15 @@ class Collaboration:
         task = self.store.get(task_id, origin)
         from recovery import recovery_card
         host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
-        return dict(task, recovery=recovery_card(task, self.store.path, host=host))
+        return dict(task, runtime_links=build_runtime_links(task),
+                    recovery=recovery_card(task, self.store.path, host=host))
 
     def events(self, client, task_id, after=0):
         return self.store.events(task_id, self.origin(client), after)
 
-    def list(self, client):
-        return self.store.list(self.origin(client))
+    def list(self, client, group=None):
+        return [dict(t, runtime_links=build_runtime_links(t))
+                for t in self.store.list(self.origin(client), group=group)]
 
     def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False, expected_turn=None):
         task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id,
@@ -129,9 +135,11 @@ class Collaboration:
         self.store.permission(task_id, self.origin(client), **args)
         return self.status(client, task_id)
 
-    def dialogue(self, client, task_id, prompt, *, expected_turn, command_id, question_id=None):
+    def dialogue(self, client, task_id, prompt='', *, expected_turn, command_id, question_id=None,
+                 target_command_id=None, withdraw=False):
         self.store.dialogue(task_id, self.origin(client), prompt, expected_turn=expected_turn,
-                            command_id=command_id, question_id=question_id)
+                            command_id=command_id, question_id=question_id,
+                            target_command_id=target_command_id, withdraw=withdraw)
         return self.status(client, task_id)
 
     def _advance(self, client, task_id):
@@ -194,7 +202,8 @@ class Collaboration:
         receipt = release_only_task(self.store, origin, task_id, expected_turn, abandon=abandon)
         task = self.store.release_target(task_id, origin)
         host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
-        return dict(task, recovery=recovery_card(task, host=host), close_receipt=public_close_receipt(receipt))
+        return dict(task, runtime_links=build_runtime_links(task),
+                    recovery=recovery_card(task, host=host), close_receipt=public_close_receipt(receipt))
 
     def close(self, client, task_id):
         from release import close_task
@@ -241,10 +250,12 @@ def main(argv=None):
     start.add_argument('--timeout', type=lambda value: None if value == 'none' else float(value),
                        help='Uncommon explicit hard execution limit in seconds, not a review reminder; omitted or none means no execution deadline')
     start.add_argument('--prompt', required=True)
+    start.add_argument('--group', help='Optional lightweight task group label')
     start.add_argument('--skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot a coordinator-side skill directory')
     start.add_argument('--target-skill', action='append', default=[], metavar='MODE=PATH', help='Snapshot an existing execution-device skill directory')
     start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
-    sub.add_parser('list')
+    list_parser = sub.add_parser('list')
+    list_parser.add_argument('--group', help='Filter listed tasks within this client origin by group label')
     for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']:
         p = sub.add_parser(action)
         p.add_argument('--task', required=True)
@@ -265,10 +276,12 @@ def main(argv=None):
         if action == 'reply':
             p.add_argument('--question-id', required=True)
         if action == 'dialogue':
-            p.add_argument('--prompt', required=True)
+            p.add_argument('--prompt', default='')
             p.add_argument('--expected-turn', type=int, required=True)
             p.add_argument('--command-id', required=True)
             p.add_argument('--question-id')
+            p.add_argument('--target-command-id')
+            p.add_argument('--withdraw', action='store_true')
         if action == 'permission':
             p.add_argument('--expected-turn', type=int, required=True)
             p.add_argument('--command-id', required=True)

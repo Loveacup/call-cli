@@ -11,7 +11,10 @@ import re
 from pathlib import Path
 import sqlite3
 
-from .bridge import Origin, Store
+try:
+    from .bridge import Origin, Store, normalize_group
+except ImportError:
+    from bridge import Origin, Store, normalize_group
 
 # Inspected native interactive surfaces and built-in messaging routes. New or
 # plugin-defined sources need explicit compatibility review, not a truthy label.
@@ -224,13 +227,17 @@ class NativeStore(Store):
             return False
         return False
 
-    def list(self, origin):
+    def list(self, origin, group=None):
         # Only same-route owner identities are candidates; no foreign task data
         # leaves the Store. Each returned row passes the same authorization check.
+        target = normalize_group(group)
         with self.connect() as db:
             rows = db.execute('''SELECT owner, data FROM tasks
                 WHERE CASE WHEN json_valid(owner) THEN
                   json_extract(owner, '$.profile') = ? ELSE 0 END''', (origin.profile,)).fetchall()
-        return [json.loads(row['data']) for row in rows if
-                self._same_principal(row['owner'], origin) or self._allows(
-                    Origin(**json.loads(row['data']).get('controller', json.loads(row['data'])['origin'])).key(), origin)]
+        tasks = [json.loads(row['data']) for row in rows if
+                 self._same_principal(row['owner'], origin) or self._allows(
+                     Origin(**json.loads(row['data']).get('controller', json.loads(row['data'])['origin'])).key(), origin)]
+        if target is not None:
+            return [t for t in tasks if t.get('group') == target]
+        return tasks

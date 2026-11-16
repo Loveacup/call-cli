@@ -34,8 +34,87 @@ def capture_origin(get_env, profile):
                   get_env('HERMES_SESSION_CHAT_ID',''), get_env('HERMES_SESSION_THREAD_ID',''))
 
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?|\x1b[@-Z\\-_]')
+_CONTROL_BIDI_RE = re.compile(r'[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]')
 
 
+def sanitize_label(value, default='unknown', max_len=160):
+    """Strip ANSI/control/bidi characters, collapse whitespace, and cap length."""
+    if not isinstance(value, str):
+        return default
+    cleaned = _ANSI_ESCAPE_RE.sub('', value)
+    cleaned = _CONTROL_BIDI_RE.sub(lambda m: ' ' if m.group(0) in '\t\n\r\x0b\x0c' else '', cleaned)
+    cleaned = ' '.join(cleaned.split())[:max_len].strip()
+    return cleaned or default
+
+
+def normalize_group(group):
+    """Validate and sanitize an optional task group label."""
+    if group is None:
+        return None
+    if not isinstance(group, str):
+        raise ValueError('group must be a non-empty string')
+    cleaned = sanitize_label(group, default='', max_len=128)
+    if not cleaned:
+        raise ValueError('group must be a non-empty string')
+    return cleaned
+
+
+def build_origin_context(*, surface='unknown', platform='unknown', source=None,
+                         chat_type=None, chat_name=None, topic_name=None, session_name=None):
+    """Build sanitized non-authoritative origin context without altering Origin."""
+    clean_chat = sanitize_label(chat_name)
+    clean_topic = sanitize_label(topic_name)
+    clean_session = sanitize_label(session_name)
+    display_name = next(
+        (item for item in (clean_topic, clean_chat, clean_session) if item != 'unknown'),
+        'unknown',
+    )
+    return {
+        'surface': sanitize_label(surface),
+        'platform': sanitize_label(platform),
+        'source': sanitize_label(source),
+        'chat_type': sanitize_label(chat_type),
+        'chat_name': clean_chat,
+        'topic_name': clean_topic,
+        'session_name': clean_session,
+        'display_name': display_name,
+    }
+
+
+def capture_origin_context(get_env, origin, *, surface='hermes-native'):
+    """Capture sanitized Hermes host context strictly from in-memory env vars."""
+    return build_origin_context(
+        surface=surface,
+        platform=origin.platform,
+        source=get_env('HERMES_SESSION_SOURCE', ''),
+        chat_type=get_env('HERMES_SESSION_CHAT_TYPE', ''),
+        chat_name=get_env('HERMES_SESSION_CHAT_NAME', ''),
+        topic_name=get_env('HERMES_SESSION_TOPIC_NAME', ''),
+        session_name=get_env('HERMES_SESSION_TITLE', ''),
+    )
+
+
+def build_runtime_links(task):
+    """Project already-recorded session/process linkage identifiers from a task dict."""
+    native_exit = task.get('native_owner_exit')
+    return {
+        'task_id': task.get('id'),
+        'session': task.get('session'),
+        'turn': task.get('turn'),
+        'control_epoch': task.get('control_epoch', 1),
+        'launch_id': task.get('launch_id'),
+        'process_id': task.get('process_id') or None,
+        'runner_pid': task.get('runner_pid') or None,
+        'acpx_record_id': task.get('acpx_record_id'),
+        'acpx_session_id': task.get('acpx_session_id'),
+        'native_session_id': task.get('native_session_id'),
+        'native_predecessor_session_id': task.get('native_predecessor_session_id'),
+        'native_owner_exit_pid': native_exit.get('pid') if isinstance(native_exit, dict) else None,
+        'backend_request_id': task.get('backend_request_id'),
+        'device': task.get('device'),
+        'cwd': task.get('cwd'),
+    }
 
 
 class Store:
@@ -57,12 +136,18 @@ class Store:
         finally:
             db.close()
 
-    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None, skills=None, *, initiating_surface=None):
+    def create(self, origin, device, agent, cwd, prompt, write, resource='', device_key=None, skills=None,
+               *, initiating_surface=None, group=None, origin_context=None):
+        group = normalize_group(group)
+        surface = initiating_surface or 'unknown'
+        context = (origin_context if isinstance(origin_context, dict) else
+                   build_origin_context(surface=surface, platform=origin.platform, source=origin.platform))
         task_id = uuid.uuid4().hex[:16]
         data = dict(id=task_id, session='call-'+task_id, origin=dataclasses.asdict(origin),
                     device=device, device_key=device_key or device, agent=agent, cwd=cwd, prompt=prompt, write=write,
                     resource=resource, state='queued', turn=1, process_id='', question_id='', questions=[], answers={},
-                    controller=dataclasses.asdict(origin), control_epoch=1, initiating_surface=initiating_surface or 'unknown')
+                    controller=dataclasses.asdict(origin), control_epoch=1, initiating_surface=surface,
+                    group=group, origin_context=context)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             self._check_writers(db, data)
@@ -214,10 +299,25 @@ class Store:
     def _native_binding(task):
         return dict(turn=task['turn'], launch_id=task.get('launch_id'), epoch=task.get('control_epoch', 1))
 
-    def dialogue(self, task_id, origin, prompt, *, expected_turn, command_id, question_id=None):
+    def dialogue(self, task_id, origin, prompt='', *, expected_turn, command_id, question_id=None,
+                 target_command_id=None, withdraw=False):
         if type(expected_turn) is not int or expected_turn < 1 or not isinstance(command_id, str) or not command_id.strip():
             raise ValueError('dialogue requires expected_turn and stable command_id')
-        if not isinstance(prompt, str) or not prompt.strip():
+        if type(withdraw) is not bool:
+            raise ValueError('withdraw must be boolean')
+        if target_command_id is not None:
+            if not isinstance(target_command_id, str) or not target_command_id.strip():
+                raise ValueError('target_command_id must be nonempty')
+            if target_command_id == command_id:
+                raise ValueError('command_id must differ from target_command_id')
+        if withdraw:
+            if not target_command_id:
+                raise ValueError('withdraw requires target_command_id')
+            if (isinstance(prompt, str) and prompt.strip()) or (not isinstance(prompt, str) and prompt is not None):
+                raise ValueError('withdraw does not accept prompt')
+            if question_id is not None:
+                raise ValueError('withdraw does not accept question_id')
+        elif not isinstance(prompt, str) or not prompt.strip():
             raise ValueError('dialogue requires nonempty prompt')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -227,11 +327,17 @@ class Store:
             same = getattr(self, '_same_principal', self._allows)
             if not same(controller, origin):
                 raise PermissionError('Dialogue belongs to the current controller')
-            intent = dict(prompt=prompt, expected_turn=expected_turn, question_id=question_id)
+            if withdraw:
+                intent = dict(withdraw=True, target_command_id=target_command_id, expected_turn=expected_turn)
+            else:
+                intent = dict(prompt=prompt, expected_turn=expected_turn, question_id=question_id)
+                if target_command_id is not None:
+                    intent['target_command_id'] = target_command_id
+            expected_kind = 'dialogue_withdraw' if withdraw else 'dialogue'
             commands = task.setdefault('commands', {})
             old = commands.get(command_id)
             if old is not None:
-                if old.get('kind') != 'dialogue' or old.get('intent') != intent:
+                if old.get('kind') != expected_kind or old.get('intent') != intent:
                     raise ValueError('command_id already used with different parameters')
                 return task
             self._check_intent(task, expected_turn)
@@ -243,6 +349,21 @@ class Store:
                     or not task.get('runner_pid') or not binding['launch_id']
                     or not cap.get('accepting') or any(cap.get(k) != v for k,v in binding.items())):
                 raise ValueError('Native dialogue unsupported: no live bound owner input capability')
+            target = None
+            if target_command_id is not None:
+                target = commands.get(target_command_id)
+                if not target or target.get('kind') != 'dialogue':
+                    raise ValueError('Target dialogue command_id not found')
+                if any(target.get(k) != v for k, v in binding.items()):
+                    raise ValueError('Target dialogue is from a different turn or binding')
+                if target.get('status') != 'accepted':
+                    raise ValueError('Target dialogue is no longer accepted and cannot be modified')
+            if withdraw:
+                target['status'] = 'withdrawn'
+                commands[command_id] = dict(kind='dialogue_withdraw', command_id=command_id, intent=intent,
+                    target_command_id=target_command_id, status='returned', **binding)
+                self._save(db, task)
+                return task
             question = None
             if question_id is not None:
                 if question_id not in task.get('questions', []):
@@ -254,9 +375,12 @@ class Store:
                 question = dict(id=question_id, label=event.get('question_label'),
                     interaction_seq=event.get('interaction_seq', 0), text=event['text'],
                     sha256=event.get('question_sha256'), length=event.get('question_length'))
-                if any(c.get('kind') == 'dialogue' and c.get('question_id') == question_id
+                if any(c.get('kind') == 'dialogue' and c.get('command_id') != target_command_id
+                       and c.get('question_id') == question_id
                        and c.get('status') in {'accepted', 'claimed', 'send_started', 'returned'} for c in commands.values()):
                     raise ValueError('Question already has an admitted answer')
+            if target is not None:
+                target['status'] = 'superseded'
             seq = task.get('native_interaction_next', task.get('interaction_seq', 0))+1
             task['native_interaction_next'] = seq
             commands[command_id] = dict(kind='dialogue', command_id=command_id, intent=intent,
@@ -790,9 +914,13 @@ class Store:
             return [dict(seq=r['rowid'], **json.loads(r['data'])) for r in db.execute(
                 'SELECT rowid,data FROM events WHERE task=? AND rowid>? ORDER BY rowid', (task_id, after))]
 
-    def list(self, origin):
+    def list(self, origin, group=None):
+        target = normalize_group(group)
         with self.connect() as db:
-            return [json.loads(r['data']) for r in db.execute('SELECT data FROM tasks WHERE owner=?', (origin.key(),))]
+            tasks = [json.loads(r['data']) for r in db.execute('SELECT data FROM tasks WHERE owner=?', (origin.key(),))]
+        if target is not None:
+            return [t for t in tasks if t.get('group') == target]
+        return tasks
 
     def release_target(self, task_id, origin):
         return self.get(task_id, origin)

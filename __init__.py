@@ -6,7 +6,7 @@ from pathlib import Path, PureWindowsPath
 import shlex
 import sqlite3
 import sys
-from .bridge import capture_origin
+from .bridge import capture_origin, capture_origin_context, build_runtime_links
 from .native_continuity import NativeStore as Store
 from .transport import device_identity
 from .backends import BACKENDS, prepare_start
@@ -38,10 +38,13 @@ SCHEMA={
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
+        'target_command_id':{'type':'string','description':'Optional dialogue-only target command_id to withdraw or supersede while still accepted'},
+        'withdraw':{'type':'boolean','description':'Optional dialogue-only flag to withdraw target_command_id without sending a new prompt'},
         'expected_turn':{'type':'integer','description':'Observed turn; required for dialogue, release_only, cross-controller continuation, new no-question reply and native close/reconcile recovery'},
         'abandon':{'type':'boolean','description':'release_only only: explicitly accept native/detached activity risk and release ownership without stop proof; never business success'},
         'after':{'type':'integer','default':0},
-        'clear_timeout':{'type':'boolean','description':'reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'}
+        'clear_timeout':{'type':'boolean','description':'reply/intervene only: clear an inherited execution limit on the next settled continuation; queued clearing is refused'},
+        'group':{'type':'string','description':'Optional lightweight group label; filters list within this exact authorized origin only'}
     },'required':['action'],'additionalProperties':False}
 }
 
@@ -74,6 +77,12 @@ class Coordinator:
             raise ValueError('clear_timeout requires reply or intervene')
         if 'abandon' in args and (args.get('action') != 'release_only' or type(args['abandon']) is not bool):
             raise ValueError('abandon requires release_only and a boolean')
+        if 'group' in args and args.get('action') not in {'start', 'list'}:
+            raise ValueError('group requires start or list')
+        if 'target_command_id' in args and args.get('action') != 'dialogue':
+            raise ValueError('target_command_id requires dialogue')
+        if 'withdraw' in args and (args.get('action') != 'dialogue' or type(args['withdraw']) is not bool):
+            raise ValueError('withdraw requires dialogue and a boolean')
         origin=capture_origin(self.get_env,self.ctx.profile_name)
         action=args['action']
         store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root, action=action)
@@ -91,7 +100,7 @@ class Coordinator:
                 'receipt': {key: receipt.get(key) for key in
                     ('state', 'operation', 'business_state', 'external_close_attempted')}
                     if isinstance(receipt, dict) else None}}
-        if action=='list':return {'tasks':[self.public(t) for t in store.list(origin)]}
+        if action=='list':return {'tasks':[self.public(t) for t in store.list(origin, group=args.get('group'))]}
         if action in {'status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only'}:
             task=(store.release_target(args.get('task_id',''),origin) if action=='release_only'
                   else store.get(args.get('task_id',''),origin))
@@ -106,7 +115,8 @@ class Coordinator:
             fields=prepare_start(agent,args.get('model'),args.get('effort'),args.get('agy_approval'),
                                  agy_swarm=args.get('agy_swarm'),agy_worker_model=args.get('agy_worker_model'),agy_mode=args.get('agy_mode'))
             command(device,args.get('remote_shell','posix'),['acpx'])  # Validate host alias before any state change.
-            task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'),initiating_surface='hermes-native')
+            origin_context=capture_origin_context(self.get_env, origin, surface='hermes-native')
+            task=store.create(origin,device,agent,cwd,prompt,args.get('write',False) is True,args.get('resource',''),device_key=device_identity(device),skills=args.get('skills'),initiating_surface='hermes-native',group=args.get('group'),origin_context=origin_context)
             task=store.update(task['id'],shell=args.get('remote_shell','posix'),timeout=None,continuation_version=2,
                               needs_session=True,acpx_created=False,session_creation_attempted=False,**fields)
             return self.launch(store,task)
@@ -115,9 +125,18 @@ class Coordinator:
                 permission_id=args.get('permission_id'),script_sha256=args.get('script_sha256'),decision=args.get('decision'))
             return {'task':self.public(task),'note':'Exact single-use permission recorded; send/return evidence remains separate'}
         if action=='dialogue':
+            withdraw=args.get('withdraw',False)
+            target_command_id=args.get('target_command_id')
             task=store.dialogue(task['id'],origin,args.get('prompt',''), expected_turn=args.get('expected_turn'),
-                                command_id=args.get('command_id'), question_id=args.get('question_id'))
-            return {'task':self.public(task),'note':'Dialogue accepted by bound owner queue; not sent or adopted until evidence returns'}
+                                command_id=args.get('command_id'), question_id=args.get('question_id'),
+                                target_command_id=target_command_id, withdraw=withdraw)
+            if withdraw:
+                note=f'Accepted dialogue {target_command_id} withdrawn before claim/send'
+            elif target_command_id:
+                note=f'Accepted dialogue {target_command_id} superseded by {args.get("command_id")} in bound owner queue; not sent or adopted until evidence returns'
+            else:
+                note='Dialogue accepted by bound owner queue; not sent or adopted until evidence returns'
+            return {'task':self.public(task),'note':note}
         if action=='intervene':
             prompt=args.get('prompt','')
             command_id=args.get('command_id','')
@@ -171,7 +190,10 @@ class Coordinator:
     def public(task):
         def project(value):
             if isinstance(value,dict):
-                return {key:project(item) for key,item in value.items() if key not in {'prompt','reply_commands','native_snapshot'}}
+                projected = {key:project(item) for key,item in value.items() if key not in {'prompt','reply_commands','native_snapshot'}}
+                if 'id' in value and 'session' in value and 'turn' in value:
+                    projected['runtime_links'] = build_runtime_links(value)
+                return projected
             if isinstance(value,list):
                 return [project(item) for item in value]
             return value

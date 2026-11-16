@@ -567,6 +567,167 @@ class StoreTests(unittest.TestCase):
         self.store.request_cancel(t['id'], self.a)
         self.assertEqual(self.store.get(t['id'])['intervention']['status'], 'withdrawn')
 
+    def test_origin_context_sanitization_runtime_links_and_intra_origin_grouping(self):
+        from bridge import (sanitize_label, normalize_group, build_origin_context,
+                            capture_origin_context, build_runtime_links)
+        self.assertEqual(sanitize_label('\x1b[31mTeam\x1b[0m \x1b]0;x\x07\u202e\x00  Alpha \n'), 'Team Alpha')
+        self.assertEqual(sanitize_label(' \x1b[31m\x1b[0m\u200f '), 'unknown')
+        self.assertEqual(sanitize_label(123, default='fallback'), 'fallback')
+        self.assertIsNone(normalize_group(None))
+        self.assertEqual(normalize_group('  \x1b[32mSprint 1\x1b[0m  '), 'Sprint 1')
+        for bad in ('', '   ', '\x1b[31m\x1b[0m', '\u202e', 123, True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                normalize_group(bad)
+
+        env = {
+            'HERMES_SESSION_SOURCE': 'telegram',
+            'HERMES_SESSION_CHAT_TYPE': 'group',
+            'HERMES_SESSION_CHAT_NAME': '\x1b[31mDeploy\x1b[0m Chat\u202e',
+            'HERMES_SESSION_TOPIC_NAME': '  Topic  Zero  ',
+            'HERMES_SESSION_TITLE': 'Fallback Title',
+        }
+        ctx = capture_origin_context(lambda k, d='': env.get(k, d), self.a, surface='hermes-native')
+        self.assertEqual(ctx, {
+            'surface': 'hermes-native', 'platform': 'telegram', 'source': 'telegram',
+            'chat_type': 'group', 'chat_name': 'Deploy Chat',
+            'topic_name': 'Topic Zero', 'session_name': 'Fallback Title',
+            'display_name': 'Topic Zero',
+        })
+        fallback_ctx = build_origin_context(surface='hermes-native', platform='cli', chat_name='Room A', session_name='Title B')
+        self.assertEqual(fallback_ctx['display_name'], 'Room A')
+        title_only_ctx = build_origin_context(surface='omp-extension', platform='omp', session_name='Title B')
+        self.assertEqual(title_only_ctx['display_name'], 'Title B')
+        empty_ctx = build_origin_context()
+        self.assertEqual(empty_ctx['display_name'], 'unknown')
+
+        t1 = self.store.create(self.a, 'local', 'omp', '/one', 'inspect', False,
+                               initiating_surface='hermes-native', group=' alpha ', origin_context=ctx)
+        t2 = self.store.create(self.a, 'local', 'omp', '/two', 'inspect', False, group='beta')
+        t3 = self.store.create(self.a, 'local', 'omp', '/three', 'inspect', False)
+        t_foreign = self.store.create(self.b, 'local', 'omp', '/four', 'inspect', False, group='alpha')
+        self.assertEqual(t1['group'], 'alpha')
+        self.assertEqual(t1['origin'], dict(profile='default', session_id='session-a',
+            session_key='telegram:chat:topic-a', platform='telegram', chat_id='chat', thread_id='topic-a'))
+        self.assertEqual(t1['origin_context']['display_name'], 'Topic Zero')
+        self.assertEqual([t['id'] for t in self.store.list(self.a, group='alpha')], [t1['id']])
+        self.assertEqual([t['id'] for t in self.store.list(self.a, group='beta')], [t2['id']])
+        self.assertEqual(sorted(t['id'] for t in self.store.list(self.a)), sorted([t1['id'], t2['id'], t3['id']]))
+        self.assertEqual([t['id'] for t in self.store.list(self.b, group='alpha')], [t_foreign['id']])
+        with self.assertRaises(ValueError):
+            self.store.create(self.a, 'local', 'omp', '/bad', 'inspect', False, group='  ')
+        with self.assertRaises(ValueError):
+            self.store.list(self.a, group='')
+
+        self.store.update(t1['id'], launch_id='l1', process_id='', runner_pid=0,
+                          acpx_record_id='rec-1', acpx_session_id='sess-1',
+                          native_session_id='nat-1', native_predecessor_session_id='nat-0',
+                          native_owner_exit={'pid': 987, 'code': 0}, backend_request_id=f"{t1['id']}:1")
+        links = build_runtime_links(self.store.get(t1['id']))
+        self.assertEqual(links, {
+            'task_id': t1['id'], 'session': t1['session'], 'turn': 1, 'control_epoch': 1,
+            'launch_id': 'l1', 'process_id': None, 'runner_pid': None,
+            'acpx_record_id': 'rec-1', 'acpx_session_id': 'sess-1',
+            'native_session_id': 'nat-1', 'native_predecessor_session_id': 'nat-0',
+            'native_owner_exit_pid': 987, 'backend_request_id': f"{t1['id']}:1",
+            'device': 'local', 'cwd': '/one',
+        })
+
+    def test_dialogue_withdraw_and_supersede_exact_accepted_target_idempotent_and_no_resurrection(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'draft 1', expected_turn=1, command_id='d1')
+        self.store.dialogue(task['id'], self.a, 'independent 2', expected_turn=1, command_id='d_other')
+
+        withdrawn = self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w1',
+                                        target_command_id='d1', withdraw=True)
+        self.assertEqual(withdrawn['commands']['d1']['status'], 'withdrawn')
+        self.assertEqual(withdrawn['commands']['d_other']['status'], 'accepted')
+        # Idempotent retry of withdraw and no resurrection of d1
+        self.assertEqual(self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w1',
+                                             target_command_id='d1', withdraw=True), withdrawn)
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w1',
+                                target_command_id='d_other', withdraw=True)
+        self.assertEqual(self.store.dialogue(task['id'], self.a, 'draft 1', expected_turn=1, command_id='d1'), withdrawn)
+        self.assertEqual(self.store.get(task['id'])['commands']['d1']['status'], 'withdrawn')
+
+        # Supersede d_other with d2; d_other becomes superseded, d2 accepted
+        superseded = self.store.dialogue(task['id'], self.a, 'revised 2', expected_turn=1, command_id='d2',
+                                         target_command_id='d_other')
+        self.assertEqual(superseded['commands']['d_other']['status'], 'superseded')
+        self.assertEqual(superseded['commands']['d2']['status'], 'accepted')
+        self.assertEqual(superseded['commands']['d2']['interaction_seq'], 3)
+        self.assertEqual(self.store.dialogue(task['id'], self.a, 'revised 2', expected_turn=1, command_id='d2',
+                                             target_command_id='d_other'), superseded)
+        self.assertEqual(self.store.dialogue(task['id'], self.a, 'independent 2', expected_turn=1,
+                                             command_id='d_other'), superseded)
+
+        # Only d2 is claimed; withdrawn/superseded do not block seal after d2 returns
+        claimed = self.store.native_dialogue_claim(task['id'], 1, 'launch', 1)
+        self.assertEqual(claimed['command_id'], 'd2')
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'd2', 'send_started')
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'd2', 'returned')
+        self.assertTrue(self.store.native_input_seal(task['id'], 1, 'launch', 1, 3))
+
+    def test_dialogue_withdraw_and_supersede_question_reanswer_and_same_question_replace(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.event(task['id'], '1:q', 'question', 'Q1 Format?', turn=1, interaction_seq=0)
+        self.store.dialogue(task['id'], self.a, 'YAML', expected_turn=1, command_id='d1', question_id='1:q')
+        self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w1',
+                            target_command_id='d1', withdraw=True)
+        # Withdrawn answer allows re-answering same question_id
+        self.store.dialogue(task['id'], self.a, 'TOML', expected_turn=1, command_id='d2', question_id='1:q')
+        # Superseding d2 with d3 on the same question_id succeeds atomically
+        res = self.store.dialogue(task['id'], self.a, 'JSON', expected_turn=1, command_id='d3',
+                                  question_id='1:q', target_command_id='d2')
+        self.assertEqual(res['commands']['d2']['status'], 'superseded')
+        self.assertEqual(res['commands']['d3']['status'], 'accepted')
+
+    def test_dialogue_withdraw_and_supersede_reject_claimed_sent_and_cross_turn_or_binding(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'inspect', False)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'first', expected_turn=1, command_id='d1')
+
+        # Non-controller rejected
+        with self.assertRaises(PermissionError):
+            self.store.dialogue(task['id'], self.b, expected_turn=1, command_id='wb',
+                                target_command_id='d1', withdraw=True)
+
+        # Claim race: once claimed, withdraw and supersede both reject
+        claimed = self.store.native_dialogue_claim(task['id'], 1, 'launch', 1)
+        self.assertEqual(claimed['command_id'], 'd1')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w_claimed',
+                                target_command_id='d1', withdraw=True)
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'second', expected_turn=1, command_id='d2',
+                                target_command_id='d1')
+
+        # send_started / returned also reject
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'd1', 'send_started')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w_sent',
+                                target_command_id='d1', withdraw=True)
+        self.store.native_dialogue_state(task['id'], 1, 'launch', 1, 'd1', 'returned')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'second', expected_turn=1, command_id='d2_ret',
+                                target_command_id='d1')
+
+        # Cross-turn / cross-binding target rejected even if its status is still 'accepted'
+        self.store.dialogue(task['id'], self.a, 'stale_turn1', expected_turn=1, command_id='d_turn1')
+        self.store.update(task['id'], turn=2, launch_id='launch2',
+                          native_input=dict(turn=2, launch_id='launch2', epoch=1, accepting=True))
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, expected_turn=2, command_id='w_cross_turn',
+                                target_command_id='d_turn1', withdraw=True)
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'turn2_new', expected_turn=2, command_id='d_turn2',
+                                target_command_id='d_turn1')
+
 class ProtocolTests(unittest.TestCase):
     def test_host_context_captures_topic_and_session_not_model_input(self):
         from bridge import capture_origin

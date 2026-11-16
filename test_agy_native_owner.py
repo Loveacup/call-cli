@@ -842,8 +842,41 @@ class NativeOwnerTests(unittest.TestCase):
         owner.request('session/prompt', {}, timeout=None)
         self.assertEqual(len(ticks), 2000)
 
+    def test_cancel_attempt_is_single_across_drains_loads_and_new_owners(self):
+        from agy_native import NativeOwner
+        task = dict(device='local', cwd='/', agy_approval='approve-all')
+        with patch('agy_native.subprocess.Popen'), patch('agy_native.selectors.DefaultSelector'):
+            owners = [NativeOwner(task), NativeOwner(task)]
+        for owner in owners:
+            owner.session_id = 'owned'
+            sent = []
+            owner.send = sent.append
+            owner.drain_pending(check_cancel=lambda: True)
+            owner.drain_pending(check_cancel=lambda: True)
+            owner.load(reconcile_stream=True, check_cancel=lambda: True)
+            owner.buffer = b'{"id":1,"result":{}}\n'
+            owner.request('session/load', {}, check_cancel=lambda: True)
+            owner.notify_cancel()
+            self.assertEqual([frame for frame in sent if frame.get('method') == 'session/cancel'],
+                             [dict(method='session/cancel', params=dict(sessionId='owned'))])
+
+    def test_failed_cancel_send_is_not_retried_on_same_owner(self):
+        from agy_native import NativeOwner
+        with patch('agy_native.subprocess.Popen'), patch('agy_native.selectors.DefaultSelector'):
+            owner = NativeOwner(dict(device='local', cwd='/'))
+        owner.session_id = 'owned'
+        with patch.object(owner, 'send', side_effect=OSError('uncertain synthetic send')) as send:
+            with self.assertRaises(OSError):
+                owner.notify_cancel()
+            owner.drain_pending(check_cancel=lambda: True)
+            owner.load(reconcile_stream=True, check_cancel=lambda: True)
+            owner.notify_cancel()
+            self.assertEqual(send.call_count, 1)
+
     def test_review_cooldown_spans_prompt_dialogue_and_background_until_cancelled(self):
         from types import SimpleNamespace
+        from agy_native import NativeOwner
+        original_request = NativeOwner.request
         for active in (False, True):
             with self.subTest(active=active), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -864,10 +897,35 @@ class NativeOwnerTests(unittest.TestCase):
                 clock = [0.0]
                 timer = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 1000+clock[0],
                     sleep=lambda seconds: time.sleep(.001))
+                release_consumption = threading.Event()
+                consumed = [threading.Event(), threading.Event()]
+                quiesced = [threading.Event(), threading.Event()]
+                prompt_index = [0]
+                def observed_request(owner, method, params, **kwargs):
+                    callback = kwargs.get('on_update')
+                    if method == 'session/prompt' and callback is not None:
+                        index = prompt_index[0]
+                        prompt_index[0] += 1
+                        seen = set()
+                        def on_update(update):
+                            if index == 0:
+                                if not release_consumption.wait(4):
+                                    raise AssertionError('Synthetic consumption release missing')
+                            callback(update)
+                            if update.get('sessionUpdate') == 'tool_call':
+                                seen.add(update.get('toolCallId'))
+                            if {'add', 'read'} <= seen:
+                                consumed[index].set()
+                            if (update.get('sessionUpdate') == 'user_message_chunk'
+                                    and update.get('content', {}).get('text') == f'quiesced-prompt{index}'):
+                                quiesced[index].set()
+                        kwargs['on_update'] = on_update
+                    return original_request(owner, method, params, **kwargs)
                 with patch.dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'], AGY_NATIVE_FIXTURE=directory), \
                         patch('updates.DEFAULT_LOCK_ROOT', root/'locks'), \
                         patch('updates.ensure_current', return_value={'decision':'fixture'}), \
-                        patch('agy_native.time', timer), contextlib.redirect_stdout(io.StringIO()):
+                        patch('agy_native.time', timer), patch.object(NativeOwner, 'request', observed_request), \
+                        contextlib.redirect_stdout(io.StringIO()):
                     c = Collaboration(root/'tasks.db', launch=lambda task: None)
                     client = c.connect('omp')['client_id']
                     other = c.connect('omp')['client_id']
@@ -892,13 +950,18 @@ class NativeOwnerTests(unittest.TestCase):
                     try:
                         for index, gate in enumerate(gates):
                             await_condition(lambda: (root/('waiting-'+gate)).exists())
+                            if gate.startswith('prompt'):
+                                release_consumption.set()
+                                await_condition(lambda: consumed[index // 2].is_set())
                             clock[0] = (index+1)*600-1
-                            time.sleep(.15)
                             self.assertEqual(len(notices()), index, gate+' bypassed shared cooldown')
                             clock[0] += 1
                             await_condition(lambda: len(notices()) == index+1)
                             self.assertEqual(c.status(client, task['id'])['state'], 'running')
                             self.assertEqual(notices()[-1]['interaction_seq'], int(index >= 2))
+                            expected_kind = 'checkpoint' if active and gate.startswith('prompt') else 'quiet'
+                            self.assertEqual(notices()[-1]['notice_kind'], expected_kind)
+                            self.assertEqual(notices()[-1]['elapsed'], (index + 1) * 600)
                             with self.assertRaises(PermissionError):
                                 c.events(other, task['id'])
                             requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
@@ -908,8 +971,10 @@ class NativeOwnerTests(unittest.TestCase):
                                 c.dialogue(client, task['id'], 'explicit revision', expected_turn=1, command_id='revision')
                             if gate == 'load1':
                                 c.cancel(client, task['id'])
-                            # Enter bounded loads near the next deadline without resetting the review clock.
+                            # Quiesce producer and drain queued prompt updates before advancing the clock.
                             if gate.startswith('prompt'):
+                                (root/('quiesce-'+gate)).touch()
+                                await_condition(lambda: quiesced[index // 2].is_set())
                                 clock[0] = (index+2)*600-1
                             (root/('release-'+gate)).touch()
                         thread.join(5)
@@ -939,9 +1004,33 @@ class NativeOwnerTests(unittest.TestCase):
             result, events, requests = self.run_question_replay([], [[tool]]*4)
         observation = result['native_observation']
         self.assertGreater(observation['last_success_at'], observation['last_semantic_change_at'])
-        self.assertEqual(len([e for e in events if e.get('quiet_notice')]), 3)
+        quiet_notices = [e for e in events if e.get('quiet_notice')]
+        self.assertEqual(len(quiet_notices), 3)
+        self.assertEqual([e.get('notice_kind') for e in quiet_notices], ['quiet', 'quiet', 'quiet'])
+        self.assertTrue(all(isinstance(e.get('elapsed'), int) and e['elapsed'] >= 600 for e in quiet_notices))
         self.assertEqual(len([e for e in events if e['kind']=='tool']), 1)
         self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests), 1)
+
+    def test_load_fresh_update_marks_review_checkpoint_before_quiet(self):
+        from types import SimpleNamespace
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += 15
+        tool1 = dict(sessionUpdate='tool_call', toolCallId='step1', title='read_board', status='in_progress')
+        tool2 = dict(sessionUpdate='tool_call', toolCallId='step2', title='swarm', status='in_progress')
+        timer = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 1000+clock[0], sleep=sleep)
+        with patch('agy_native.time', timer):
+            _, events, requests = self.run_question_replay([], [
+                [tool1],
+                [tool1, tool2],
+                [tool1, tool2],
+                [tool1, tool2],
+                [tool1, tool2],
+            ])
+        notices = [e for e in events if e.get('quiet_notice')]
+        self.assertEqual([n.get('notice_kind') for n in notices], ['checkpoint', 'quiet'])
+        self.assertEqual([n.get('elapsed') for n in notices], [600, 1200])
+        self.assertEqual(sum(r.get('method') == 'session/prompt' for r in requests), 1)
 
     def exercise_native_owner(self, missing_receipts=False):
         with tempfile.TemporaryDirectory() as directory:
@@ -1274,4 +1363,121 @@ class NativeOwnerTests(unittest.TestCase):
                 self.assertEqual([e['text'] for e in c.events(client, task['id']) if e['kind']=='answer' and e['turn']==2].count('same legitimate answer'), 2)
                 self.assertEqual(c.close(client, task['id'])['state'], 'closed')
 
-    
+    def test_deferred_question_settles_after_dialogue_supersede_seq_gap(self):
+        fake_agy = '''import json, os, sys, time
+from pathlib import Path
+state = Path(os.environ['FAKE_AGY_STATE'])
+prompt_count = 0
+last_dialogue_body = None
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\\n')
+    sys.stdout.flush()
+def notify(update):
+    send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': 'sess-1', 'update': update}})
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    rid, method, params = req.get('id'), req.get('method'), req.get('params', {})
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': 1, 'agentCapabilities': {'loadSession': True, 'sessionCapabilities': {'close': {}}}}})
+    elif method == 'session/new':
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {
+            'sessionId': 'sess-1',
+            'models': {'currentModelId': 'gemini-4-carbon-low', 'availableModels': [{'modelId': 'gemini-4-carbon-low'}]},
+            'configOptions': [
+                {'id': 'model', 'currentValue': 'gemini-4-carbon', 'options': [{'value': 'gemini-4-carbon'}]},
+                {'id': 'thought_level', 'currentValue': 'low', 'options': [{'value': 'low'}]},
+            ],
+        }})
+    elif method == 'session/prompt':
+        prompt_count += 1
+        text = ''.join(p.get('text', '') for p in params.get('prompt', []))
+        if prompt_count == 1:
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Foreground ack.\\n'}})
+        else:
+            last_dialogue_body = text
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Final answer after A.\\n'}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+    elif method == 'session/load':
+        if prompt_count == 1:
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\ninitial prompt'}})
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Foreground ack.\\nCALLCLI_QUESTION Q1 Pick A or B'}})
+            if not (state / 'first_load_done').exists():
+                (state / 'first_load_done').touch()
+            else:
+                deadline = time.monotonic() + 5
+                while not (state / 'proceed_load').exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        elif prompt_count >= 2:
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\ninitial prompt'}})
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Foreground ack.\\nCALLCLI_QUESTION Q1 Pick A or B'}})
+            if last_dialogue_body is not None:
+                notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': last_dialogue_body}})
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Final answer after A.\\n'}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {
+            'sessionId': 'sess-1',
+            'models': {'currentModelId': 'gemini-4-carbon-low', 'availableModels': [{'modelId': 'gemini-4-carbon-low'}]},
+            'configOptions': [
+                {'id': 'model', 'currentValue': 'gemini-4-carbon', 'options': [{'value': 'gemini-4-carbon'}]},
+                {'id': 'thought_level', 'currentValue': 'low', 'options': [{'value': 'low'}]},
+            ],
+        }})
+    elif method == 'session/close':
+        (state / 'closed').touch()
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {}})
+    elif method == 'session/set_config_option':
+        if (state / 'closed').exists():
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32602, 'message': 'Session not found'}})
+        else:
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'configOptions': [
+                {'id': 'model', 'currentValue': 'gemini-4-carbon', 'options': [{'value': 'gemini-4-carbon'}]},
+                {'id': 'thought_level', 'currentValue': 'low', 'options': [{'value': 'low'}]},
+            ]}})
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / 'state'
+            state_dir.mkdir()
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + fake_agy)
+            executable.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], FAKE_AGY_STATE=str(state_dir)), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', model='4cs', cwd=directory, prompt='initial prompt', write=False)
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1), daemon=True)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and thread.is_alive():
+                        st = c.status(client, task['id'])
+                        self.assertIn(st.get('state'), {'queued', 'running'}, st.get('settlement_note'))
+                        if (state_dir / 'first_load_done').exists() and st.get('native_observation', {}).get('question_blockers'):
+                            break
+                        time.sleep(0.01)
+                    st = c.status(client, task['id'])
+                    self.assertEqual(st.get('state'), 'running', st.get('settlement_note'))
+                    c.dialogue(client, task['id'], 'draft 1', expected_turn=1, command_id='d1')
+                    c.dialogue(client, task['id'], 'proceed with A', expected_turn=1, command_id='d2', target_command_id='d1')
+                    (state_dir / 'proceed_load').touch()
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive(), 'Deferred seq-gap task failed to settle')
+                    result = c.status(client, task['id'])
+                    self.assertEqual(result['state'], 'completed', result.get('settlement_note'))
+                    self.assertEqual(result['commands']['d1']['status'], 'superseded')
+                    self.assertEqual(result['commands']['d2']['status'], 'returned')
+                    self.assertEqual(result['native_observation']['question_blockers'], [])
+                    supersede_stages = [e for e in c.events(client, task['id'])
+                                        if e.get('kind') == 'stage' and 'Incomplete question superseded by returned dialogue d2' in e.get('text', '')]
+                    self.assertEqual(len(supersede_stages), 1)
+                    self.assertEqual(supersede_stages[0]['interaction_seq'], 0)
+                finally:
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(3)
+

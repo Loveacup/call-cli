@@ -1,5 +1,9 @@
 # Verification
 
+## Reviewed deployed-source update (2026-11-16)
+
+See [publication scope and boundaries](docs/publication-2026-11-16.md) for the reviewed runtime closure, history/dialogue and observability additions, intentional exclusions and remaining acceptance gaps. Earlier results below are historical; exact-commit post-push verification is reported separately, not inferred from the deployed snapshot.
+
 ## Public source update (2026-11-15)
 
 This publication includes native-skip defaults for new tasks, AGY invalid-output handling, native history/dialogue reconciliation, navigation-only response handling, structured-argv control identity, and explicit resource recovery. Source publication does not activate an installed adapter or modify existing tasks.

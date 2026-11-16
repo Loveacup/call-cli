@@ -33,6 +33,7 @@ class NativeOwner:
         self.model_config_value = None
         self.created_session = False
         self.prompt_returned = False
+        self.request_cancel_sent = False
         self.serial = 0
         self.buffer = b''
         self.permission_decisions = []
@@ -42,6 +43,12 @@ class NativeOwner:
         self.permission_handler = None
         self.workflow_identity = {}
         self.approval_wait_seconds = 0.0
+        self.pending_drained = []
+        self.drain_workflow_calls = set()
+        self.drained_public_text = ''
+        self.last_load_drained = 0
+        self.last_load_retried = False
+        self.pending_retry_state = None
         skip = (task.get('execution_policy') == 'native-skip'
                 or task.get('agy_approval') == 'skip-permissions')
         argv = ['agy', 'acp', '--disable-telemetry']
@@ -59,15 +66,21 @@ class NativeOwner:
         self.proc.stdin.flush()
 
     def notify_cancel(self):
+        if getattr(self, 'request_cancel_sent', False):
+            return
+        # A failed send has unknown effects; never replay it on this owner.
+        self.request_cancel_sent = True
         self.send(dict(method='session/cancel', params=dict(sessionId=self.session_id)))
 
     def request(self, method, params, *, timeout=60, check_cancel=None, on_update=None):
-        self.serial += 1
-        ident = self.serial
+        drain_mode = (method is None and params is None)
+        ident = None
         if method is not None:
+            self.serial += 1
+            ident = self.serial
             self.send(dict(id=ident, method=method, params=params))
         updates = []
-        workflow_calls = set()
+        workflow_calls = getattr(self, 'drain_workflow_calls', set()) if drain_mode else set()
         try:
             from .agy import fatal_error
         except ImportError:
@@ -76,23 +89,27 @@ class NativeOwner:
         def review():
             if not cancel_sent and not getattr(self, 'review_blocked', False) and self.review is not None:
                 self.review()
-        deadline = time.monotonic()+timeout if timeout is not None else None
+        deadline = None if drain_mode else (time.monotonic()+timeout if timeout is not None else None)
         cancel_sent = False
-        self.request_cancel_sent = False
         while True:
-            if method is None and params['command'] in self.available_commands:
+            if drain_mode and len(updates) >= 4096:
+                return {}, updates
+            if method is None and isinstance(params, dict) and params.get('command') in self.available_commands:
                 return {}, updates
             if check_cancel and check_cancel() and not cancel_sent:
                 self.notify_cancel()
                 cancel_sent = True
-                self.request_cancel_sent = True
+                if drain_mode:
+                    return {}, updates
                 deadline = time.monotonic()+25
             if deadline is not None and time.monotonic() >= deadline:
                 if method is None:
                     return {}, updates
                 raise ProtocolError('Native ACP control did not settle; effects unknown')
             if b'\n' not in self.buffer:
-                if not self.poller.select(.1):
+                if not self.poller.select(0 if drain_mode else .1):
+                    if drain_mode:
+                        return {}, updates
                     review()
                     continue
                 chunk = os.read(self.proc.stdout.fileno(), 65536)
@@ -106,7 +123,7 @@ class NativeOwner:
             except (ValueError, UnicodeError):
                 raise ProtocolError('Invalid native ACP frame') from None
             if frame.get('method') and 'id' in frame:
-                if method is None:
+                if method is None and not drain_mode:
                     self.send(dict(id=frame['id'],result=dict(outcome=dict(outcome='cancelled'))))
                     raise ProtocolError('Unexpected callback during capability observation; no prompt')
                 waited = getattr(self,'approval_wait_seconds',0.0)
@@ -135,21 +152,39 @@ class NativeOwner:
                             self.review_blocked = True
                     if on_update is not None:
                         on_update(update)
-            elif frame.get('id') == ident and not frame.get('method'):
-                if 'error' in frame:
-                    error = frame['error']
-                    self.last_rpc_error = error
-                    # Exact structured not-found is used only as close readback.
-                    if (error.get('code') == -32602 and error.get('message') in
-                            {'Session not found', 'Session not found: '+str(self.session_id)}):
-                        raise ProtocolError('session_not_found')
-                    raise ProtocolError('Native ACP request rejected: '+method)
-                if not isinstance(frame.get('result'), dict):
-                    raise ProtocolError('Native ACP omitted structured result')
-                if method == 'session/prompt':
-                    self.prompt_returned = True
-                return frame['result'], updates
-            review()
+            elif 'id' in frame and not frame.get('method'):
+                if method is None:
+                    raise ProtocolError('Unexpected native ACP response')
+                if frame.get('id') == ident:
+                    if 'error' in frame:
+                        error = frame['error']
+                        self.last_rpc_error = error
+                        # Exact structured not-found is used only as close readback.
+                        if (error.get('code') == -32602 and error.get('message') in
+                                {'Session not found', 'Session not found: '+str(self.session_id)}):
+                            raise ProtocolError('session_not_found')
+                        raise ProtocolError('Native ACP request rejected: '+method)
+                    if not isinstance(frame.get('result'), dict):
+                        raise ProtocolError('Native ACP omitted structured result')
+                    if method == 'session/prompt':
+                        self.prompt_returned = True
+                    return frame['result'], updates
+            if not drain_mode:
+                review()
+
+    def drain_pending(self, *, check_cancel=None):
+        try:
+            from .agy import fatal_error
+        except ImportError:
+            from agy import fatal_error
+        _, updates = self.request(None, None, timeout=0, check_cancel=check_cancel)
+        for update in updates:
+            self.pending_drained.append(update)
+            if update['sessionUpdate'] == 'agent_message_chunk':
+                self.drained_public_text = (self.drained_public_text + update['content']['text'])[-64000:]
+                if fatal_error(self.drained_public_text):
+                    self.review_blocked = True
+        return updates
 
     def validate_workflow_update(self, raw, calls):
         if raw.get('sessionUpdate') not in {'tool_call','tool_call_update'}:
@@ -253,11 +288,74 @@ class NativeOwner:
     def workspace(self):
         return dict(cwd=self.task['cwd'], mcpServers=[])
 
-    def load(self):
-        result, updates = self.request('session/load', dict(sessionId=self.session_id, **self.workspace()))
-        self.last_load_updates = updates
+    def load(self, *, reconcile_stream=False, check_cancel=None):
+        if not reconcile_stream:
+            result, updates = self.request('session/load', dict(sessionId=self.session_id, **self.workspace()))
+            self.last_load_updates = updates
+            if result.get('sessionId') != self.session_id:
+                raise ProtocolError('Native load identity mismatch')
+            return result, snapshot(updates)
+        self.last_load_retried = False
+        pre_drained = self.drain_pending(check_cancel=check_cancel)
+        self.last_load_drained = len(self.pending_drained)
+        if check_cancel and check_cancel():
+            return {}, []
+        result, updates = self.request(
+            'session/load', dict(sessionId=self.session_id, **self.workspace()), check_cancel=check_cancel
+        )
         if result.get('sessionId') != self.session_id:
             raise ProtocolError('Native load identity mismatch')
+        if check_cancel and check_cancel():
+            return result, []
+        prior_retry = getattr(self, 'pending_retry_state', None)
+        orphan, dup = _inverted_tool_counts(updates)
+        if orphan or dup:
+            self.last_load_retried = True
+            d1_updates = list(pre_drained) if prior_retry is not None else list(self.pending_drained)
+            for entry in updates:
+                if entry.get('sessionUpdate') == 'tool_call':
+                    self.pending_drained.append(dict(entry, _retry_create=(entry.get('tool_event') == 'tool_call')))
+            d2_updates = self.drain_pending(check_cancel=check_cancel)
+            self.last_load_drained += len(d2_updates)
+            if prior_retry is not None:
+                if pre_drained:
+                    prior_retry['d2_updates'] = list(prior_retry['d2_updates']) + list(pre_drained)
+                self.pending_retry_state = dict(
+                    d1_updates=[], attempt_updates=updates, d2_updates=d2_updates, prior=prior_retry,
+                )
+            else:
+                self.pending_retry_state = dict(
+                    d1_updates=d1_updates, attempt_updates=updates, d2_updates=d2_updates,
+                )
+            if check_cancel and check_cancel():
+                return {}, []
+            result, updates = self.request(
+                'session/load', dict(sessionId=self.session_id, **self.workspace()), check_cancel=check_cancel
+            )
+            if result.get('sessionId') != self.session_id:
+                raise ProtocolError('Native load identity mismatch')
+            if check_cancel and check_cancel():
+                return result, []
+            orphan, dup = _inverted_tool_counts(updates)
+            if orphan or dup:
+                try:
+                    err_snap = snapshot(updates)
+                except ProtocolError:
+                    err_snap = updates
+                raise ProtocolError(
+                    'Native history prefix changed; reconciliation required',
+                    history_diagnostic=_history_diagnostic(
+                        'inverted_tool_replay', (), err_snap,
+                        call_site='load', interaction_seq=None,
+                        orphan_tool_updates=orphan, duplicate_tool_creates=dup,
+                        load_retried=True, drained_before_load=self.last_load_drained,
+                    ),
+                )
+        elif prior_retry is not None and pre_drained:
+            prior_retry['d2_updates'] = list(prior_retry['d2_updates']) + list(pre_drained)
+        if hasattr(self, 'drain_workflow_calls'):
+            self.drain_workflow_calls.clear()
+        self.last_load_updates = updates
         return result, snapshot(updates)
 
     def select(self, metadata):
@@ -624,6 +722,309 @@ def first_replay(published, replay, *, call_site=None, interaction_seq=None):
     return fresh
 
 
+_TOOL_STATUS_RANK = {'pending': 0, 'in_progress': 1, 'completed': 2, 'failed': 2}
+
+
+def _inverted_tool_counts(updates):
+    created = set()
+    orphan_updates = 0
+    duplicate_creates = 0
+    for entry in updates:
+        if entry.get('sessionUpdate') != 'tool_call':
+            continue
+        tid = entry.get('toolCallId')
+        if not tid:
+            continue
+        event = entry.get('tool_event')
+        if event == 'tool_call':
+            if tid in created:
+                duplicate_creates += 1
+            created.add(tid)
+        elif event == 'tool_call_update' and tid not in created:
+            orphan_updates += 1
+    return orphan_updates, duplicate_creates
+
+
+def _agent_chunks(entries):
+    return [
+        e for e in (entries or ())
+        if e.get('sessionUpdate') == 'agent_message_chunk' and _entry_text(e)
+    ]
+
+
+def _text_len(entries):
+    return sum(len(_entry_text(e) or '') for e in entries)
+
+
+def _coalesce_message_slots(updates):
+    """Merge consecutive agent_message_chunk entries without crossing tool or user boundaries."""
+    slots = []
+    prev_was_agent = False
+    for entry in updates:
+        kind = entry.get('sessionUpdate')
+        if kind == 'agent_message_chunk':
+            text = _entry_text(entry)
+            if not text:
+                continue
+            if prev_was_agent and slots:
+                slots[-1] = dict(
+                    sessionUpdate='agent_message_chunk',
+                    content=dict(type='text', text=slots[-1]['content']['text'] + text),
+                )
+            else:
+                slots.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=text)))
+            prev_was_agent = True
+        elif kind in {'tool_call', 'user_message_chunk'}:
+            prev_was_agent = False
+    return slots
+
+
+def _reconcile_drained_tools(drained, history, *, call_site='drain_reconcile', interaction_seq=0):
+    """Validate raw drained and retry tool frames in wire order without collapsing via snapshot()."""
+    history_tools = {e['toolCallId']: e for e in history if e.get('sessionUpdate') == 'tool_call'}
+    seen_tools = {}
+    for entry in drained:
+        if entry.get('sessionUpdate') != 'tool_call':
+            continue
+        tid = entry.get('toolCallId')
+        if not tid:
+            raise ProtocolError('Tool history omitted identity')
+        clean = {k: v for k, v in entry.items() if k != '_retry_create'}
+        persisted = history_tools.get(tid)
+        if persisted is None:
+            raise ProtocolError(
+                'Native tool history changed; reconciliation required',
+                history_diagnostic=_history_diagnostic(
+                    'drained_tool_missing', [clean], (), index=0,
+                    background_growth=True, call_site=call_site, interaction_seq=interaction_seq,
+                ),
+            )
+        if ('swarm' not in clean and clean.get('title') in (None, '', 'swarm')
+                and 'swarm' in persisted and isinstance(clean.get('swarm_update'), dict)):
+            checked = dict(clean, swarm=clean['swarm_update'])
+        else:
+            checked = clean
+        if _tool_history_conflict(checked, persisted):
+            raise ProtocolError(
+                'Native tool history changed; reconciliation required',
+                history_diagnostic=_history_diagnostic(
+                    'drained_tool_conflict', [checked], [persisted], index=0,
+                    background_growth=True, call_site=call_site, interaction_seq=interaction_seq,
+                ),
+            )
+        d_status = _safe_tool_status(checked)
+        h_status = _safe_tool_status(persisted)
+        if d_status is not None:
+            prev_checked, prev_status = seen_tools.get(tid, (None, None))
+            if prev_status is not None:
+                if entry.get('_retry_create'):
+                    regressed = (
+                        prev_status in {'completed', 'failed'}
+                        and d_status in {'completed', 'failed'}
+                        and d_status != prev_status
+                    )
+                else:
+                    regressed = (
+                        _TOOL_STATUS_RANK[d_status] < _TOOL_STATUS_RANK[prev_status]
+                        or (prev_status in {'completed', 'failed'} and d_status != prev_status)
+                    )
+                if regressed:
+                    raise ProtocolError(
+                        'Native tool history changed; reconciliation required',
+                        history_diagnostic=_history_diagnostic(
+                            'drained_tool_status_regressed', [prev_checked], [checked], index=0,
+                            background_growth=True, call_site=call_site, interaction_seq=interaction_seq,
+                        ),
+                    )
+            if (h_status is None
+                    or _TOOL_STATUS_RANK[h_status] < _TOOL_STATUS_RANK[d_status]
+                    or (d_status in {'completed', 'failed'} and h_status != d_status)):
+                raise ProtocolError(
+                    'Native tool history changed; reconciliation required',
+                    history_diagnostic=_history_diagnostic(
+                        'drained_tool_status_regressed', [checked], [persisted], index=0,
+                        background_growth=True, call_site=call_site, interaction_seq=interaction_seq,
+                    ),
+                )
+            if prev_status is None or _TOOL_STATUS_RANK[d_status] >= _TOOL_STATUS_RANK[prev_status]:
+                seen_tools[tid] = (checked, d_status)
+
+
+def _reconcile_non_tail_slots(rem_slots, history_msgs, persisted_prior_slots, unpersisted_prior_msgs,
+                              *, call_site, interaction_seq):
+    """Verify non-tail slot growth against persisted prior slots and return trailing unconsumed text."""
+    if not persisted_prior_slots:
+        return None
+    if len(rem_slots) < len(persisted_prior_slots) or len(history_msgs) < len(rem_slots):
+        return None
+    for idx, p_slot in enumerate(persisted_prior_slots):
+        if not rem_slots[idx]['content']['text'].startswith(p_slot['content']['text']):
+            return None
+    if unpersisted_prior_msgs:
+        try:
+            first_replay(
+                unpersisted_prior_msgs,
+                rem_slots[len(persisted_prior_slots):],
+                call_site=call_site,
+                interaction_seq=interaction_seq,
+            )
+        except ProtocolError:
+            return None
+    rem_after_slots = []
+    for idx, r_slot in enumerate(rem_slots):
+        r_text = r_slot['content']['text']
+        h_text = history_msgs[idx]['content']['text']
+        allow_growth = idx < len(persisted_prior_slots) or idx == len(rem_slots) - 1
+        if allow_growth:
+            if not h_text.startswith(r_text):
+                return None
+            delta = h_text[len(r_text):]
+            if delta:
+                rem_after_slots.append(
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=delta))
+                )
+        elif h_text != r_text:
+            return None
+    rem_after_slots.extend(history_msgs[len(rem_slots):])
+    return rem_after_slots
+
+
+def _reconcile_retry_messages(retry_state, history_msgs, reconciled_msgs, prior_messages,
+                              persisted_prior_slots, *, call_site, interaction_seq):
+    """Reconcile D1 -> Attempt #1 -> D2 message streams fail-closed without guessing by user chunks."""
+    if retry_state.get('prior') is not None:
+        rem_base = _reconcile_retry_messages(
+            retry_state['prior'], history_msgs, reconciled_msgs,
+            prior_messages, persisted_prior_slots,
+            call_site=call_site, interaction_seq=interaction_seq,
+        )
+    else:
+        rem_base = reconciled_msgs
+
+    d1_msgs = _agent_chunks(retry_state.get('d1_updates'))
+    rem_after_d1 = (
+        first_replay(d1_msgs, rem_base, call_site=call_site, interaction_seq=interaction_seq)
+        if d1_msgs else rem_base
+    )
+
+    attempt_updates = retry_state.get('attempt_updates') or ()
+    msg_indices = [
+        i for i, e in enumerate(attempt_updates)
+        if e.get('sessionUpdate') == 'agent_message_chunk' and _entry_text(e)
+    ]
+    if not msg_indices:
+        rem_for_d2 = rem_after_d1
+    else:
+        attempt_msgs = [attempt_updates[i] for i in msg_indices]
+        unpersisted_prior = prior_messages[len(persisted_prior_slots):]
+        rem_for_d2 = None
+        last_exc = None
+        for split in range(len(attempt_msgs) + 1):
+            pre_msgs = attempt_msgs[:split]
+            if pre_msgs:
+                try:
+                    rem_after_pre = first_replay(
+                        pre_msgs, rem_after_d1, call_site=call_site, interaction_seq=interaction_seq,
+                    )
+                except ProtocolError as exc:
+                    last_exc = exc
+                    continue
+            else:
+                rem_after_pre = rem_after_d1
+
+            if split == len(attempt_msgs):
+                rem_for_d2 = rem_after_pre
+                break
+
+            found = False
+            for end in range(len(attempt_msgs), split, -1):
+                saved_part = attempt_msgs[split:end]
+                post_msgs = attempt_msgs[end:]
+                rem_after_saved = None
+                try:
+                    if prior_messages:
+                        first_replay(
+                            prior_messages, saved_part,
+                            call_site=call_site, interaction_seq=interaction_seq,
+                        )
+                    rem_after_r = first_replay(
+                        saved_part, history_msgs,
+                        call_site=call_site, interaction_seq=interaction_seq,
+                    )
+                    rem_after_saved = (
+                        rem_after_pre
+                        if _text_len(rem_after_pre) <= _text_len(rem_after_r)
+                        else rem_after_r
+                    )
+                except ProtocolError as exc:
+                    last_exc = exc
+                    slice_start = msg_indices[split]
+                    slice_stop = msg_indices[end - 1] + 1
+                    rem_slots = _coalesce_message_slots(attempt_updates[slice_start:slice_stop])
+                    rem_after_slots = _reconcile_non_tail_slots(
+                        rem_slots, history_msgs, persisted_prior_slots, unpersisted_prior,
+                        call_site=call_site, interaction_seq=interaction_seq,
+                    )
+                    if rem_after_slots is not None:
+                        rem_after_saved = (
+                            rem_after_pre
+                            if _text_len(rem_after_pre) <= _text_len(rem_after_slots)
+                            else rem_after_slots
+                        )
+
+                if rem_after_saved is None:
+                    continue
+
+                if post_msgs:
+                    try:
+                        rem_for_d2 = first_replay(
+                            post_msgs, rem_after_saved,
+                            call_site=call_site, interaction_seq=interaction_seq,
+                        )
+                    except ProtocolError as exc:
+                        last_exc = exc
+                        continue
+                else:
+                    rem_for_d2 = rem_after_saved
+                found = True
+                break
+            if found:
+                break
+
+        if rem_for_d2 is None:
+            raise last_exc
+
+    d2_msgs = _agent_chunks(retry_state.get('d2_updates'))
+    if d2_msgs:
+        return first_replay(d2_msgs, rem_for_d2, call_site=call_site, interaction_seq=interaction_seq)
+    return rem_for_d2
+
+
+def _reconcile_drained(drained, history, fresh, recovered, *, retry_state=None, prior_messages=(),
+                       persisted_prior_slots=(), call_site='drain_reconcile', interaction_seq=0):
+    if not drained and retry_state is None:
+        return
+    _reconcile_drained_tools(drained, history, call_site=call_site, interaction_seq=interaction_seq)
+    recovered_msgs = [
+        dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=suffix))
+        for _, suffix, _ in recovered if suffix
+    ]
+    reconciled_msgs = recovered_msgs + _agent_chunks(fresh)
+    if retry_state is None:
+        drained_msgs = _coalesce_message_slots(
+            [e for e in drained if e.get('sessionUpdate') != 'user_message_chunk']
+        )
+        if drained_msgs:
+            first_replay(drained_msgs, reconciled_msgs, call_site=call_site, interaction_seq=interaction_seq)
+        return
+    history_msgs = _agent_chunks(history)
+    _reconcile_retry_messages(
+        retry_state, history_msgs, reconciled_msgs,
+        list(prior_messages), list(persisted_prior_slots),
+        call_site=call_site, interaction_seq=interaction_seq,
+    )
+
+
 
 
 
@@ -785,16 +1186,21 @@ def run_native(store, task, emit, policy):
             decoder = EventDecoder()
             live_updates = []
             def publish_update(entry):
+                nonlocal last_visible
                 live_updates.append(entry)
+                if entry.get('sessionUpdate') != 'user_message_chunk':
+                    last_visible = time.monotonic()
                 for kind, text in decoder.feed(dict(params=dict(update=entry))):
                     emit(kind, text)
-            last_notice = time.monotonic()
+            started_at = last_notice = last_visible = time.monotonic()
             def review():
                 nonlocal last_notice
                 now = time.monotonic()
                 if (not owner.review_blocked and now-last_notice >= 600
                         and store.get(task['id'])['state'] == 'running'):
-                    emit('stage', 'Coordinator review requested: native work pending; no cancellation or prompt sent.', quiet_notice=True)
+                    notice_kind = 'quiet' if now - last_visible >= 600 else 'checkpoint'
+                    emit('stage', 'Coordinator review requested: native work pending; no cancellation or prompt sent.',
+                         quiet_notice=True, notice_kind=notice_kind, elapsed=int(now - started_at))
                     last_notice = now
             # One cooldown across foreground, dialogue and passive observation requests.
             owner.review = review
@@ -831,10 +1237,12 @@ def run_native(store, task, emit, policy):
             blocker_notice = None
             while True:
                 if check_cancel():
-                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates), first=previous is None)
-                _, history = owner.load()
+                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates),
+                                          notify=not getattr(owner, 'request_cancel_sent', False), first=previous is None)
+                _, history = owner.load(reconcile_stream=True, check_cancel=check_cancel)
                 if check_cancel():
-                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates), first=previous is None)
+                    return cancel_cleanup(previous if previous is not None else snapshot(live_updates),
+                                          notify=not getattr(owner, 'request_cancel_sent', False), first=previous is None)
                 comparison = previous
                 recovered = []
                 if previous is not None and deferred_questions:
@@ -866,6 +1274,7 @@ def run_native(store, task, emit, policy):
                     fresh_sections = {seq: additions(old_sections.get(seq, []), section, background_growth=True,
                         call_site='section', interaction_seq=seq)
                         for seq, section in new_sections.items()}
+                pre_load_dialogue = dialogue_public
                 if dialogue_public is not None:
                     if current_interaction not in fresh_sections:
                         raise ProtocolError('Native dialogue replay boundary missing; reconciliation required',
@@ -876,6 +1285,19 @@ def run_native(store, task, emit, policy):
                         call_site='dialogue_replay', interaction_seq=current_interaction)
                     dialogue_public = None
                 fresh = [e for section in fresh_sections.values() for e in section]
+                prior_base = previous if previous is not None else (list(baseline) + list(previous_public))
+                prior_messages = _agent_chunks(prior_base) + _agent_chunks(pre_load_dialogue if previous is not None else ())
+                persisted_prior_slots = _agent_chunks(previous if previous is not None else baseline)
+                _reconcile_drained(
+                    owner.pending_drained, history, fresh, recovered,
+                    retry_state=getattr(owner, 'pending_retry_state', None),
+                    prior_messages=prior_messages,
+                    persisted_prior_slots=persisted_prior_slots,
+                    call_site='drain_reconcile', interaction_seq=current_interaction,
+                )
+                owner.pending_drained.clear()
+                owner.pending_retry_state = None
+                owner.drained_public_text = ''
                 for deferred, suffix, boundary in recovered:
                     update = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=suffix))
                     for kind, text in deferred['decoder'].feed(dict(params=dict(update=update))):
@@ -898,8 +1320,11 @@ def run_native(store, task, emit, policy):
                             emit(kind, text, interaction_seq=seq)
                 previous = history
                 now = time.time()
-                if fresh or any(suffix or boundary for _, suffix, boundary in recovered) or last_semantic_change is None:
+                has_recovery = any(suffix or boundary for _, suffix, boundary in recovered)
+                if fresh or has_recovery or last_semantic_change is None:
                     last_semantic_change = now
+                if any(e.get('sessionUpdate') != 'user_message_chunk' for e in fresh) or has_recovery:
+                    last_visible = time.monotonic()
                 # Persist only reconciled successful loads, never partial RPC updates.
                 store.update(task['id'], native_snapshot=[e for e in history if e['sessionUpdate'] != 'user_message_chunk'],
                     native_permission_decisions=owner.permission_decisions,
@@ -924,6 +1349,9 @@ def run_native(store, task, emit, policy):
                 current_text = '\n'.join(e['content']['text'] for e in turn_history if e['sessionUpdate'] == 'agent_message_chunk')
                 if fatal_error(current_text):
                     raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
+                owner.drain_pending(check_cancel=check_cancel)
+                if owner.pending_drained:
+                    continue
                 entry = store.native_dialogue_claim(*binding)
                 if entry is not None:
                     if pending_question(decoder):
@@ -940,15 +1368,19 @@ def run_native(store, task, emit, policy):
                     else:
                         for kind, text in decoder.finish():
                             emit(kind, text)
+                    prev_interaction = current_interaction
                     current_interaction = entry['interaction_seq']
                     dialogue_live = []
                     def publish_dialogue(update):
+                        nonlocal last_visible
                         dialogue_live.append(update)
+                        if update.get('sessionUpdate') != 'user_message_chunk':
+                            last_visible = time.monotonic()
                         for kind, text in decoder.feed(dict(params=dict(update=update))):
                             emit(kind, text)
                     emit('stage', 'Dialogue '+entry['command_id']+' claimed; not yet sent.')
                     interaction_body = dialogue_body(task, entry)
-                    if deferred_questions and deferred_questions[-1]['interaction_seq'] == current_interaction-1:
+                    if deferred_questions and deferred_questions[-1]['interaction_seq'] == prev_interaction:
                         deferred_questions[-1].update(replacement_command=entry['command_id'],
                             replacement_body=interaction_body)
                     store.native_dialogue_state(*binding, entry['command_id'], 'send_started')
@@ -1003,10 +1435,12 @@ def run_native(store, task, emit, policy):
                             'board_navigation_only' if board_hint else 'native_handoff_only')
                         store.update(task['id'],native_observation=observation)
                         review()
+                        owner.drain_pending(check_cancel=check_cancel)
                         time.sleep(.1)
                         continue
                     if not result_decoder.final_answer.strip():
                         review()
+                        owner.drain_pending(check_cancel=check_cancel)
                         time.sleep(.1)
                         continue
                     # A reviewed, unbound input can replace an incomplete interview,
@@ -1024,6 +1458,7 @@ def run_native(store, task, emit, policy):
                                 interaction_seq=deferred['interaction_seq'])
                     if deferred_questions:
                         review()
+                        owner.drain_pending(check_cancel=check_cancel)
                         time.sleep(.1)
                         continue
                     observation = current['native_observation']
@@ -1051,9 +1486,11 @@ def run_native(store, task, emit, policy):
                 review()
                 # Observation interval, never an execution deadline or generation prompt.
                 for _ in range(20):
+                    owner.drain_pending(check_cancel=check_cancel)
                     current = store.get(task['id'])
-                    if current['state'] == 'cancelling' or any(c.get('kind')=='dialogue' and c.get('status')=='accepted'
-                            for c in current.get('commands', {}).values()):
+                    if (owner.pending_drained or current['state'] == 'cancelling'
+                            or any(c.get('kind')=='dialogue' and c.get('status')=='accepted'
+                                   for c in current.get('commands', {}).values())):
                         break
                     time.sleep(.1)
     except ProtocolError as exc:
@@ -1069,6 +1506,9 @@ def run_native(store, task, emit, policy):
             diag = dict(exc.history_diagnostic, turn=task['turn'])
             if diag.get('interaction_seq') is None and 'current_interaction' in locals():
                 diag['interaction_seq'] = current_interaction
+            if owner is not None:
+                diag.setdefault('drained_before_load', getattr(owner, 'last_load_drained', 0))
+                diag.setdefault('load_retried', getattr(owner, 'last_load_retried', False))
             observation = dict(store.get(task['id']).get('native_observation') or {})
             observation.setdefault('turn', task['turn'])
             observation['history_diagnostic'] = diag

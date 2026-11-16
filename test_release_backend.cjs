@@ -200,5 +200,13 @@ function adapter({badReadback=false,replacement=false,badBefore}={}) {
   assert.equal((await closeTarget({...target, agent: 'omp'}, winDeps)).verified, true);
   assert.ok(winResolved.some(a => a.includes('omp.exe')));
 
+  // Reject closeTarget when details.status indicates running or unknown non-idle state.
+  for (const [statusVal, expectedReason] of [['running', 'session_running'], ['starting', 'session_status_unknown']]) {
+    const runningBad = adapter({badBefore: {details: {cwd: target.cwd, closed: false, status: statusVal}}});
+    await assert.rejects(closeTarget(target, runningBad.deps),
+      error => failureReason(error) === expectedReason);
+    assert.equal(runningBad.closes(), 0);
+  }
+
   console.log('STRICT_NATIVE_RELEASE_PROOF_OK');
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -2,9 +2,9 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
 const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']);
-const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'question_id', 'command_id', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
+const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'group', 'question_id', 'command_id', 'target_command_id', 'withdraw', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
-const visible = new Set(['stage', 'question', 'permission', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
+const visible = new Set(['stage', 'question', 'permission', 'diagnostic', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
 
 function bridgeRequest(request) {
   return new Promise((resolve, reject) => {
@@ -34,8 +34,12 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
   let generation = 0;
   const identity = ctx => ({session_id: ctx.sessionManager.getSessionId(), agent_id: ctx.agent.id});
   const key = ctx => JSON.stringify(identity(ctx));
+  const hostContext = ctx => {
+    const name = typeof ctx?.sessionManager?.getSessionName === 'function' ? ctx.sessionManager.getSessionName() : '';
+    return {session_name: typeof name === 'string' ? name : ''};
+  };
   const live = (binding, ctx) => generation === binding.generation && key(ctx) === binding.key && bindings.get(binding.key) === binding;
-  const call = (binding, args) => request({db, host: binding.host, capability: binding.capability, args});
+  const call = (binding, args, extra = {}) => request({db, host: binding.host, capability: binding.capability, ...extra, args});
 
   function schedule(binding, ctx) {
     if (!live(binding, ctx) || binding.timer || binding.reading || ![...binding.tasks.values()].some(track => track.active)) return;
@@ -108,7 +112,13 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       if (args && Object.hasOwn(args, 'timeout')) throw new Error('call_cli_omp does not accept timeout; omit it. Explicit execution budgets remain available through CLI/Python start.');
       if (args && Object.hasOwn(args, 'clear_timeout') && !['reply', 'intervene'].includes(args.action)) throw new Error('clear_timeout requires reply or intervene');
       if (!args || Object.keys(args).some(name => !fields.has(name)) || !actions.has(args.action)) throw new Error('Unsupported action or host field');
+      if (Object.hasOwn(args, 'group') && args.group !== undefined) {
+        if (!['start', 'list'].includes(args.action)) throw new Error('group requires start or list');
+        if (typeof args.group !== 'string' || !args.group.trim()) throw new Error('group must be a non-empty string');
+      }
       if (args.action === 'dialogue' && (!args.command_id || !Number.isInteger(args.expected_turn) || args.expected_turn < 1)) throw new Error('dialogue requires expected_turn and stable command_id');
+      if (Object.hasOwn(args, 'target_command_id') && args.target_command_id !== undefined && args.action !== 'dialogue') throw new Error('target_command_id requires dialogue');
+      if (Object.hasOwn(args, 'withdraw') && args.withdraw !== undefined && (args.action !== 'dialogue' || typeof args.withdraw !== 'boolean')) throw new Error('withdraw requires dialogue and a boolean');
       if (args.action === 'release_only' && (!Number.isInteger(args.expected_turn) || args.expected_turn < 1)) throw new Error('release_only requires observed expected_turn');
       if (Object.hasOwn(args, 'abandon') && (args.action !== 'release_only' || typeof args.abandon !== 'boolean')) throw new Error('abandon requires release_only and a boolean');
       const bindingKey = key(ctx);
@@ -131,7 +141,7 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
         try {binding = await pending;}
         finally {if (pendingBindings.get(bindingKey) === pending) pendingBindings.delete(bindingKey);}
       }
-      const result = await call(binding, args);
+      const result = await call(binding, args, args.action === 'start' ? {host_context: hostContext(ctx)} : {});
       if (!live(binding, ctx)) throw new Error('Host session changed; action outcome must be reconciled, not replayed');
       if (result.task) {
         const id = result.task.id;
@@ -181,7 +191,11 @@ export default function register(pi) {
       agy_mode: z.enum(['single', 'swarm', 'teamwork', 'dynamic']).optional().describe('Explicit execution mode; native modes require their advertised command; default skip-permissions executes Dynamic /run-workflow natively (explicit non-skip preserves script approval)'),
       permission_id: z.string().optional(), script_sha256: z.string().optional(), decision: z.enum(['allow_once', 'reject_once']).optional(),
       skills: z.array(z.object({path: z.string(), mode: z.enum(['required', 'optional', 'reference']), location: z.enum(['origin', 'target']).optional()})).optional(),
-      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'), expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue and release_only'), after: z.number().optional()}).strict(),
+      group: z.string().optional().describe('Optional lightweight task group label; filters list within this bound host session only'),
+      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'),
+      target_command_id: z.string().optional().describe('Optional dialogue-only target command_id to withdraw or supersede while still accepted'),
+      withdraw: z.boolean().optional().describe('Optional dialogue-only flag to withdraw target_command_id without sending a new prompt'),
+      expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue and release_only'), after: z.number().optional()}).strict(),
     async execute(_id, args, _signal, _onUpdate, ctx) {
       const result = await adapter.execute(args, ctx);
       return {content: [{type: 'text', text: JSON.stringify(result)}]};

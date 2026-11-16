@@ -487,6 +487,9 @@ class AcpxBackend:
                 note = ((note+' ') if note else '')+('Local transport cleanup did not settle after the authoritative result; '
                         'remote outcome must be reconciled; no automatic replay.')
             settled = rc == 0 and not decoder.failed and decoder.stop_reason in {'cancelled', 'end_turn'}
+            missing_final = (settled and not cancelling and not cleanup_expired
+                             and decoder.stop_reason == 'end_turn' and state == 'completed'
+                             and not decoder.final_answer.strip() and not decoder.error_category)
             if settled and not cancelling and decoder.stop_reason == 'end_turn' and state == 'completed' and not decoder.final_answer.strip() and not note:
                 note = ('Protocol ended with no final answer (or none after the last tool event); '
                         'stage, skill reports and tool status are not completion evidence. '
@@ -529,6 +532,15 @@ class AcpxBackend:
                 emit('diagnostic', diagnostic, stage=diagnostic_stage, reason_code=diagnostic_reason,
                      acceptance_observed=decoder.prompt_started)
                 note = ((note+' ') if note else '')+diagnostic
+            if missing_final and not decoder.diagnostic:
+                reason_code = ('tool_failed_no_final_answer' if decoder.tool_failed
+                               else 'no_post_tool_final_answer' if decoder.tool_seen
+                               else 'no_final_answer')
+                settlement = dict(turn=task['turn'], request_id=request_id,
+                                  protocol_settled=True, reason_code=reason_code)
+                if task.get('launch_id'):
+                    settlement['launch_id'] = task['launch_id']
+                store.update(task_id, turn_settlement=settlement)
             return TurnResult(state, rc, decoder.stop_reason, note)
         except Exception:
             # Exception text and subprocess stderr can contain prompts or credentials.

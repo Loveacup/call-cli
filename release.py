@@ -478,6 +478,20 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
     return recover_native(store, origin, task_id, expected_turn, 'close', backend)
 
 
+def _settled_close_eligible(task):
+    if task.get('state') != 'unknown' or task.get('runner_pid'):
+        return False
+    ts = task.get('turn_settlement')
+    if not isinstance(ts, dict) or ts.get('protocol_settled') is not True:
+        return False
+    req = task.get('backend_request_id')
+    if ts.get('turn') != task.get('turn') or not req or ts.get('request_id') != req:
+        return False
+    if task.get('launch_id') and ts.get('launch_id') != task.get('launch_id'):
+        return False
+    return True
+
+
 def recover_native(store, origin, task_id, expected_turn, operation, backend=None, *, abandon=False):
     """Host-authenticated exact-task recovery, with explicit resource abandonment."""
     import dataclasses
@@ -597,14 +611,18 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
                        (task_id,1,json.dumps(current),canonical(receipt)))
             Release._publish(db,current,receipt)
         elif operation == 'close':
-            # Existing uncertainty is reconciled, never another external close.
-            operation = 'reconcile'
+            existing_receipt = json.loads(fence[0])
+            has_close_attempt = any(a.get('operation') == 'close' for a in existing_receipt.get('attempts', []))
+            if not (_settled_close_eligible(current) and not has_close_attempt):
+                # Existing uncertainty is reconciled, never another external close.
+                operation = 'reconcile'
     if operation == 'close':
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT data,receipt FROM release_fences WHERE task=?',(task_id,)).fetchone()
             reserved, receipt = json.loads(row[0]), json.loads(row[1])
-            if receipt['state'] == 'released' or receipt.get('attempts'):
+            has_close = any(a.get('operation') == 'close' for a in receipt.get('attempts', []))
+            if receipt['state'] == 'released' or (has_close if _settled_close_eligible(reserved) else receipt.get('attempts')):
                 return receipt
             receipt['attempts'].append(dict(number=1,operation='close',stage='close',
                                            reason_code='in_progress',started_at=time.time()))

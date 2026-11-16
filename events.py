@@ -35,6 +35,7 @@ class EventDecoder:
         self.error_category = None
         self.error_source = None
         self.tool_failed = False
+        self.tool_seen = False
         self.final_answer = ''
         self.tool_details = {}
         self.tool_summaries = {}
@@ -103,6 +104,7 @@ class EventDecoder:
             # Text blocks often omit a trailing newline. A tool boundary ends
             # the preceding public block; publish it before the tool runs.
             out = self.finish() if text_boundary else []
+            self.tool_seen = True
             self.final_answer = ''
             self.tool_failed |= update.get('status') == 'failed'
             tool_id = safe_tool_id(update.get('toolCallId', ''))

@@ -36,8 +36,12 @@ def review_gate(name):
         return False
     import select
     (root/('waiting-'+name)).touch()
+    quiesced = False
     while not (root/('release-'+name)).exists():
-        if (root/('active-'+name)).exists():
+        if not quiesced and (root/('quiesce-'+name)).exists():
+            quiesced = True
+            update(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text='quiesced-'+name)))
+        if not quiesced and (root/('active-'+name)).exists():
             update(dict(sessionUpdate='tool_call_update', toolCallId='read', status='completed'))
         if select.select([sys.stdin], [], [], .01)[0]:
             pending = json.loads(sys.stdin.readline())

@@ -1325,6 +1325,45 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
             self.store.update(b['id'],state='cancelling')
             self.assertEqual(fb.result(timeout=5),0)
 
+    def test_post_tool_missing_final_answer_records_settled_observation_and_keeps_unknown(self):
+        import contextlib, io, json, os
+        from unittest.mock import patch
+        tool_ok = {'toolCallId': 'read1', 'kind': 'read', 'status': 'completed'}
+        tool_fail = {'toolCallId': 'shell1', 'kind': 'execute', 'status': 'failed'}
+        cases = [
+            ('no_post_tool_final_answer', ['Partial before tool\n'],
+             {'ACPX_FAKE_TRAILING_TOOLS': json.dumps([tool_ok])}, 'no_post_tool_final_answer'),
+            ('tool_failed_no_final_answer', ['CALLCLI_STAGE running\n'],
+             {'ACPX_FAKE_TOOLS': json.dumps([tool_fail])}, 'tool_failed_no_final_answer'),
+            ('no_final_answer', ['CALLCLI_STAGE only stage\n'], {}, 'no_final_answer'),
+        ]
+        for name, chunks, extra, expected_reason in cases:
+            with self.subTest(case=name):
+                task = self.task('synthetic settled missing final')
+                with patch.dict(os.environ, dict(extra, ACPX_FAKE_CHUNKS=json.dumps(chunks))), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    rc = __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
+                result = self.store.get(task['id'], self.origin)
+                self.assertEqual((rc, result['state'], result['exit_code'], result['stop_reason']),
+                                 (1, 'unknown', 0, 'end_turn'))
+                ts = result.get('turn_settlement')
+                self.assertIsInstance(ts, dict)
+                self.assertTrue(ts.get('protocol_settled'))
+                self.assertEqual(ts.get('turn'), result['turn'])
+                self.assertEqual(ts.get('request_id'), result.get('backend_request_id'))
+                self.assertEqual(ts.get('launch_id'), result.get('launch_id'))
+                self.assertEqual(ts.get('reason_code'), expected_reason)
+        for fail_env in ({'ACPX_FAKE_EXIT': '1'}, {'ACPX_FAKE_RESULT_FAILED': '1'}):
+            with self.subTest(fail_env=fail_env):
+                task = self.task('synthetic unsettled failure')
+                with patch.dict(os.environ, dict(fail_env, ACPX_FAKE_CHUNKS=json.dumps(['Partial\n']),
+                                                 ACPX_FAKE_TRAILING_TOOLS=json.dumps([tool_ok]))), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    rc = __import__('test_dispatch').run_dispatched(self.store.path, task['id'])
+                result = self.store.get(task['id'], self.origin)
+                self.assertEqual((rc, result['state']), (1, 'unknown'))
+                self.assertFalse((result.get('turn_settlement') or {}).get('protocol_settled'))
+
 
 if __name__ == '__main__':
     unittest.main()

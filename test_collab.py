@@ -85,6 +85,20 @@ class CollaborationTests(unittest.TestCase):
         self.assertEqual((result['state'], result['turn']), ('running', 1))
         self.assertEqual(result['commands']['d1']['status'], 'accepted')
         self.assertEqual((len(self.launches), self.controls), (1, []))
+        sup_out = StringIO()
+        with patch.object(collab, 'Collaboration', return_value=self.c), redirect_stdout(sup_out):
+            rc = collab.main(['--db', str(self.db), '--client', client, 'dialogue', '--task', task['id'],
+                '--prompt', 'revise 2', '--expected-turn', '1', '--command-id', 'd2', '--target-command-id', 'd1'])
+        self.assertEqual(rc, 0, sup_out.getvalue())
+        sup_res = json.loads(sup_out.getvalue())
+        self.assertEqual(sup_res['commands']['d1']['status'], 'superseded')
+        self.assertEqual(sup_res['commands']['d2']['status'], 'accepted')
+        wd_out = StringIO()
+        with patch.object(collab, 'Collaboration', return_value=self.c), redirect_stdout(wd_out):
+            rc = collab.main(['--db', str(self.db), '--client', client, 'dialogue', '--task', task['id'],
+                '--expected-turn', '1', '--command-id', 'w2', '--target-command-id', 'd2', '--withdraw'])
+        self.assertEqual(rc, 0, wd_out.getvalue())
+        self.assertEqual(json.loads(wd_out.getvalue())['commands']['d2']['status'], 'withdrawn')
 
     def test_new_tasks_without_budget_remain_cancellable_and_legacy_budgets_survive(self):
         client = self.c.connect('omp')['client_id']
@@ -450,3 +464,41 @@ class CollaborationTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM clients').fetchone()[0], 2)
         with self.assertRaises(ValueError): self.c.connect('unsupported-runtime')
         with self.assertRaises(PermissionError): self.c.origin('missing')
+
+    def test_standalone_group_origin_context_runtime_links_and_isolation(self):
+        from unittest.mock import patch
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        a = self.c.connect('omp')['client_id']
+        b = self.c.connect('pi')['client_id']
+        t1 = self.c.start(a, prompt='one', cwd='/project', group=' alpha ')
+        t2 = self.c.start(a, prompt='two', cwd='/project', group='beta')
+        tb = self.c.start(b, prompt='three', cwd='/project', group='alpha')
+        self.assertEqual(t1['group'], 'alpha')
+        self.assertEqual(t1['origin_context']['surface'], 'standalone')
+        self.assertEqual(t1['origin_context']['platform'], 'omp')
+        self.assertEqual(t1['origin_context']['display_name'], 'unknown')
+        self.assertEqual(t1['runtime_links']['task_id'], t1['id'])
+        self.assertEqual([t['id'] for t in self.c.list(a, group='alpha')], [t1['id']])
+        self.assertEqual(self.c.list(a, group='alpha')[0]['runtime_links']['task_id'], t1['id'])
+        self.assertEqual([t['id'] for t in self.c.list(b, group='alpha')], [tb['id']])
+        self.assertNotIn(tb['id'], [t['id'] for t in self.c.list(a, group='alpha')])
+        self.assertEqual(self.c.status(a, t1['id'])['runtime_links']['session'], t1['session'])
+
+        def run_cli(*argv):
+            out = StringIO()
+            with redirect_stdout(out), patch.object(collab, 'Collaboration', return_value=self.c):
+                rc = collab.main(['--db', str(self.db), '--client', a, *argv])
+            return rc, json.loads(out.getvalue())
+
+        rc, cli_task = run_cli('start', '--cwd', '/project', '--prompt', 'via cli', '--group', 'cli-grp')
+        self.assertEqual(rc, 0)
+        self.assertEqual(cli_task['group'], 'cli-grp')
+        self.assertEqual(cli_task['runtime_links']['task_id'], cli_task['id'])
+        rc, cli_list = run_cli('list', '--group', 'cli-grp')
+        self.assertEqual(rc, 0)
+        self.assertEqual([t['id'] for t in cli_list], [cli_task['id']])
+        with self.assertRaises(ValueError):
+            self.c.list(a, group='')
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            collab.main(['--db', str(self.db), '--client', a, 'start', '--cwd', '/project', '--prompt', 'x', '--goal', 'bad'])
