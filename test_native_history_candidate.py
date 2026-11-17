@@ -42,7 +42,7 @@ class HistoryRaceTests(unittest.TestCase):
                 self.assertEqual(state['questions'], [])
                 self.assertTrue((root/'closed-session').exists())
 
-    def test_tampering_never_settles_or_unloads(self):
+    def test_non_safety_history_races_degrade_and_complete_without_prompt_replay(self):
         for race in ('rewrite', 'delete', 'live-rewrite', 'missing-boundary'):
             with self.subTest(race=race), patch.dict(os.environ, AGY_NATIVE_HISTORY_RACE=race):
                 with self.workspace('question') as (root, c, client, task, thread):
@@ -54,11 +54,16 @@ class HistoryRaceTests(unittest.TestCase):
                     thread.join(5)
                     self.assertFalse(thread.is_alive())
                     state = c.status(client, task['id'])
-                    self.assertEqual(state['state'], 'unknown')
-                    self.assertNotIn('native_result', state)
-                    self.assertNotIn('native_cleanup', state)
-                    self.assertFalse((root/'closed-session').exists())
+                    self.assertEqual(state['state'], 'completed', state.get('settlement_note'))
+                    self.assertTrue(state['native_observation'].get('history_degraded'))
+                    self.assertIsInstance(state['native_observation'].get('history_diagnostic'), dict)
+                    self.assertEqual(state['native_result']['interaction_seq'], 1)
+                    self.assertIn(state['native_result']['result'], {'Revised answer', 'Tampered answer', 'Late background answer\nRevised answer'})
+                    self.assertEqual(state['questions'], [])
                     self.assertEqual(len([e for e in c.events(client, task['id']) if e['kind']=='question']), 1)
+                    self.assertTrue((root/'closed-session').exists())
+                    requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
+                    self.assertEqual(sum(r.get('method') == 'session/prompt' for r in requests), 2)
 
     def test_two_dialogues_preserve_older_background_interaction(self):
         with patch.dict(os.environ, AGY_NATIVE_HISTORY_RACE='multi'):
@@ -279,21 +284,27 @@ class HistoryRaceTests(unittest.TestCase):
                                           kwargs=dict(turn=1, launch_id=task['launch_id'], epoch=1))
                 thread.start()
                 try:
-                    deadline = time.monotonic() + 4
+                    deadline = time.monotonic() + 8
                     while time.monotonic() < deadline:
                         if c.status(client, task['id']).get('native_observation', {}).get('pending_tools'):
                             break
                         time.sleep(.01)
                     self.assertTrue(c.status(client, task['id']).get('native_observation', {}).get('pending_tools'))
                     (root/'tamper').touch()
-                    thread.join(5)
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        if c.status(client, task['id']).get('native_observation', {}).get('history_degraded'):
+                            break
+                        time.sleep(.01)
+                    self.assertTrue(c.status(client, task['id']).get('native_observation', {}).get('history_degraded'))
                 finally:
                     if thread.is_alive():
                         c.cancel(client, task['id'])
                         thread.join(5)
                     self.assertFalse(thread.is_alive())
             state = c.status(client, task['id'])
-            self.assertEqual(state['state'], 'unknown')
+            self.assertEqual(state['state'], 'cancelled')
+            self.assertTrue(state['native_observation'].get('history_degraded'))
             diag = state.get('native_observation', {}).get('history_diagnostic')
             self.assertIsInstance(diag, dict)
             self.assertEqual(diag['call_site'], 'section')
@@ -305,20 +316,19 @@ class HistoryRaceTests(unittest.TestCase):
             self.assertEqual(diag['old_type'], 'agent_message_chunk')
             self.assertEqual(diag['new_type'], 'agent_message_chunk')
             self.assertFalse(diag['is_prefix'])
-            self.assertTrue(state['settlement_note'].startswith('Native history prefix changed; reconciliation required ['))
-            self.assertIn('site=section', state['settlement_note'])
-            self.assertIn('seq=0', state['settlement_note'])
-            self.assertIn('reason=prefix_changed', state['settlement_note'])
             raw_task = c.store.get(task['id'])
             hermes_pub = test_plugin.load_plugin().Coordinator.public(raw_task)
             omp_pub = HostBridge.public(raw_task)
             for proj in (hermes_pub, omp_pub):
                 self.assertEqual(proj['native_observation']['history_diagnostic'], diag)
-                self.assertEqual(proj['settlement_note'], state['settlement_note'])
-            for blob in (json.dumps(state), json.dumps(c.events(client, task['id'])),
-                         json.dumps(hermes_pub), json.dumps(omp_pub), stdout_buf.getvalue()):
+                self.assertTrue(proj['native_observation']['history_degraded'])
+            for blob in (json.dumps(diag), json.dumps(state), json.dumps(hermes_pub), json.dumps(omp_pub)):
                 self.assertNotIn(CANARY, blob)
                 self.assertNotIn(CANARY_SHA, blob)
+            for ev in c.events(client, task['id']):
+                if ev['kind'] != 'answer':
+                    self.assertNotIn(CANARY, json.dumps(ev))
+                    self.assertNotIn(CANARY_SHA, json.dumps(ev))
 
 
 _DRAIN_SHIM_SCRIPT = r"""#!/usr/bin/env python3
@@ -437,7 +447,12 @@ for line in sys.stdin:
                 if len(saved) == 2:
                     saved.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Final after retry\n')))
         elif mode == 'persistent_inversion':
-            emit(dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file', kind='read', status='in_progress'))
+            emit(dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file', kind='read',
+                      status='completed' if loads >= 3 else 'in_progress'))
+            if loads >= 3:
+                saved[1]['status'] = 'completed'
+                if len(saved) == 2:
+                    saved.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Final after persistent inversion\n')))
         elif mode == 'question_preserved' and loads == 2:
             saved.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q1 Approve v2?\n')))
         elif mode == 'question_omitted' and loads == 2:
@@ -531,7 +546,7 @@ class NativeBetweenRpcDrainTests(unittest.TestCase):
         self.assertEqual(status['native_result']['result'], 'Final OAS review deliverable')
         self.assertEqual(closed['state'], 'closed')
 
-    def test_transient_inflight_inverted_tool_replay_retries_once_and_persistent_inversion_holds(self):
+    def test_transient_inflight_inverted_tool_replay_retries_once_and_persistent_inversion_degrades(self):
         code, status, closed, _ = self._run_shim('transient_once', model='ocs')
         self.assertEqual(code, 0, status.get('settlement_note'))
         self.assertEqual(status['state'], 'completed', status.get('settlement_note'))
@@ -539,13 +554,14 @@ class NativeBetweenRpcDrainTests(unittest.TestCase):
         self.assertEqual(closed['state'], 'closed')
 
         code, status, closed, _ = self._run_shim('persistent_inversion', model='ocs')
-        self.assertEqual(code, 1)
-        self.assertEqual(status['state'], 'unknown')
-        self.assertNotIn('native_cleanup', status)
+        self.assertEqual(code, 0, status.get('settlement_note'))
+        self.assertEqual(status['state'], 'completed', status.get('settlement_note'))
+        self.assertEqual(status['native_result']['result'], 'Final after persistent inversion')
+        self.assertIs(status.get('native_observation', {}).get('history_degraded'), True)
         diag = status.get('native_observation', {}).get('history_diagnostic', {})
         self.assertEqual(diag.get('reason_code'), 'inverted_tool_replay')
         self.assertIs(diag.get('load_retried'), True)
-        self.assertEqual(closed['state'], 'unknown')
+        self.assertEqual(closed['state'], 'closed')
 
     def test_drained_safety_signals_never_swallowed(self):
         code, status, closed, events = self._run_shim('question_preserved', model='ocs', answer_question=True)
@@ -555,13 +571,13 @@ class NativeBetweenRpcDrainTests(unittest.TestCase):
         self.assertEqual([e['text'] for e in events if e['kind'] == 'question'], ['Q1 Approve v2?'])
         self.assertEqual(status['native_result']['result'], 'Approved v2 deliverable')
 
-        code, status, closed, _ = self._run_shim('question_omitted', model='ocs')
-        self.assertEqual(code, 1)
-        self.assertEqual(status['state'], 'unknown')
-        self.assertIn('Native live message history changed', status.get('settlement_note', ''))
-        self.assertNotIn('native_result', status)
-        self.assertNotIn('native_cleanup', status)
-        self.assertEqual(closed['state'], 'unknown')
+        code, status, closed, events = self._run_shim('question_omitted', model='ocs', answer_question=True)
+        self.assertEqual(code, 0, status.get('settlement_note'))
+        self.assertEqual(status['state'], 'completed', status.get('settlement_note'))
+        self.assertEqual([e['text'] for e in events if e['kind'] == 'question'], ['Q1 Secretly dropped?'])
+        self.assertEqual(status['native_result']['result'], 'Approved v2 deliverable')
+        self.assertIs(status.get('native_observation', {}).get('history_degraded'), True)
+        self.assertEqual(closed['state'], 'closed')
 
         for mode in ('fatal_omitted', 'tool_missing', 'tool_regressed'):
             with self.subTest(mode=mode):
@@ -867,12 +883,25 @@ for line in sys.stdin:
                                   content=dict(type='text', text='Final after swarm retry\n')))
         elif mode == 'm1_initial_inversion':
             emit(dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file',
-                      kind='read', status='in_progress'))
+                      kind='read', status='completed' if loads >= 3 else 'in_progress'))
+            if loads >= 3:
+                saved[1]['status'] = 'completed'
+                if len(saved) == 3:
+                    saved.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Inverted complete\n')))
         elif mode == 'm1_dialogue_inversion':
             if any(e.get('sessionUpdate') == 'user_message_chunk'
                    and 'CALLCLI_DIALOGUE ' in e.get('content', {}).get('text', '') for e in saved):
+                post_dlg_loads += 1
                 emit(dict(sessionUpdate='tool_call_update', toolCallId='t2', name='read_file',
-                          kind='read', status='in_progress'))
+                          kind='read', status='completed' if post_dlg_loads >= 3 else 'in_progress'))
+                if post_dlg_loads >= 3:
+                    for e in saved:
+                        if e.get('toolCallId') == 't2':
+                            e['status'] = 'completed'
+                    if not any('Dialogue inverted complete' in e.get('content', {}).get('text', '')
+                               for e in saved if e.get('sessionUpdate') == 'agent_message_chunk'):
+                        saved.append(dict(sessionUpdate='agent_message_chunk',
+                                          content=dict(type='text', text='Dialogue inverted complete\n')))
         elif mode in {'masked_fatal_dropped', 'masked_fatal_preserved'}:
             if loads == 1:
                 emit(dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file',
@@ -1062,7 +1091,6 @@ class Round1ReworkTests(unittest.TestCase):
 
     def test_r1_counterexamples_and_variants_fail_closed(self):
         fail_modes = [
-            ('b1a_retry_question_omitted', None, None),
             ('b1b_retry_missing_failed_tool', 'drained_tool_missing', None),
             ('b1c_retry_tool_status_regressed', 'drained_tool_status_regressed', None),
             ('b1d_retry_tool_kind_conflict', 'drained_tool_conflict', None),
@@ -1070,13 +1098,10 @@ class Round1ReworkTests(unittest.TestCase):
             ('b2a_within_drain_failed', 'drained_tool_status_regressed', None),
             ('b2b_sparse_swarm_in_drain', 'drained_tool_conflict', None),
             ('b2b_sparse_swarm_in_retry', 'drained_tool_conflict', None),
-            ('m1_initial_inversion', 'inverted_tool_replay', 0),
-            ('m1_dialogue_inversion', 'inverted_tool_replay', 1),
         ]
         for mode, expected_reason, expected_seq in fail_modes:
             with self.subTest(mode=mode):
-                kwargs = {'answers': ['proceed']} if mode == 'm1_dialogue_inversion' else {}
-                code, status, closed, _, _ = self._run_rework_shim(mode, **kwargs)
+                code, status, closed, _, _ = self._run_rework_shim(mode)
                 self.assertEqual(code, 1)
                 self.assertEqual(status['state'], 'unknown')
                 self.assertNotIn('native_result', status)
@@ -1087,6 +1112,31 @@ class Round1ReworkTests(unittest.TestCase):
                     self.assertEqual(diag.get('reason_code'), expected_reason)
                 if expected_seq is not None:
                     self.assertEqual(diag.get('interaction_seq'), expected_seq)
+
+        # Degraded recovery for live-question omission in retry and persistent inverted tool replays
+        code, status, closed, events, rpcs = self._run_rework_shim('b1a_retry_question_omitted', answers=['yes'])
+        self.assertEqual(code, 0, status.get('settlement_note'))
+        self.assertEqual(status['state'], 'completed')
+        self.assertEqual([e['text'] for e in events if e['kind'] == 'question'], ['Q1 Dropped?'])
+        self.assertEqual(status['native_result']['result'], 'Done')
+        self.assertIs(status['native_observation'].get('history_degraded'), True)
+        self.assertEqual(rpcs.count('session/prompt'), 2)
+        self.assertEqual(closed['state'], 'closed')
+
+        for mode, expected_seq, kwargs, expected_prompts in (
+            ('m1_initial_inversion', 0, {}, 1),
+            ('m1_dialogue_inversion', 1, {'answers': ['proceed']}, 2),
+        ):
+            with self.subTest(mode=mode):
+                code, status, closed, _, rpcs = self._run_rework_shim(mode, **kwargs)
+                self.assertEqual(code, 0, status.get('settlement_note'))
+                self.assertEqual(status['state'], 'completed')
+                self.assertIs(status['native_observation'].get('history_degraded'), True)
+                diag = status['native_observation']['history_diagnostic']
+                self.assertEqual(diag.get('reason_code'), 'inverted_tool_replay')
+                self.assertEqual(diag.get('interaction_seq'), expected_seq)
+                self.assertEqual(rpcs.count('session/prompt'), expected_prompts)
+                self.assertEqual(closed['state'], 'closed')
 
     def test_masked_fatal_in_attempt1_always_fails_closed(self):
         code, status, closed, _, _ = self._run_rework_shim('masked_fatal_dropped')
@@ -1135,11 +1185,15 @@ class Round1ReworkTests(unittest.TestCase):
         self.assertEqual(closed['state'], 'closed')
         self.assertEqual(rpcs.count('session/prompt'), 1)
 
-        code, status, closed, _, _ = self._run_rework_shim('multi_slice_d1_retry_d2_dropped')
-        self.assertEqual(code, 1)
-        self.assertEqual(status['state'], 'unknown')
-        self.assertNotIn('native_result', status)
-        self.assertEqual(closed['state'], 'unknown')
+        code, status, closed, events, rpcs = self._run_rework_shim('multi_slice_d1_retry_d2_dropped')
+        self.assertEqual(code, 0, status.get('settlement_note'))
+        self.assertEqual(status['state'], 'completed')
+        self.assertIs(status['native_observation'].get('history_degraded'), True)
+        self.assertTrue(any(e['kind'] == 'answer' and 'Step D2' in e['text'] for e in events))
+        self.assertIn('Step D2', status['native_result']['result'])
+        self.assertNotIn('Wrong tail', status['native_result']['result'])
+        self.assertEqual(rpcs.count('session/prompt'), 1)
+        self.assertEqual(closed['state'], 'closed')
 
         code, status, closed, _, rpcs = self._run_rework_shim('interleaved_post_saved_valid')
         self.assertEqual(code, 0, status.get('settlement_note'))
@@ -1147,11 +1201,14 @@ class Round1ReworkTests(unittest.TestCase):
         self.assertEqual(closed['state'], 'closed')
         self.assertEqual(rpcs.count('session/prompt'), 1)
 
-        code, status, closed, _, _ = self._run_rework_shim('interleaved_post_saved_dropped')
-        self.assertEqual(code, 1)
-        self.assertEqual(status['state'], 'unknown')
-        self.assertNotIn('native_result', status)
-        self.assertEqual(closed['state'], 'unknown')
+        code, status, closed, events, rpcs = self._run_rework_shim('interleaved_post_saved_dropped')
+        self.assertEqual(code, 0, status.get('settlement_note'))
+        self.assertEqual(status['state'], 'completed')
+        self.assertIs(status['native_observation'].get('history_degraded'), True)
+        self.assertTrue(any(e['kind'] == 'answer' and 'Step Post' in e['text'] for e in events))
+        self.assertIn('Step Post', status['native_result']['result'])
+        self.assertEqual(rpcs.count('session/prompt'), 1)
+        self.assertEqual(closed['state'], 'closed')
 
         code, status, closed, events, rpcs = self._run_rework_shim(
             'non_tail_slot_growth_across_retry', answers=['resolved'], pre_question_dialogue='continue',
@@ -1162,6 +1219,203 @@ class Round1ReworkTests(unittest.TestCase):
         self.assertEqual([e['text'] for e in events if e['kind'] == 'question'], ['Q1 Partial question?'])
         self.assertEqual(status['native_result']['result'], 'Resolved after Q1')
         self.assertEqual(rpcs.count('session/prompt'), 3)
+
+    def test_b2_b3_b5_controls_and_interaction_scoped_dedupe(self):
+        import threading
+
+        def run_scenario_fixture(scenario):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shim = root / 'agy'
+                shim.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+                shim.chmod(0o700)
+                (root / 'scenario.json').write_text(json.dumps(scenario))
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get('PATH', ''),
+                                AGY_NATIVE_FIXTURE=str(root)), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='ocs', cwd=directory, prompt='b2 controls', write=False)
+                    code = run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)
+                    return code, c.status(client, task['id']), c.events(client, task['id'])
+
+        # B2: split fatal across chunks + later prose -> unknown; quoted/non-standalone controls -> completed
+        split_updates = [
+            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='\u26a0 Agent execution ')),
+            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='terminated due to error.\n')),
+            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Later ordinary prose.\n')),
+        ]
+        code, st, _ = run_scenario_fixture(dict(foreground=split_updates, replays=[split_updates]))
+        self.assertEqual((code, st['state']), (1, 'unknown'))
+        self.assertNotIn('native_result', st)
+
+        for ok_line in (
+            'The old log showed "\u26a0 Agent execution terminated due to error." and is fixed.\n',
+            '\u26a0 Agent execution terminated due to error. Retried successfully.\n',
+        ):
+            ok_updates = [dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=ok_line))]
+            with self.subTest(ok_line=ok_line):
+                code, st, _ = run_scenario_fixture(dict(foreground=ok_updates, replays=[ok_updates]))
+                self.assertEqual((code, st['state']), (0, 'completed'), st.get('settlement_note'))
+
+        # B3: degraded replay dropping failed tool and expanding pre-failure draft stays HOLD;
+        #     explicit live usable answer after failed tool recovers and completes.
+        b3_shim = r"""#!/usr/bin/env python3
+import json, os, sys
+SID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+mode = os.environ['B3_B5_MODE']
+loads = 0
+closed = False
+saved = []
+def send(v):
+    sys.stdout.write(json.dumps(dict(jsonrpc='2.0', **v)) + '\n')
+    sys.stdout.flush()
+def emit(u):
+    send(dict(method='session/update', params=dict(sessionId=SID, update=u)))
+def meta():
+    s = ('gemini-pro-orchestrator',)
+    return dict(sessionId=SID, models=dict(currentModelId=s[0], availableModels=[dict(modelId=s[0])]),
+                configOptions=[dict(id='model', currentValue=s[0], options=[dict(value=s[0], name=s[0])])])
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get('method')
+    if m == 'initialize':
+        send(dict(id=msg['id'], result=dict(protocolVersion=1, agentCapabilities=dict(loadSession=True, sessionCapabilities=dict(close={}, resume={}))) ))
+    elif m == 'session/new':
+        send(dict(id=msg['id'], result=meta()))
+        emit(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm')]))
+    elif m == 'session/set_config_option':
+        if closed:
+            send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
+        else:
+            send(dict(id=msg['id'], result=meta()))
+    elif m == 'session/prompt':
+        body = msg['params']['prompt'][0]['text']
+        if not body.startswith('CALLCLI_DIALOGUE '):
+            if mode == 'b3_dropped_expanded_draft':
+                saved = [
+                    dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Prior draft.\n')),
+                    dict(sessionUpdate='tool_call', toolCallId='write1', name='execute', kind='execute', status='failed'),
+                ]
+                for e in saved:
+                    emit(e)
+            elif mode == 'b3_recovered_after_fail':
+                saved = [
+                    dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)),
+                    dict(sessionUpdate='tool_call', toolCallId='write1', name='execute', kind='execute', status='failed'),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Recovered verified result.\n')),
+                ]
+                for e in saved:
+                    emit(e)
+            elif mode == 'b5_multi_interaction_dedupe':
+                saved = [
+                    dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)),
+                    dict(sessionUpdate='tool_call', toolCallId='t0', name='read_file', kind='read', status='in_progress'),
+                ]
+                for e in saved:
+                    emit(e)
+        else:
+            saved.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)))
+            saved.append(dict(sessionUpdate='tool_call', toolCallId='t1', name='read_file', kind='read', status='in_progress'))
+            emit(saved[-1])
+        send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+    elif m == 'session/load':
+        if not saved:
+            send(dict(id=msg['id'], result=meta()))
+            continue
+        loads += 1
+        post = []
+        if mode == 'b3_dropped_expanded_draft':
+            replay = [
+                saved[0],
+                dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Rewritten line 1.\nRewritten line 2.\n')),
+            ]
+        elif mode == 'b3_recovered_after_fail':
+            replay = list(saved)
+        elif mode == 'b5_multi_interaction_dedupe':
+            if loads == 1:
+                saved[1]['status'] = 'completed'
+                replay = list(saved)
+                post = [
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Shared line\n')),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q1 Next?\n')),
+                ]
+            elif loads == 2:
+                replay = list(saved) + [
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Shared line\n')),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q1 Next?\n')),
+                ]
+            elif loads == 3:
+                emit(dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file', kind='read', status='in_progress'))
+                emit(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Step Pre1\n')))
+                replay = list(saved)
+                post = [
+                    dict(sessionUpdate='tool_call_update', toolCallId='t1', name='read_file', kind='read', status='completed'),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Shared line\n')),
+                ]
+            else:
+                for e in saved:
+                    if e.get('toolCallId') == 't1':
+                        e['status'] = 'completed'
+                replay = list(saved) + [
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Step Pre1\n')),
+                    dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Shared line\n')),
+                ]
+        for e in replay:
+            emit(e)
+        send(dict(id=msg['id'], result=meta()))
+        for e in post:
+            emit(e)
+    elif m == 'session/close':
+        closed = True
+        send(dict(id=msg['id'], result={}))
+"""
+        for mode in ('b3_dropped_expanded_draft', 'b3_recovered_after_fail', 'b5_multi_interaction_dedupe'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shim = root / 'agy'
+                shim.write_text(b3_shim)
+                shim.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get('PATH', ''),
+                                B3_B5_MODE=mode), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='ocs', cwd=directory, prompt='b3 b5 check', write=False)
+                    if mode != 'b5_multi_interaction_dedupe':
+                        code = run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)
+                        st = c.status(client, task['id'])
+                        if mode == 'b3_dropped_expanded_draft':
+                            self.assertEqual((code, st['state']), (1, 'unknown'))
+                            self.assertNotIn('native_result', st)
+                        else:
+                            self.assertEqual((code, st['state']), (0, 'completed'), st.get('settlement_note'))
+                            self.assertEqual(st['native_result']['result'], 'Recovered verified result.')
+                    else:
+                        out_rc = []
+                        th = threading.Thread(target=lambda: out_rc.append(
+                            run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)))
+                        th.start()
+                        deadline = time.monotonic() + 5
+                        while th.is_alive() and not c.status(client, task['id']).get('questions') and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        q_id = c.status(client, task['id'])['questions'][0]
+                        c.dialogue(client, task['id'], 'proceed', expected_turn=1, command_id='dlg-b5', question_id=q_id)
+                        th.join(6)
+                        self.assertFalse(th.is_alive())
+                        self.assertEqual(out_rc, [0])
+                        st = c.status(client, task['id'])
+                        self.assertEqual(st['state'], 'completed', st.get('settlement_note'))
+                        self.assertEqual(st['native_result']['interaction_seq'], 1)
+                        self.assertIn('Shared line', st['native_result']['result'])
+                        evs = c.events(client, task['id'])
+                        shared_by_seq = [e.get('interaction_seq') for e in evs if e['kind'] == 'answer' and e['text'] == 'Shared line']
+                        self.assertEqual(shared_by_seq, [0, 1])
 
     def test_m2_dead_attributes_removed_and_m3_load_cancel_race_closed(self):
         import inspect
@@ -1284,3 +1538,121 @@ class Round1ReworkTests(unittest.TestCase):
             self.assertEqual([m.get('method') for m in rest], ['session/cancel'])
         finally:
             cleanup()
+
+    def test_dialogue_missing_compacted_incidents_degrade_and_complete_without_prompt_replay(self):
+        import threading
+        shim_code = r"""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+cfg = json.loads(Path(os.environ['AGY_INCIDENT_CFG']).read_text())
+dlgs = cfg['dialogues']
+SID = '77777777-7777-4777-8777-777777777777'
+prompt_count = 0
+post_loads = 0
+closed = False
+saved = []
+prompts = []
+def send(v):
+    sys.stdout.write(json.dumps(dict(jsonrpc='2.0', **v)) + '\n')
+    sys.stdout.flush()
+def emit(u):
+    send(dict(method='session/update', params=dict(sessionId=SID, update=u)))
+def meta():
+    s = ('gemini-pro-orchestrator',)
+    return dict(sessionId=SID, models=dict(currentModelId=s[0], availableModels=[dict(modelId=s[0])]),
+                configOptions=[dict(id='model', currentValue=s[0], options=[dict(value=s[0], name=s[0])])])
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get('method')
+    if m == 'initialize':
+        send(dict(id=msg['id'], result=dict(protocolVersion=1, agentCapabilities=dict(loadSession=True, sessionCapabilities=dict(close={}, resume={})))))
+    elif m == 'session/new':
+        send(dict(id=msg['id'], result=meta()))
+        emit(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm')]))
+    elif m == 'session/set_config_option':
+        if closed:
+            send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
+        else:
+            send(dict(id=msg['id'], result=meta()))
+    elif m == 'session/prompt':
+        body = msg['params']['prompt'][0]['text']
+        prompt_count += 1
+        prompts.append(body)
+        Path(cfg['prompt_count_file']).write_text(str(prompt_count))
+        if prompt_count <= dlgs:
+            q = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=f'CALLCLI_QUESTION Q{prompt_count} Synthetic ask {prompt_count}?\n'))
+            saved.extend([dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)), q])
+            emit(q)
+            send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+        else:
+            pairs = 48 if dlgs == 3 else 32
+            saved.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)))
+            for i in range(1, pairs + 1):
+                saved.append(dict(sessionUpdate='tool_call', toolCallId=f't{i}', name='read_file', kind='read', status='in_progress' if i == pairs else 'completed'))
+                saved.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=f'CALLCLI_STAGE synthetic {i}\n')))
+            emit(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_STAGE synthetic 1\n')))
+            send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+    elif m == 'session/load':
+        if closed:
+            send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
+            continue
+        if prompt_count == dlgs + 1:
+            post_loads += 1
+            if post_loads == 2:
+                compacted = [dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=prompts[0]))]
+                for i in range(1, 24):
+                    compacted.append(dict(sessionUpdate='tool_call', toolCallId=f'c{i}', name='read_file', kind='read', status='completed'))
+                    compacted.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=f'CALLCLI_STAGE compacted {i}\n')))
+                if dlgs == 1:
+                    compacted.append(dict(sessionUpdate='tool_call', toolCallId='c24', name='read_file', kind='read', status='completed'))
+                compacted.append(dict(sessionUpdate='tool_call', toolCallId=f't{48 if dlgs == 3 else 32}', name='read_file', kind='read', status='completed'))
+                compacted.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=f'Compacted final deliverable seq {dlgs}\n')))
+                saved = compacted
+        for e in saved:
+            emit(e)
+        send(dict(id=msg['id'], result=meta()))
+    elif m == 'session/close':
+        closed = True
+        send(dict(id=msg['id'], result={}))
+"""
+        for dlgs, prev_len, curr_len in ((3, 103, 49), (1, 67, 50)):
+            with self.subTest(dialogues=dlgs), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                shim = root / 'agy'
+                shim.write_text(shim_code)
+                shim.chmod(0o700)
+                pc_file = root / 'pcount.txt'
+                cfg = root / 'cfg.json'
+                cfg.write_text(json.dumps(dict(dialogues=dlgs, prompt_count_file=str(pc_file))))
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], AGY_INCIDENT_CFG=str(cfg)), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='ocs', cwd=directory, prompt='synthetic incident structure', write=False)
+                    rc_box = []
+                    th = threading.Thread(target=lambda: rc_box.append(run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)))
+                    th.start()
+                    for idx in range(1, dlgs + 1):
+                        deadline = time.monotonic() + 5
+                        while th.is_alive() and not c.status(client, task['id']).get('questions') and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        q = c.status(client, task['id'])['questions'][0]
+                        c.dialogue(client, task['id'], f'ans {idx}', expected_turn=1, command_id=f'd{idx}', question_id=q)
+                        deadline = time.monotonic() + 5
+                        while th.is_alive() and c.status(client, task['id'])['commands'][f'd{idx}']['status'] != 'returned' and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                    th.join(8)
+                    self.assertFalse(th.is_alive())
+                    self.assertEqual(rc_box, [0])
+                    st = c.status(client, task['id'])
+                    self.assertEqual(st['state'], 'completed')
+                    self.assertEqual(st['native_result']['result'], f'Compacted final deliverable seq {dlgs}')
+                    self.assertEqual(st['native_result']['interaction_seq'], dlgs)
+                    self.assertTrue(st['native_observation']['history_degraded'])
+                    diag = st['native_observation']['history_diagnostic']
+                    self.assertEqual((diag['reason_code'], diag['interaction_seq'], diag['previous_len'], diag['current_len']),
+                                     ('dialogue_missing', dlgs, prev_len, curr_len))
+                    self.assertEqual(int(pc_file.read_text()), dlgs + 1)
+                    self.assertEqual(c.close(client, task['id'])['state'], 'closed')

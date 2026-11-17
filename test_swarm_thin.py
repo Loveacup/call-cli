@@ -79,15 +79,16 @@ class SwarmThinTests(unittest.TestCase):
             thread.join(5)
             self.assertFalse(thread.is_alive())
             status=c.status(client,task['id'])
-            self.assertEqual(status['state'],'unknown')
-            self.assertIn('stop unverified',status.get('settlement_note',''))
-            self.assertIs(status['native_owner_exit']['forced'],False)
-            self.assertEqual(status['native_owner_exit']['worker_fate'],'unknown')
+            self.assertEqual(status['state'],'cancelled')
+            self.assertTrue(status['native_cancel']['session_unloaded'])
+            self.assertFalse(status['native_cleanup']['all_descendants_proven_stopped'])
             requests=[json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
             self.assertEqual(sum(r.get('method')=='session/cancel' for r in requests),1)
             self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests),1)
-            self.assertFalse(any(r.get('method')=='session/close' for r in requests))
-            with self.assertRaises(ValueError): c.start(client,prompt='conflicting writer',cwd=str(root),write=True)
+            self.assertEqual(sum(r.get('method')=='session/close' for r in requests),1)
+            self.assertEqual(c.close(client,task['id'])['state'],'closed')
+            second=c.start(client,prompt='non-conflicting after verified cancel',cwd=str(root),write=True)
+            c.cancel(client,second['id'])
 
     def test_fatal_and_empty_response_never_become_success(self):
         for fault in ('fatal','empty'):

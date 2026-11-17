@@ -38,6 +38,14 @@ class _Store(Store):
         return self.get(task_id)
 
 
+def _public_task(task):
+    if isinstance(task, list):
+        return [_public_task(item) for item in task]
+    if not isinstance(task, dict):
+        return task
+    return {key: _public_task(item) for key, item in task.items() if key != 'native_snapshot'}
+
+
 class Collaboration:
     def __init__(self, db=DEFAULT_DB, *, launch=None, control=None, lock=None):
         self.store = _Store(db)
@@ -109,19 +117,23 @@ class Collaboration:
         self._dispatch(task)
         return self.status(client, task['id'])
 
+    @staticmethod
+    def public(task):
+        return _public_task(task)
+
     def status(self, client, task_id):
         origin = self.origin(client)
         task = self.store.get(task_id, origin)
         from recovery import recovery_card
         host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
-        return dict(task, runtime_links=build_runtime_links(task),
+        return dict(_public_task(task), runtime_links=build_runtime_links(task),
                     recovery=recovery_card(task, self.store.path, host=host))
 
     def events(self, client, task_id, after=0):
         return self.store.events(task_id, self.origin(client), after)
 
     def list(self, client, group=None):
-        return [dict(t, runtime_links=build_runtime_links(t))
+        return [dict(_public_task(t), runtime_links=build_runtime_links(t))
                 for t in self.store.list(self.origin(client), group=group)]
 
     def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False, expected_turn=None):
@@ -202,7 +214,7 @@ class Collaboration:
         receipt = release_only_task(self.store, origin, task_id, expected_turn, abandon=abandon)
         task = self.store.release_target(task_id, origin)
         host = 'omp-extension' if origin.profile == 'omp-extension' else 'standalone'
-        return dict(task, runtime_links=build_runtime_links(task),
+        return dict(_public_task(task), runtime_links=build_runtime_links(task),
                     recovery=recovery_card(task, host=host), close_receipt=public_close_receipt(receipt))
 
     def close(self, client, task_id):

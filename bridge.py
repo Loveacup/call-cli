@@ -168,8 +168,17 @@ class Store:
             return posixpath.normpath(value.replace(chr(92), '/')).rstrip('/').casefold()
         for row in db.execute('SELECT data FROM tasks WHERE id != ?', (task['id'],)):
             other = json.loads(row['data'])
+            active_cancel_resume = (
+                other['state'] == 'cancelled'
+                and (other.get('intervention', {}).get('status') == 'pending'
+                     or bool(other.get('native_resume_session_id'))
+                     or (other.get('agy_swarm') == 'native'
+                         and bool(other.get('native_session_id'))
+                         and not other.get('native_cleanup', {}).get('session_unloaded')))
+            )
             if (not other['write'] or other.get('resource_state') == 'released'
-                    or other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}):
+                    or (other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}
+                        and not active_cancel_resume)):
                 continue
             shared = task['resource'] and task['resource'] == other['resource']
             left, right = norm(task['cwd']), norm(other['cwd'])
@@ -198,6 +207,8 @@ class Store:
             if current.get('native_cleanup', {}).get('session_unloaded') is True:
                 task['native_predecessor_session_id'] = current.get('native_session_id')
                 task.pop('native_session_id', None)
+                task.pop('native_resume_session_id', None)
+                task.pop('native_capabilities', None)
                 task['needs_session'] = True
             for key in ('native_result', 'native_cleanup', 'native_cancel', 'native_snapshot',
                         'native_workers', 'native_roster', 'native_prompt_submitted', 'native_phase', 'native_observation',
@@ -537,6 +548,19 @@ class Store:
             self._save(db,task)
             return True
 
+    def native_begin_unload(self, task_id, turn, launch_id, epoch, observation, *, fence_pending_intervention=False):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()[0])
+            if (self._native_binding(task) != dict(turn=turn, launch_id=launch_id, epoch=epoch)
+                    or task['state'] == 'closed' or task.get('release_epoch')):
+                return 'stale'
+            if fence_pending_intervention and task.get('intervention', {}).get('status') == 'pending':
+                return 'pending_intervention'
+            task['native_unload_observation'] = observation
+            self._save(db, task)
+            return 'ok'
+
     def native_cancel_notice(self, task_id, turn, launch_id, epoch):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -756,6 +780,9 @@ class Store:
                 return task, False
             if task.get('agy_swarm')=='native' and task['state']=='running' and task.get('native_input',{}).get('settling'):
                 raise ValueError('Native owner is settling; inspect final outcome before intervention')
+            if (task.get('agy_swarm') == 'native' and task['state'] in {'running', 'cancelling'}
+                    and task.get('native_unload_observation', {}).get('attempted')):
+                raise ValueError('Native owner is unloading session; inspect final outcome before intervention')
             self._check_intent(task, expected_turn)
             self._admit_controller(task, origin, expected_turn, command_id)
             if task.get('intervention', {}).get('status') == 'pending':
@@ -819,7 +846,21 @@ class Store:
                 entry['status'] = 'withdrawn'
                 task['commands'][entry['command_id']] = entry
             task.pop('clear_timeout_pending', None)
-            if task['state']=='queued':task.update(state='cancelled',prompt='')
+            if task['state'] in {'cancelled', 'queued'}:
+                unloaded_native = bool(task.get('native_cleanup', {}).get('session_unloaded'))
+                unsettled_native = (
+                    bool(task.get('native_resume_session_id'))
+                    or (task.get('agy_swarm') == 'native'
+                        and bool(task.get('native_session_id'))
+                        and not unloaded_native)
+                )
+                if unsettled_native:
+                    self._target_commands(task, 'withdrawn')
+                    task.update(state='unknown', prompt='')
+                else:
+                    task.pop('native_resume_session_id', None)
+                    if task['state'] == 'queued':
+                        task.update(state='cancelled', prompt='')
             elif task['state']=='running':task['state']='cancelling'
             if task.get('agy_swarm')=='native' and task['state']=='cancelling':
                 task.setdefault('native_input', {})['accepting']=False
@@ -837,6 +878,7 @@ class Store:
             if entry.get('status') == 'pending':
                 entry['status'] = 'withdrawn'
                 task['commands'][entry['command_id']] = entry
+            task.pop('native_resume_session_id', None)
             task.pop('clear_timeout_pending', None)
             self._target_commands(task, 'target_unknown')
             task['state']='closing'

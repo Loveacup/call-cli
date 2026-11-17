@@ -632,3 +632,39 @@ test('real omp_bridge roundtrip preserves group, origin_context, runtime_links, 
     await rm(root,{recursive:true,force:true});
   }
 });
+
+test('running stream interruption diagnostic immediately triggers followUp without flushing buffered answers', async () => {
+  const f = fixture();
+  await f.adapter.execute({action: 'start', agent: 'agy', cwd: '/work', prompt: 'owned'}, f.ctx);
+  f.setPacket({
+    task: {id: 'task-a', agent: 'agy', state: 'running', turn: 1},
+    events: [
+      {seq: 1, turn: 1, kind: 'answer', text: 'The stream was interrupted. Please continue the task you were working on.'},
+      {seq: 2, turn: 1, kind: 'diagnostic', diagnostic_code: 'agy_stream_interrupted', attention_required: true, notification_scope: 'originating-session', text: 'AGY reported stream interruption; native owner remains attached.'},
+    ],
+    after: 2,
+  });
+  await f.timers.shift()();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].options.deliverAs, 'followUp');
+  assert.equal(f.sent[0].options.triggerTurn, true);
+  const delivered = JSON.parse(f.sent[0].message.content);
+  assert.equal(delivered.task_id, 'task-a');
+  assert.deepEqual(delivered.events.map(e => e.kind), ['diagnostic']);
+  assert.equal(delivered.events[0].attention_required, true);
+  assert.equal(delivered.events[0].diagnostic_code, 'agy_stream_interrupted');
+  // Buffered answer flushes only when terminal event arrives
+  f.setPacket({
+    task: {id: 'task-a', agent: 'agy', state: 'completed', turn: 1},
+    events: [
+      {seq: 3, turn: 1, kind: 'answer', text: 'Resumed deliverable'},
+      {seq: 4, turn: 1, kind: 'completed', text: 'Prompt exited 0'},
+    ],
+    after: 4,
+  });
+  await f.timers.shift()();
+  assert.equal(f.sent.length, 2);
+  const terminalBatch = JSON.parse(f.sent[1].message.content);
+  assert.deepEqual(terminalBatch.events.map(e => e.seq), [1, 3, 4]);
+  f.adapter.detach();
+});

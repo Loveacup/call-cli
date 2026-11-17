@@ -3,6 +3,7 @@
 The coordinator, transport and task lifecycle remain shared with other agents.
 """
 import json
+import re
 try:
     from .acpx_backend import AcpxBackend
 except ImportError:
@@ -10,6 +11,13 @@ except ImportError:
 
 
 AGY_FATAL_LINE = '\u26a0 Agent execution terminated due to error.'
+AGY_INVALID_OUTPUT_LINE = '\u26a0 Model produced invalid output.'
+AGY_INTERRUPTED_LINE = 'The stream was interrupted. Please continue the task you were working on.'
+_PROVIDER_ERROR_LINE_RE = re.compile(r'^(?:\u26a0\s*)?API error\b[^\r\n]*$', re.IGNORECASE)
+BOARD_HINT_RE = re.compile(
+    r'Run /swarm board(?: \(default shortcut [^()\r\n]+\))?'
+    r'(?: to open the live board)?\.?'
+)
 AGY_APPROVALS = {'skip-permissions', 'approve-all', 'approve-reads'}
 
 
@@ -49,13 +57,57 @@ def fatal_error(text):
     return bool(lines) and lines[-1] == AGY_FATAL_LINE
 
 
+def is_board_navigation_only(text):
+    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    return bool(lines) and all(BOARD_HINT_RE.fullmatch(line) for line in lines)
+
+
+def is_standalone_incomplete_diagnostic(text):
+    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    non_nav = [line for line in lines if not BOARD_HINT_RE.fullmatch(line)]
+    if not non_nav:
+        return None
+    has_interrupted = False
+    has_provider_error = False
+    has_invalid_output = False
+    for line in non_nav:
+        if line == AGY_INTERRUPTED_LINE:
+            has_interrupted = True
+        elif _PROVIDER_ERROR_LINE_RE.fullmatch(line):
+            has_provider_error = True
+        elif line == AGY_INVALID_OUTPUT_LINE:
+            has_invalid_output = True
+        else:
+            return None
+    if has_interrupted:
+        return 'interrupted'
+    if has_provider_error:
+        return 'provider_error'
+    if has_invalid_output:
+        return 'invalid_output'
+    return None
+
+
 def outcome_note(decoder, exit_code, state):
     reason = None
+    standalone_diag = (
+        is_standalone_incomplete_diagnostic(decoder.final_answer)
+        if state == 'completed' and decoder.stop_reason == 'end_turn'
+        else None
+    )
     if fatal_error(decoder.text):
         reason = 'AGY reported a fatal execution error (final line "'+AGY_FATAL_LINE+'")'
-    elif decoder.final_answer.strip() == '⚠ Model produced invalid output.':
+    elif decoder.final_answer.strip() == AGY_INVALID_OUTPUT_LINE or standalone_diag == 'invalid_output':
         # Observed error-only response, not arbitrary prose mentioning an error.
-        return ('AGY reported "⚠ Model produced invalid output."; no usable final answer '
+        return ('AGY reported "'+AGY_INVALID_OUTPUT_LINE+'"; no usable final answer '
+                'although the protocol ended '+str(decoder.stop_reason)+' with exit '+str(exit_code)
+                +'; turn not completed, outcome unknown, no automatic replay.')
+    elif standalone_diag == 'interrupted':
+        return ('AGY reported stream interruption ("'+AGY_INTERRUPTED_LINE+'"); no usable final answer '
+                'although the protocol ended '+str(decoder.stop_reason)+' with exit '+str(exit_code)
+                +'; turn not completed, outcome unknown, no automatic replay.')
+    elif standalone_diag == 'provider_error':
+        return ('AGY reported a provider API error diagnostic without a usable final answer '
                 'although the protocol ended '+str(decoder.stop_reason)+' with exit '+str(exit_code)
                 +'; turn not completed, outcome unknown, no automatic replay.')
     elif (exit_code == 0 and not decoder.failed and decoder.stop_reason == 'end_turn'

@@ -728,6 +728,153 @@ class StoreTests(unittest.TestCase):
             self.store.dialogue(task['id'], self.a, 'turn2_new', expected_turn=2, command_id='d_turn2',
                                 target_command_id='d_turn1')
 
+    def test_cancelled_pending_intervention_retains_writer_lock_and_resume_session_lifecycle(self):
+        t = self.store.create(self.a, 'local', 'agy', '/resumable-work', 'turn1', True)
+        self.store.update(
+            t['id'], state='running', agy_swarm='native', launch_id='l1', runner_pid=101,
+            native_session_id='sid-1',
+            native_capabilities=dict(load_session=True, close_supported=True, resume_supported=True,
+                                     session_id='sid-1', advertised_commands=['swarm']),
+        )
+        self.store.intervene(t['id'], self.a, 'turn2 prompt', 'iv-1', expected_turn=1)
+        self.store.native_owner_diagnostics(t['id'], 1, 'l1', 1, native_resume_session_id='sid-1')
+        self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled', 'Foreground cancelled; exact session preserved')
+
+        # While cancelled + pending intervention (session not unloaded), conflicting writer is blocked
+        with self.assertRaisesRegex(ValueError, 'already owned'):
+            self.store.create(self.b, 'local', 'omp', '/resumable-work', 'conflict', True)
+
+        # Advancing intervention into Turn 2 preserves native_session_id, native_resume_session_id, and native_capabilities
+        advanced, launch = self.store.advance_intervention(t['id'], self.a)
+        self.assertTrue(launch)
+        self.assertEqual((advanced['turn'], advanced['state']), (2, 'queued'))
+        self.assertEqual(advanced['native_session_id'], 'sid-1')
+        self.assertEqual(advanced['native_resume_session_id'], 'sid-1')
+        self.assertEqual(advanced['native_capabilities']['advertised_commands'], ['swarm'])
+
+        # When Turn 2 unloads the session and a Turn 3 starts, native_session_id/resume/capabilities clear cleanly
+        self.store.update(
+            t['id'], state='completed', native_resume_session_id='',
+            native_cleanup=dict(session_unloaded=True),
+        )
+        t3, launch3 = self.store.intervene(t['id'], self.a, 'turn3 fresh', 'iv-2', expected_turn=2)
+        self.assertTrue(launch3)
+        self.assertEqual(t3['turn'], 3)
+        self.assertEqual(t3['native_predecessor_session_id'], 'sid-1')
+        self.assertNotIn('native_session_id', t3)
+        self.assertNotIn('native_resume_session_id', t3)
+        self.assertNotIn('native_capabilities', t3)
+        self.assertTrue(t3['needs_session'])
+
+        # Withdrawing a pending intervention via request_cancel when session was not unloaded transitions to unknown (HOLD)
+        t_wd = self.store.create(self.a, 'local', 'agy', '/withdraw-work', 'turn1', True)
+        self.store.update(t_wd['id'], state='running', agy_swarm='native', launch_id='lw', runner_pid=102, native_session_id='sid-w')
+        self.store.intervene(t_wd['id'], self.a, 'turn2', 'iv-w', expected_turn=1)
+        self.store.native_owner_diagnostics(t_wd['id'], 1, 'lw', 1, native_resume_session_id='sid-w')
+        self.store.finish_turn(t_wd['id'], 1, 'cancelled', 0, 'cancelled')
+        after_cancel = self.store.request_cancel(t_wd['id'], self.a)
+        self.assertEqual(after_cancel['state'], 'unknown')
+        self.assertEqual(after_cancel['native_session_id'], 'sid-w')
+        self.assertEqual(after_cancel['native_resume_session_id'], 'sid-w')
+        with self.assertRaisesRegex(ValueError, 'already owned'):
+            self.store.create(self.b, 'local', 'omp', '/withdraw-work', 'conflict-after-cancel', True)
+        with self.assertRaises(ValueError):
+            self.store.intervene(t_wd['id'], self.a, 'still refused on unknown', 'iv-refused', expected_turn=1)
+
+    def test_b1_cancel_queued_resume_and_concurrent_advance_cancel_preserve_binding_and_writer_lock(self):
+        import threading
+        from release import close_task
+        from runner import run_task
+
+        for with_claim in (False, True):
+            cwd_path = f'/queued-resume-{"claimed" if with_claim else "unclaimed"}'
+            with self.subTest(with_claim=with_claim):
+                t = self.store.create(self.a, 'local', 'agy', cwd_path, 'turn1', True)
+                self.store.update(t['id'], state='running', agy_swarm='native', launch_id='l1',
+                                  runner_pid=101, native_session_id='sid-q')
+                self.store.intervene(t['id'], self.a, 'turn2', 'iv-q', expected_turn=1)
+                self.store.native_owner_diagnostics(t['id'], 1, 'l1', 1, native_resume_session_id='sid-q')
+                self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled')
+                advanced, launch = self.store.advance_intervention(t['id'], self.a)
+                self.assertTrue(launch)
+                self.assertEqual((advanced['turn'], advanced['state']), (2, 'queued'))
+                if with_claim:
+                    claimed = self.store.claim_launch(t['id'], 2, advanced.get('control_epoch', 1))
+                    saved_launch_id = claimed['launch_id']
+                after = self.store.request_cancel(t['id'], self.a)
+                self.assertEqual(after['state'], 'unknown')
+                self.assertEqual(after['turn'], 2)
+                self.assertEqual(after['native_session_id'], 'sid-q')
+                self.assertEqual(after['native_resume_session_id'], 'sid-q')
+                self.assertEqual(after['intervention']['status'], 'withdrawn')
+                if with_claim:
+                    self.assertEqual(after['launch_id'], saved_launch_id)
+                    with self.assertRaises(ValueError):
+                        run_task(self.store.path, t['id'], turn=2, launch_id=saved_launch_id,
+                                 epoch=after.get('control_epoch', 1))
+                else:
+                    with self.assertRaises(ValueError):
+                        self.store.claim_launch(t['id'], 2, after.get('control_epoch', 1))
+                with self.assertRaisesRegex(ValueError, 'already owned'):
+                    self.store.create(self.b, 'local', 'omp', cwd_path, 'conflict', True)
+                with self.assertRaises(ValueError):
+                    self.store.intervene(t['id'], self.a, 'refused', 'iv-no', expected_turn=2)
+                self.assertEqual(close_task(self.store, self.a, t['id'], expected_turn=2)['state'], 'unknown')
+
+        # Concurrent advance_intervention + request_cancel never lose writer lock or resume binding
+        for idx in range(8):
+            cwd_path = f'/race-advance-cancel-{idx}'
+            t = self.store.create(self.a, 'local', 'agy', cwd_path, 'turn1', True)
+            self.store.update(t['id'], state='running', agy_swarm='native', launch_id=f'lr-{idx}',
+                              runner_pid=200 + idx, native_session_id=f'sid-r-{idx}')
+            self.store.intervene(t['id'], self.a, 'turn2', f'iv-r-{idx}', expected_turn=1)
+            self.store.native_owner_diagnostics(t['id'], 1, f'lr-{idx}', 1, native_resume_session_id=f'sid-r-{idx}')
+            self.store.finish_turn(t['id'], 1, 'cancelled', 0, 'cancelled')
+            barrier = threading.Barrier(2)
+            errors = []
+            def do_advance():
+                try:
+                    barrier.wait(2)
+                    self.store.advance_intervention(t['id'], self.a)
+                except Exception as exc:
+                    errors.append(exc)
+            def do_cancel():
+                try:
+                    barrier.wait(2)
+                    self.store.request_cancel(t['id'], self.a)
+                except Exception as exc:
+                    errors.append(exc)
+            th1 = threading.Thread(target=do_advance)
+            th2 = threading.Thread(target=do_cancel)
+            th1.start(); th2.start()
+            th1.join(3); th2.join(3)
+            self.assertEqual(errors, [])
+            final = self.store.get(t['id'])
+            self.assertEqual(final['state'], 'unknown')
+            self.assertEqual(final['native_session_id'], f'sid-r-{idx}')
+            self.assertEqual(final['native_resume_session_id'], f'sid-r-{idx}')
+            with self.assertRaisesRegex(ValueError, 'already owned'):
+                self.store.create(self.b, 'local', 'omp', cwd_path, 'conflict', True)
+
+        # Atomic unload fence against pending intervention
+        tf = self.store.create(self.a, 'local', 'agy', '/fence-work', 'turn1', True)
+        self.store.update(tf['id'], state='cancelling', agy_swarm='native', launch_id='lf',
+                          runner_pid=301, native_session_id='sid-f')
+        self.store.intervene(tf['id'], self.a, 'turn2', 'iv-f', expected_turn=1)
+        obs = dict(task=tf['id'], session_id='sid-f', turn=1, launch_id='lf', epoch=1,
+                   context='cancelled', attempted=True, verified=False, reason_code='unload_in_progress')
+        self.assertEqual(self.store.native_begin_unload(tf['id'], 1, 'lf', 1, obs, fence_pending_intervention=True),
+                         'pending_intervention')
+        self.assertNotIn('native_unload_observation', self.store.get(tf['id']))
+
+        tf2 = self.store.create(self.a, 'local', 'agy', '/fence-work-2', 'turn1', True)
+        self.store.update(tf2['id'], state='cancelling', agy_swarm='native', launch_id='lf2',
+                          runner_pid=302, native_session_id='sid-f2')
+        obs2 = dict(obs, task=tf2['id'], session_id='sid-f2', launch_id='lf2')
+        self.assertEqual(self.store.native_begin_unload(tf2['id'], 1, 'lf2', 1, obs2, fence_pending_intervention=True), 'ok')
+        with self.assertRaisesRegex(ValueError, 'unloading session'):
+            self.store.intervene(tf2['id'], self.a, 'late iv', 'iv-late', expected_turn=1)
+
 class ProtocolTests(unittest.TestCase):
     def test_host_context_captures_topic_and_session_not_model_input(self):
         from bridge import capture_origin

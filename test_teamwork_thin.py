@@ -167,12 +167,14 @@ class TeamworkThinTests(unittest.TestCase):
             thread.join(5)
             self.assertFalse(thread.is_alive())
             status=c.status(client,task['id'])
-            self.assertEqual(status['state'],'unknown')
-            self.assertIs(status['native_owner_exit']['forced'],False)
+            self.assertEqual(status['state'],'cancelled')
+            self.assertTrue(status['native_cancel']['session_unloaded'])
+            self.assertFalse(status['native_cleanup']['all_descendants_proven_stopped'])
             requests=self.requests(root)
             self.assertEqual(sum(r.get('method')=='session/cancel' for r in requests),1)
             self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests),1)
-            self.assertNotIn('native_cleanup',status)
+            self.assertEqual(sum(r.get('method')=='session/close' for r in requests),1)
+            self.assertEqual(c.close(client,task['id'])['state'],'closed')
 
     def test_cancel_during_dialogue_forwards_once_without_resume_or_close(self):
         with self.workspace('cancel-dialogue') as (root,c,client,task,thread):
@@ -186,14 +188,15 @@ class TeamworkThinTests(unittest.TestCase):
             thread.join(5)
             self.assertFalse(thread.is_alive())
             status=c.status(client,task['id'])
-            self.assertEqual(status['state'],'unknown')
+            self.assertEqual(status['state'],'cancelled')
             self.assertEqual(status['commands']['answer']['status'],'cancelled')
-            self.assertIs(status['native_owner_exit']['forced'],False)
+            self.assertTrue(status['native_cancel']['session_unloaded'])
+            self.assertFalse(status['native_cleanup']['all_descendants_proven_stopped'])
             requests=self.requests(root)
             self.assertEqual(sum(r.get('method')=='session/cancel' for r in requests),1)
             self.assertEqual(sum(r.get('method')=='session/prompt' for r in requests),2)
-            self.assertFalse(any(r.get('method')=='session/close' for r in requests))
-            self.assertNotIn('native_cleanup',status)
+            self.assertEqual(sum(r.get('method')=='session/close' for r in requests),1)
+            self.assertEqual(c.close(client,task['id'])['state'],'closed')
 
     def test_replay_only_delegation_does_not_close_before_async_question(self):
         with self.workspace('replay-only') as (root,c,client,task,thread):

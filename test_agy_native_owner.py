@@ -591,7 +591,7 @@ class NativeOwnerTests(unittest.TestCase):
             self.assertEqual([e['text'] for e in events if e['kind']=='stage'].count('tail stage'), 1)
             self.assertNotIn('old result', '\n'.join(e['text'] for e in events))
 
-    def run_question_replay(self, foreground, replays):
+    def run_question_replay(self, foreground, replays, *, include_stored=False):
         # Finite replays end in fixture disconnect: observation evidence, not a reply/continuation loop.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -608,6 +608,8 @@ class NativeOwnerTests(unittest.TestCase):
                 task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
                 run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)
             requests = [json.loads(line) for line in (root/'requests.jsonl').read_text().splitlines()]
+            if include_stored:
+                return c.status(client, task['id']), c.events(client, task['id']), requests, c.store.get(task['id'])
             return c.status(client, task['id']), c.events(client, task['id']), requests
 
     def test_incomplete_replay_question_is_not_flushed_on_disconnect(self):
@@ -674,9 +676,10 @@ class NativeOwnerTests(unittest.TestCase):
     def test_failed_load_preserves_last_success_without_publishing_partial_question(self):
         tool = dict(sessionUpdate='tool_call', toolCallId='owned-tool', title='read_board', kind='read', status='pending')
         partial = dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q1 Half\n'))
-        result, events, _ = self.run_question_replay([], [[tool], dict(updates=[partial], fail=True)])
+        result, events, _, stored = self.run_question_replay([], [[tool], dict(updates=[partial], fail=True)], include_stored=True)
         self.assertEqual([e for e in events if e['kind']=='question'], [])
-        self.assertEqual(result['native_snapshot'], [tool])
+        self.assertNotIn('native_snapshot', result)
+        self.assertEqual(stored['native_snapshot'], [tool])
         observation = result['native_observation']
         self.assertEqual(observation['turn'], 1)
         self.assertEqual(observation['pending_tools'], [dict(id='owned-tool', name='read_board', kind='read', status='pending')])
@@ -980,11 +983,11 @@ class NativeOwnerTests(unittest.TestCase):
                         thread.join(5)
                         self.assertFalse(thread.is_alive())
                         self.assertEqual(errors, [])
-                        self.assertEqual(c.status(client, task['id'])['state'], 'unknown')
+                        self.assertEqual(c.status(client, task['id'])['state'], 'cancelled')
                         clock[0] = 6000
                         time.sleep(.15)
                         self.assertEqual(len(notices()), 4)
-                        self.assertEqual(c.close(client, task['id'])['state'], 'unknown')
+                        self.assertEqual(c.close(client, task['id'])['state'], 'closed')
                     finally:
                         if thread.is_alive():
                             c.cancel(client, task['id'])
@@ -1216,7 +1219,7 @@ class NativeOwnerTests(unittest.TestCase):
             self.assertEqual(c.close(client,task['id'])['state'],'unknown')
 
 
-    def test_foreground_and_background_cancel_retain_unknown_worker_occupancy(self):
+    def test_foreground_and_background_cancel_settle_via_session_unload_without_claiming_descendants_stopped(self):
         for foreground in (True, False):
             with self.subTest(foreground=foreground), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -1240,14 +1243,16 @@ class NativeOwnerTests(unittest.TestCase):
                         thread.join(8)
                     self.assertFalse(thread.is_alive())
                     result = c.status(client, task['id'])
-                    self.assertEqual(result['state'], 'unknown')
-                    self.assertNotIn('native_unload_observation',result)
-                    self.assertNotIn('native_cleanup',result)
-                    self.assertEqual(c.close(client, task['id'])['close_receipt']['reason_code'], 'native_workers_unproven')
-                    with self.assertRaisesRegex(ValueError, 'already owned'):
-                        c.start(client, agent='omp', cwd=directory, prompt='conflict', write=True)
+                    self.assertEqual(result['state'], 'cancelled')
+                    self.assertTrue(result['native_unload_observation']['verified'])
+                    self.assertEqual(result['native_cleanup']['kind'], 'verified-cancellation')
+                    self.assertFalse(result['native_cleanup']['all_descendants_proven_stopped'])
+                    self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+                    second = c.start(client, agent='omp', cwd=directory, prompt='non-conflicting after close', write=True)
+                    c.cancel(client, second['id'])
 
     def test_public_host_reads_hide_replay_snapshot_but_keep_result(self):
+        import collab
         from omp_bridge import HostBridge
         from test_plugin import load_plugin, Ctx
         with tempfile.TemporaryDirectory() as root:
@@ -1282,6 +1287,38 @@ class NativeOwnerTests(unittest.TestCase):
                 self.assertNotIn('native_snapshot', json.dumps(coordinator.handle(args)))
             self.assertEqual(coordinator.handle(dict(action='status', task_id=task['id']))['task']['native_result'],
                              {'result':'public result'})
+            collab_inst = Collaboration(Path(root)/'collab.db', launch=lambda task: None)
+            cli_id = collab_inst.connect('hermes')['client_id']
+            ctask = collab_inst.start(cli_id, agent='agy', cwd=root, prompt='owned')
+            diag = {'reason_code': 'prefix_changed', 'call_site': 'section', 'interaction_seq': 0, 'turn': 1}
+            collab_inst.store.update(
+                ctask['id'], state='unknown',
+                native_snapshot=[{'private_replay': 'CANARY_PRIVATE_REPLAY'}],
+                native_result={'result': 'public result'},
+                native_observation={'history_degraded': True, 'history_diagnostic': diag},
+            )
+            for payload in (
+                collab_inst.status(cli_id, ctask['id']),
+                collab_inst.wait(cli_id, ctask['id'], timeout=0),
+                collab_inst.list(cli_id),
+                collab_inst.events(cli_id, ctask['id']),
+            ):
+                blob = json.dumps(payload)
+                self.assertNotIn('native_snapshot', blob)
+                self.assertNotIn('CANARY_PRIVATE_REPLAY', blob)
+            st_pub = collab_inst.status(cli_id, ctask['id'])
+            self.assertEqual(st_pub['native_result'], {'result': 'public result'})
+            self.assertTrue(st_pub['native_observation']['history_degraded'])
+            self.assertEqual(st_pub['native_observation']['history_diagnostic'], diag)
+            cli_out = io.StringIO()
+            with contextlib.redirect_stdout(cli_out):
+                self.assertEqual(collab.main(['--db', str(Path(root)/'collab.db'), '--client', cli_id, 'status', '--task', ctask['id']]), 0)
+            self.assertNotIn('native_snapshot', cli_out.getvalue())
+            self.assertNotIn('CANARY_PRIVATE_REPLAY', cli_out.getvalue())
+            rel_pub = collab_inst.release_only(cli_id, ctask['id'], expected_turn=1, abandon=True)
+            self.assertNotIn('native_snapshot', json.dumps(rel_pub))
+            self.assertNotIn('CANARY_PRIVATE_REPLAY', json.dumps(rel_pub))
+            self.assertEqual(collab_inst.store.get(ctask['id'])['native_snapshot'], [{'private_replay': 'CANARY_PRIVATE_REPLAY'}])
 
     def test_native_fatal_exit_and_missing_kill_notify_initiator_and_hold(self):
         cases = [('AGY_NATIVE_FATAL', 'foreground', 'fatal execution error'),
@@ -1480,4 +1517,680 @@ for line in sys.stdin:
                     if thread.is_alive():
                         c.cancel(client, task['id'])
                         thread.join(3)
+
+    def test_write_delegated_intervene_resumes_exact_session_on_turn2_and_holds_when_unsupported_or_unsettled(self):
+        fake_agy = '''import json, os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_AGY_STATE'])
+mode = os.environ.get('FAKE_AGY_MODE', 'normal')
+sid = 'sess-exact-resume-1'
+closed = False
+loads = 0
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\\n')
+    sys.stdout.flush()
+def notify(u):
+    send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': sid, 'update': u}})
+def meta():
+    return {
+        'sessionId': sid,
+        'models': {'currentModelId': 'gemini-4-carbon-low', 'availableModels': [{'modelId': 'gemini-4-carbon-low'}]},
+        'configOptions': [
+            {'id': 'model', 'currentValue': 'gemini-4-carbon', 'options': [{'value': 'gemini-4-carbon'}]},
+            {'id': 'thought_level', 'currentValue': 'low', 'options': [{'value': 'low'}]},
+        ],
+    }
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    rid, method, params = req.get('id'), req.get('method'), req.get('params', {})
+    with (state / 'rpcs.jsonl').open('a') as f:
+        f.write(json.dumps({'method': method, 'params': params}) + '\\n')
+    if method == 'initialize':
+        scaps = {'close': {}} if mode == 'no_resume_cap' else {'close': {}, 'resume': {}}
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': 1, 'agentCapabilities': {'loadSession': True, 'sessionCapabilities': scaps}}})
+    elif method == 'session/new':
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+    elif method == 'session/resume':
+        (state / 'resumed_sid').write_text(str(params.get('sessionId')))
+        (state / 'loads_at_resume').write_text(str(loads))
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+    elif method == 'session/load':
+        loads += 1
+        if (state / 'turn2_prompt').exists():
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\nturn1'}})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'sw-1', 'title': 'swarm', 'kind': 'other', 'status': 'completed', 'rawInput': {'action': 'add', 'name': 'w1'}})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'tc-1', 'title': 'bash', 'kind': 'execute', 'status': 'failed'})
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': (state / 'turn2_prompt').read_text()}})
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Turn 2 resumed deliverable.\\n'}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+    elif method == 'session/prompt':
+        ptext = ''.join(p.get('text', '') for p in params.get('prompt', []))
+        if 'revised turn2 goal' in ptext:
+            (state / 'loads_before_turn2_prompt').write_text(str(loads))
+            (state / 'turn2_prompt').write_text(ptext)
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Turn 2 resumed deliverable.\\n'}})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+        else:
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'sw-1', 'title': 'swarm', 'kind': 'other', 'status': 'completed', 'rawInput': {'action': 'add', 'name': 'w1'}})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'tc-1', 'title': 'bash', 'kind': 'execute', 'status': 'in_progress'})
+            (state / 'active').touch()
+            rline = sys.stdin.readline()
+            if rline and json.loads(rline).get('method') == 'session/cancel':
+                if mode == 'disconnect_on_cancel':
+                    sys.exit(1)
+                send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'cancelled'}})
+    elif method == 'session/close':
+        closed = True
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {}})
+    elif method == 'session/set_config_option':
+        if closed:
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32602, 'message': 'Session not found: ' + sid}})
+        else:
+            send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+'''
+        # Case 1: write=True + Swarm delegated + intervene -> Turn 1 cancelled (resumable), Turn 2 session/resume completes
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / 'state_ok'
+            state_dir.mkdir()
+            exe = root / 'agy'
+            exe.write_text('#!' + sys.executable + '\n' + fake_agy)
+            exe.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE='normal'), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', model='4cs', cwd=directory, prompt='turn1', write=True)
+                rc1 = []
+                t1 = threading.Thread(target=lambda: rc1.append(run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)))
+                t1.start()
+                deadline = time.monotonic() + 5
+                while not (state_dir / 'active').exists() and t1.is_alive() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                c.intervene(client, task['id'], 'revised turn2 goal', command_id='iv-t2', expected_turn=1)
+                t1.join(5)
+                self.assertEqual(rc1, [0])
+                st1 = c.status(client, task['id'])
+                self.assertEqual(st1['state'], 'cancelled')
+                self.assertTrue(st1['native_cancel']['resumable'])
+                self.assertEqual(st1['native_cancel']['workers'], 'delegated_observed')
+                self.assertFalse(st1['native_cancel']['all_descendants_proven_stopped'])
+                # Writer lock still held while Turn 2 intervention is pending
+                with self.assertRaisesRegex(ValueError, 'already owned'):
+                    c.start(client, agent='omp', cwd=directory, prompt='other writer', write=True)
+                waited = c.wait(client, task['id'], timeout=0.1)
+                self.assertEqual(waited['task']['turn'], 2)
+                t2_task = c.store.get(task['id'])
+                rc2 = run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'], epoch=t2_task.get('control_epoch', 1))
+                self.assertEqual(rc2, 0)
+                st2 = c.status(client, task['id'])
+                self.assertEqual(st2['state'], 'completed')
+                self.assertEqual(st2['native_result']['result'], 'Turn 2 resumed deliverable.')
+                self.assertEqual((state_dir / 'resumed_sid').read_text(), 'sess-exact-resume-1')
+                # No session/load called on Turn 2 prior to session/prompt
+                self.assertEqual((state_dir / 'loads_at_resume').read_text(), (state_dir / 'loads_before_turn2_prompt').read_text())
+                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+
+        # Case 2: Missing resume capability or disconnect on cancel -> retains HOLD (unknown)
+        for fail_mode in ('no_resume_cap', 'disconnect_on_cancel'):
+            with self.subTest(fail_mode=fail_mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_dir = root / ('state_' + fail_mode)
+                state_dir.mkdir()
+                exe = root / 'agy'
+                exe.write_text('#!' + sys.executable + '\n' + fake_agy)
+                exe.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE=fail_mode), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='4cs', cwd=directory, prompt='turn1', write=True)
+                    t1 = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                    t1.start()
+                    deadline = time.monotonic() + 5
+                    while not (state_dir / 'active').exists() and t1.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    if fail_mode == 'no_resume_cap':
+                        c.intervene(client, task['id'], 'revised turn2 goal', command_id='iv-fail', expected_turn=1)
+                    else:
+                        c.cancel(client, task['id'])
+                    t1.join(5)
+                    st = c.status(client, task['id'])
+                    self.assertEqual(st['state'], 'unknown')
+                    self.assertFalse(st['native_cancel']['resumable'])
+
+    def test_resumed_session_restores_coordinator_selection_and_fails_closed_on_bad_readback(self):
+        from agy_native import NativeOwner, ProtocolError
+
+        catalog_path = Path(__file__).parent / 'fixtures/agy_orchestrator_catalog.json'
+        catalog = json.loads(catalog_path.read_text())
+        fake_agy = '''import copy, json, os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_AGY_STATE'])
+mode = os.environ.get('FAKE_AGY_MODE', 'normal')
+catalog = json.loads((state / 'catalog.json').read_text())
+sid = 'sess-ocs-resume-1'
+standalone = {'gemini-pro-orchestrator', 'gemini-pro-orchestrator-argon'}
+active_model = 'gemini-4-carbon'
+active_effort = 'medium'
+closed = False
+loads = 0
+is_resume = False
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\\n')
+    sys.stdout.flush()
+
+def notify(u):
+    send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': sid, 'update': u}})
+
+def full_meta():
+    if active_model in catalog['selected']:
+        data = copy.deepcopy(catalog['selected'][active_model])
+    else:
+        data = copy.deepcopy(catalog['initial'])
+        data['models']['currentModelId'] = active_model + '-' + (active_effort or 'medium')
+        for opt in data['configOptions']:
+            if opt['id'] == 'model':
+                opt['currentValue'] = active_model
+            elif opt['id'] == 'thought_level':
+                opt['currentValue'] = active_effort
+    data['sessionId'] = sid
+    return data
+
+def cfg_only_meta(cid=None):
+    base = full_meta()
+    opts = base['configOptions']
+    if is_resume and mode == 'stale_model_readback':
+        for opt in opts:
+            if opt['id'] == 'model':
+                opt['currentValue'] = 'gemini-4-carbon'
+    elif is_resume and mode == 'residual_effort_on_standalone':
+        if not any(o['id'] == 'thought_level' for o in opts):
+            opts.append(copy.deepcopy(catalog['initial']['configOptions'][1]))
+    elif is_resume and mode == 'stale_effort_readback' and cid == 'thought_level':
+        for opt in opts:
+            if opt['id'] == 'thought_level':
+                opt['currentValue'] = 'medium'
+    res = {'configOptions': opts}
+    if is_resume and mode == 'mismatched_models_block':
+        res['models'] = {
+            'currentModelId': 'gemini-4-carbon-medium',
+            'availableModels': base['models']['availableModels'],
+        }
+    return res
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    rid, method, params = req.get('id'), req.get('method'), req.get('params', {})
+    with (state / 'rpcs.jsonl').open('a') as f:
+        f.write(json.dumps({'pid': os.getpid(), 'is_resume': is_resume, 'method': method, 'params': params}) + '\\n')
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {
+            'protocolVersion': 1,
+            'agentCapabilities': {'loadSession': True, 'sessionCapabilities': {'close': {}, 'resume': {}}},
+        }})
+    elif method == 'session/new':
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': full_meta()})
+    elif method == 'session/resume':
+        is_resume = True
+        (state / 'resumed_sid').write_text(str(params.get('sessionId')))
+        (state / 'loads_at_resume').write_text(str(loads))
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        meta = full_meta()
+        if mode == 'unadvertised_on_resume':
+            meta['models']['availableModels'] = [
+                m for m in meta['models']['availableModels'] if m['modelId'] != 'gemini-pro-orchestrator'
+            ]
+            for opt in meta['configOptions']:
+                if opt['id'] == 'model':
+                    opt['options'] = [o for o in opt['options'] if o['value'] != 'gemini-pro-orchestrator']
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta})
+    elif method == 'session/set_config_option':
+        if closed:
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32602, 'message': 'Session not found: ' + sid}})
+        else:
+            cid = params.get('configId')
+            val = params.get('value')
+            if cid == 'model':
+                active_model = val
+                active_effort = None if val in standalone else (active_effort or 'medium')
+            elif cid == 'thought_level':
+                active_effort = val
+            res = cfg_only_meta(cid=cid)
+            notify({'sessionUpdate': 'config_option_update', 'configOptions': res['configOptions']})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': res})
+    elif method == 'session/load':
+        loads += 1
+        if (state / 'turn2_prompt').exists():
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\nturn1'}})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'sw-1', 'title': 'swarm', 'kind': 'other', 'status': 'completed'})
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': (state / 'turn2_prompt').read_text()}})
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Resumed deliverable.\\n'}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': full_meta()})
+    elif method == 'session/prompt':
+        ptext = ''.join(p.get('text', '') for p in params.get('prompt', []))
+        if not is_resume:
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'sw-1', 'title': 'swarm', 'kind': 'other', 'status': 'completed'})
+            (state / 'active').touch()
+            rline = sys.stdin.readline()
+            if rline and json.loads(rline).get('method') == 'session/cancel':
+                send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'cancelled'}})
+        else:
+            (state / 'loads_before_turn2_prompt').write_text(str(loads))
+            (state / 'turn2_prompt').write_text(ptext)
+            (state / 'turn2_selection').write_text(json.dumps({'model': active_model, 'effort': active_effort}))
+            (state.parent / 'resumed.txt').write_text('RESUMED_OK')
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Resumed deliverable.\\n'}})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+    elif method == 'session/close':
+        closed = True
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {}})
+'''
+        positive_cases = [
+            ('ocs', None, 'gemini-pro-orchestrator', None),
+            ('4as', 'low', 'gemini-4-argon-low', 'low'),
+        ]
+        for start_model, start_effort, expected_model, expected_effort in positive_cases:
+            with self.subTest(case='positive', model=start_model, effort=start_effort), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_dir = root / 'state'
+                state_dir.mkdir()
+                (state_dir / 'catalog.json').write_text(json.dumps(catalog))
+                exe = root / 'agy'
+                exe.write_text('#!' + sys.executable + '\n' + fake_agy)
+                exe.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                                FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE='normal'), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model=start_model, effort=start_effort,
+                                   cwd=directory, prompt='turn1', write=True)
+                    rc1 = []
+                    t1 = threading.Thread(target=lambda: rc1.append(run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)))
+                    t1.start()
+                    deadline = time.monotonic() + 5
+                    while not (state_dir / 'active').exists() and t1.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue((state_dir / 'active').exists())
+                    c.intervene(client, task['id'], 'turn2 resume', command_id='cancel-resume-v1', expected_turn=1)
+                    t1.join(5)
+                    self.assertEqual(rc1, [0])
+                    st1 = c.status(client, task['id'])
+                    self.assertEqual(st1['state'], 'cancelled')
+                    self.assertTrue(st1['native_cancel']['resumable'])
+                    self.assertTrue(st1['native_cancel']['write_lock_retained'])
+                    waited = c.wait(client, task['id'], timeout=0.1)
+                    self.assertEqual(waited['task']['turn'], 2)
+                    t2_task = c.store.get(task['id'])
+                    rc2 = run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'],
+                                   epoch=t2_task.get('control_epoch', 1))
+                    st2 = c.status(client, task['id'])
+                    self.assertEqual(rc2, 0, st2.get('settlement_note'))
+                    self.assertEqual(st2['state'], 'completed', st2.get('settlement_note'))
+                    self.assertEqual(st2['model'], expected_model)
+                    self.assertEqual(st2['effort'], expected_effort)
+                    self.assertEqual(st2['native_result']['result'], 'Resumed deliverable.')
+                    self.assertEqual((root / 'resumed.txt').read_text(), 'RESUMED_OK')
+                    self.assertEqual((state_dir / 'resumed_sid').read_text(), 'sess-ocs-resume-1')
+                    self.assertEqual((state_dir / 'loads_at_resume').read_text(),
+                                     (state_dir / 'loads_before_turn2_prompt').read_text())
+                    actual_sel = json.loads((state_dir / 'turn2_selection').read_text())
+                    expected_family = expected_model if expected_effort is None else expected_model[:-(len(expected_effort) + 1)]
+                    self.assertEqual(actual_sel, {'model': expected_family, 'effort': expected_effort})
+                    self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+
+        negative_cases = [
+            ('stale_model_readback', 'ocs', None, True),
+            ('residual_effort_on_standalone', 'ocs', None, True),
+            ('stale_effort_readback', '4as', 'low', True),
+            ('mismatched_models_block', 'ocs', None, True),
+            ('unadvertised_on_resume', 'ocs', None, False),
+        ]
+        for fail_mode, start_model, start_effort, expect_set_cfg in negative_cases:
+            with self.subTest(fail_mode=fail_mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_dir = root / 'state'
+                state_dir.mkdir()
+                (state_dir / 'catalog.json').write_text(json.dumps(catalog))
+                exe = root / 'agy'
+                exe.write_text('#!' + sys.executable + '\n' + fake_agy)
+                exe.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                                FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE=fail_mode), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model=start_model, effort=start_effort,
+                                   cwd=directory, prompt='turn1', write=True)
+                    t1 = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                    t1.start()
+                    deadline = time.monotonic() + 5
+                    while not (state_dir / 'active').exists() and t1.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    c.intervene(client, task['id'], 'turn2 resume', command_id='cancel-resume-neg', expected_turn=1)
+                    t1.join(5)
+                    waited = c.wait(client, task['id'], timeout=0.1)
+                    self.assertEqual(waited['task']['turn'], 2)
+                    t2_task = c.store.get(task['id'])
+                    rc2 = run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'],
+                                   epoch=t2_task.get('control_epoch', 1))
+                    self.assertEqual(rc2, 1)
+                    st2 = c.status(client, task['id'])
+                    self.assertEqual(st2['state'], 'unknown')
+                    self.assertNotIn('native_cleanup', st2)
+                    self.assertFalse((root / 'resumed.txt').exists())
+                    rpcs = [json.loads(line) for line in (state_dir / 'rpcs.jsonl').read_text().splitlines()]
+                    t2_rpcs = [r for r in rpcs if r.get('is_resume')]
+                    close_idx = next((idx for idx, r in enumerate(t2_rpcs) if r['method'] == 'session/close'), len(t2_rpcs))
+                    pre_close_t2_rpcs = t2_rpcs[:close_idx]
+                    self.assertFalse(any(r['method'] == 'session/prompt' for r in t2_rpcs))
+                    self.assertFalse(any(r['method'] == 'session/load' for r in t2_rpcs))
+                    self.assertEqual(any(r['method'] == 'session/set_config_option' for r in pre_close_t2_rpcs), expect_set_cfg)
+                    if expect_set_cfg:
+                        self.assertIn('readback mismatch', st2.get('settlement_note', ''))
+                    else:
+                        self.assertIn('not advertised', st2.get('settlement_note', ''))
+                    with self.assertRaisesRegex(ValueError, 'already owned'):
+                        c.start(client, agent='omp', cwd=directory, prompt='other writer', write=True)
+                    self.assertEqual(c.close(client, task['id'])['state'], 'unknown')
+
+        # Direct unit check: two-step standalone -> family restoration on allow_load=False without owner.load()
+        owner = object.__new__(NativeOwner)
+        owner.task = dict(model='gemini-4-carbon', effort='low')
+        owner.session_id = 'owned'
+        calls = []
+
+        def unit_req(method, params, **kw):
+            calls.append((method, params))
+            self.assertEqual(method, 'session/set_config_option')
+            if params['configId'] == 'model':
+                return {'configOptions': json.loads(json.dumps(catalog['initial']['configOptions']))}, []
+            updated = json.loads(json.dumps(catalog['initial']['configOptions']))
+            updated[1]['currentValue'] = params['value']
+            return {'configOptions': updated}, []
+
+        with patch.object(owner, 'request', side_effect=unit_req), patch.object(owner, 'load') as load_mock:
+            res = owner.select(json.loads(json.dumps(catalog['selected']['gemini-pro-orchestrator'])), allow_load=False)
+        load_mock.assert_not_called()
+        self.assertEqual(res['model'], 'gemini-4-carbon-low')
+        self.assertEqual(res['effort'], 'low')
+        self.assertEqual([p['configId'] for _, p in calls], ['model', 'thought_level'])
+
+        # Missing models.currentModelId in session/resume metadata must fail closed
+        bad_meta = json.loads(json.dumps(catalog['selected']['gemini-pro-orchestrator']))
+        bad_meta['models'].pop('currentModelId', None)
+        owner2 = object.__new__(NativeOwner)
+        owner2.task = dict(model='gemini-pro-orchestrator')
+        owner2.session_id = 'owned'
+        with patch.object(owner2, 'request') as req_mock, patch.object(owner2, 'load') as load_mock:
+            with self.assertRaisesRegex(ProtocolError, 'readback'):
+                owner2.select(bad_meta, allow_load=False)
+        req_mock.assert_not_called()
+        load_mock.assert_not_called()
+
+    def test_resumed_turn_missing_boundary_degrades_preserving_live_outcomes_and_rejecting_stale_or_conflicting_replay(self):
+        catalog = json.loads((Path(__file__).parent / 'fixtures/agy_orchestrator_catalog.json').read_text())
+        fake_agy = '''import copy, json, os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_AGY_STATE'])
+mode = os.environ.get('FAKE_AGY_MODE', 'positive_ocs')
+catalog = json.loads((state / 'catalog.json').read_text())
+sid = 'sess-resumed-missing-boundary-1'
+standalone = {'gemini-pro-orchestrator', 'gemini-pro-orchestrator-argon'}
+active_model = 'gemini-4-carbon'
+active_effort = 'medium'
+closed = False
+is_resume = False
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\\n')
+    sys.stdout.flush()
+
+def notify(u):
+    send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': sid, 'update': u}})
+
+def full_meta():
+    if active_model in catalog['selected']:
+        data = copy.deepcopy(catalog['selected'][active_model])
+    else:
+        data = copy.deepcopy(catalog['initial'])
+        data['models']['currentModelId'] = active_model + '-' + (active_effort or 'medium')
+        for opt in data['configOptions']:
+            if opt['id'] == 'model':
+                opt['currentValue'] = active_model
+            elif opt['id'] == 'thought_level':
+                opt['currentValue'] = active_effort
+    data['sessionId'] = sid
+    return data
+
+def cfg_only_meta():
+    return {'configOptions': full_meta()['configOptions']}
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    rid, method, params = req.get('id'), req.get('method'), req.get('params', {})
+    with (state / 'rpcs.jsonl').open('a') as f:
+        f.write(json.dumps({'is_resume': is_resume, 'method': method}) + '\\n')
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {
+            'protocolVersion': 1,
+            'agentCapabilities': {'loadSession': True, 'sessionCapabilities': {'close': {}, 'resume': {}}},
+        }})
+    elif method == 'session/new':
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': full_meta()})
+    elif method == 'session/resume':
+        is_resume = True
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': full_meta()})
+    elif method == 'session/set_config_option':
+        if closed:
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32602, 'message': 'Session not found: ' + sid}})
+        else:
+            if params.get('configId') == 'model':
+                active_model = params.get('value')
+                active_effort = None if active_model in standalone else (active_effort or 'medium')
+            elif params.get('configId') == 'thought_level':
+                active_effort = params.get('value')
+            res = cfg_only_meta()
+            notify({'sessionUpdate': 'config_option_update', 'configOptions': res['configOptions']})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': res})
+    elif method == 'session/load':
+        # Omit Turn 2 prompt_text boundary while replaying Turn 1 failures, stale answer, and predecessor fatal.
+        notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\nturn1'}})
+        notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_ok_read', 'title': 'read_file', 'kind': 'read', 'status': 'completed'})
+        notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_fail_read', 'title': 'read_file', 'kind': 'read', 'status': 'failed'})
+        notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_edit', 'title': 'write_file', 'kind': 'edit', 'status': 'completed'})
+        notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'CALLCLI_STAGE CANCEL_WINDOW_READY\\nOLD_TURN1_STALE_ANSWER\\n\\u26a0 Agent execution terminated due to error.\\n'}})
+        notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_wait', 'title': 'run_command', 'kind': 'execute', 'status': 'failed'})
+        notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '[compacted resume prompt without slash prefix]'}})
+        if mode == 'turn2_tool_identity_conflict':
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'read', 'status': 'completed'})
+        elif mode == 'turn2_tool_status_regressed':
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'edit', 'status': 'failed'})
+        elif mode in {'positive_ocs', 'positive_dialogue'}:
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_plan', 'title': 'exit_plan_mode', 'kind': 'other', 'status': 'completed'})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'edit', 'status': 'completed'})
+            if (state / 'dlg_sent').exists():
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Confirmed resumed write: RESUMED_CANCEL_V1.\\n'}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': full_meta()})
+    elif method == 'session/prompt':
+        ptext = ''.join(p.get('text', '') for p in params.get('prompt', []))
+        if not is_resume:
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_ok_read', 'title': 'read_file', 'kind': 'read', 'status': 'completed'})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_fail_read', 'title': 'read_file', 'kind': 'read', 'status': 'failed'})
+            (state.parent / 'draft.txt').write_text('DRAFT_CANCEL_V1')
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_edit', 'title': 'write_file', 'kind': 'edit', 'status': 'completed'})
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'CALLCLI_STAGE CANCEL_WINDOW_READY\\n'}})
+            notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t1_wait', 'title': 'run_command', 'kind': 'execute', 'status': 'in_progress'})
+            (state / 't1_active').touch()
+            rline = sys.stdin.readline()
+            if rline and json.loads(rline).get('method') == 'session/cancel':
+                notify({'sessionUpdate': 'tool_call_update', 'toolCallId': 'call_t1_wait', 'status': 'failed'})
+                send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'cancelled'}})
+        elif ptext.startswith('CALLCLI_DIALOGUE '):
+            (state / 'dlg_sent').touch()
+            (state.parent / 'resumed.txt').write_text('RESUMED_CANCEL_V1')
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Confirmed resumed write: RESUMED_CANCEL_V1.\\n'}})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+        else:
+            if mode == 'positive_ocs':
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_plan', 'title': 'exit_plan_mode', 'kind': 'other', 'status': 'in_progress'})
+                notify({'sessionUpdate': 'tool_call_update', 'toolCallId': 'call_t2_plan', 'status': 'completed'})
+                (state.parent / 'resumed.txt').write_text('RESUMED_CANCEL_V1')
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'edit', 'status': 'completed'})
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'CALLCLI_STAGE RESUMED_CANCEL_VERIFIED\\n### Actual results\\n- Preserved draft.txt unchanged.\\n- Created resumed.txt containing RESUMED_CANCEL_V1.\\n'}})
+            elif mode == 'positive_dialogue':
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_plan', 'title': 'exit_plan_mode', 'kind': 'other', 'status': 'completed'})
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'edit', 'status': 'in_progress'})
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'CALLCLI_QUESTION Q1 Confirm resumed write?\\n'}})
+            elif mode == 'no_live_answer_old_replay':
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_read', 'title': 'read_file', 'kind': 'read', 'status': 'completed'})
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'CALLCLI_STAGE TURN2_STAGE_ONLY\\n'}})
+            elif mode == 'board_nav_only_old_replay':
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Run /swarm board to open the live board.\\n'}})
+            elif mode == 'turn2_live_fatal':
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Draft before fatal\\n\\u26a0 Agent execution terminated due to error.\\n'}})
+            elif mode == 'turn2_unrecovered_tool_failure':
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Draft before failure\\n'}})
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_fail', 'title': 'run_command', 'kind': 'execute', 'status': 'failed'})
+            elif mode in {'turn2_tool_identity_conflict', 'turn2_tool_status_regressed'}:
+                notify({'sessionUpdate': 'tool_call', 'toolCallId': 'call_t2_write', 'title': 'write_file', 'kind': 'edit', 'status': 'completed'})
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Claimed answer despite conflict.\\n'}})
+            elif mode == 'turn2_live_interrupted_diagnostic':
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'The stream was interrupted. Please continue the task you were working on.\\n'}})
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+    elif method == 'session/close':
+        closed = True
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {}})
+'''
+        @contextlib.contextmanager
+        def setup_resumed_cancel(mode):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_dir = root / 'state'
+                state_dir.mkdir()
+                (state_dir / 'catalog.json').write_text(json.dumps(catalog))
+                exe = root / 'agy'
+                exe.write_text('#!' + sys.executable + '\n' + fake_agy)
+                exe.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                                FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE=mode), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='ocs', cwd=directory, prompt='turn1', write=True)
+                    rc1 = []
+                    t1 = threading.Thread(target=lambda: rc1.append(
+                        run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1)))
+                    t1.start()
+                    deadline = time.monotonic() + 5
+                    while not (state_dir / 't1_active').exists() and t1.is_alive() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue((state_dir / 't1_active').exists())
+                    c.intervene(client, task['id'], 'turn2 resume', command_id='cancel-resume-v1', expected_turn=1)
+                    t1.join(5)
+                    self.assertEqual(rc1, [0])
+                    waited = c.wait(client, task['id'], timeout=0.1)
+                    self.assertEqual(waited['task']['turn'], 2)
+                    t2_task = c.store.get(task['id'])
+                    yield root, state_dir, c, client, task, t2_task
+
+        # Positive 1: Exact missing-boundary shape (a7e778fd204a402b) settles completed with Turn 2 live result
+        with self.subTest(case='positive_ocs'), setup_resumed_cancel('positive_ocs') as (root, state_dir, c, client, task, t2_task):
+            rc2 = run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'], epoch=t2_task.get('control_epoch', 1))
+            st2 = c.status(client, task['id'])
+            self.assertEqual(rc2, 0, st2.get('settlement_note'))
+            self.assertEqual(st2['state'], 'completed', st2.get('settlement_note'))
+            self.assertEqual((root / 'draft.txt').read_text(), 'DRAFT_CANCEL_V1')
+            self.assertEqual((root / 'resumed.txt').read_text(), 'RESUMED_CANCEL_V1')
+            self.assertIs(st2['native_observation']['history_degraded'], True)
+            self.assertEqual(st2['native_observation']['history_diagnostic']['reason_code'], 'resumed_boundary_missing')
+            self.assertIs(st2['native_cleanup']['session_unloaded'], True)
+            self.assertIn('Created resumed.txt containing RESUMED_CANCEL_V1.', st2['native_result']['result'])
+            self.assertNotIn('OLD_TURN1_STALE_ANSWER', st2['native_result']['result'])
+            t2_events = [e for e in c.events(client, task['id']) if e.get('turn') == 2]
+            t2_stages = [e['text'] for e in t2_events if e['kind'] == 'stage']
+            self.assertEqual(t2_stages.count('RESUMED_CANCEL_VERIFIED'), 1)
+            self.assertNotIn('CANCEL_WINDOW_READY', t2_stages)
+            self.assertNotIn('OLD_TURN1_STALE_ANSWER', '\n'.join(e.get('text', '') for e in t2_events))
+            self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+
+        # Positive 2: Turn 2 live question + dialogue settles under missing resumed boundary without adopting Turn 1 answer
+        with self.subTest(case='positive_dialogue'), setup_resumed_cancel('positive_dialogue') as (root, state_dir, c, client, task, t2_task):
+            rc2 = []
+            t2 = threading.Thread(target=lambda: rc2.append(
+                run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'], epoch=t2_task.get('control_epoch', 1))))
+            t2.start()
+            try:
+                deadline = time.monotonic() + 5
+                q_id = None
+                while time.monotonic() < deadline and t2.is_alive():
+                    st = c.status(client, task['id'])
+                    if st.get('questions'):
+                        q_id = st['questions'][0]
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(q_id)
+                st_q = c.status(client, task['id'])
+                self.assertEqual(st_q['state'], 'running', st_q.get('settlement_note'))
+                c.dialogue(client, task['id'], 'Proceed writing resumed.txt', expected_turn=2, command_id='dlg-resumed-1', question_id=q_id)
+                t2.join(6)
+                self.assertFalse(t2.is_alive())
+                st2 = c.status(client, task['id'])
+                self.assertEqual(rc2, [0], st2.get('settlement_note'))
+                self.assertEqual(st2['state'], 'completed', st2.get('settlement_note'))
+                self.assertEqual(st2['native_result']['interaction_seq'], 1)
+                self.assertEqual(st2['native_result']['result'], 'Confirmed resumed write: RESUMED_CANCEL_V1.')
+                self.assertNotIn('OLD_TURN1_STALE_ANSWER', st2['native_result']['result'])
+                self.assertEqual((root / 'resumed.txt').read_text(), 'RESUMED_CANCEL_V1')
+                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+            finally:
+                if t2.is_alive():
+                    c.cancel(client, task['id'])
+                    t2.join(3)
+
+        # Negative controls: missing resumed boundary must NEVER adopt old Turn 1 replay or hide Turn 2 failures/conflicts
+        neg_modes = (
+            'no_live_answer_old_replay',
+            'board_nav_only_old_replay',
+            'turn2_live_fatal',
+            'turn2_unrecovered_tool_failure',
+            'turn2_tool_identity_conflict',
+            'turn2_tool_status_regressed',
+            'turn2_live_interrupted_diagnostic',
+        )
+        for neg_mode in neg_modes:
+            with self.subTest(neg_mode=neg_mode), setup_resumed_cancel(neg_mode) as (root, state_dir, c, client, task, t2_task):
+                rc2 = run_task(c.store.path, task['id'], turn=2, launch_id=t2_task['launch_id'], epoch=t2_task.get('control_epoch', 1))
+                st2 = c.status(client, task['id'])
+                self.assertEqual(rc2, 1)
+                self.assertEqual(st2['state'], 'unknown')
+                self.assertNotIn('native_result', st2)
+                self.assertNotIn('native_cleanup', st2)
+                self.assertNotIn('OLD_TURN1_STALE_ANSWER', json.dumps(st2))
+                with self.assertRaisesRegex(ValueError, 'already owned'):
+                    c.start(client, agent='omp', cwd=str(root), prompt='conflicting writer', write=True)
+                self.assertEqual(c.close(client, task['id'])['state'], 'unknown')
+
 

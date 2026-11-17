@@ -92,7 +92,23 @@ for line in sys.stdin:
     with (root/'requests.jsonl').open('a') as f:
         f.write(json.dumps(msg)+'\n')
     if method == 'initialize':
-        result = dict(protocolVersion=1, agentCapabilities=dict(loadSession=True, sessionCapabilities=dict(close={})))
+        scaps = dict(close={})
+        if not os.environ.get('AGY_NATIVE_NO_RESUME'):
+            scaps['resume'] = {}
+        result = dict(protocolVersion=1, agentCapabilities=dict(loadSession=True, sessionCapabilities=scaps))
+    elif method == 'session/resume':
+        if closed or msg.get('params', {}).get('sessionId') != session:
+            send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
+            continue
+        result = metadata()
+        if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
+            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
+        if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
+            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
+        if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
+            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
+        if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
+            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
     elif method == 'session/new':
         if closed:
             session = str(uuid.uuid4())
