@@ -11,7 +11,7 @@
 - **协调主机**：本机 POSIX，或已有 SSH 别名；记录源码入口的绝对路径。
 - **发起端**：普通终端、OMP、Codex、Pi，或 Hermes 原生工具。
 - **任务库**：一个明确的 DB 路径。后续调用始终复用同一位置。
-- **执行目标**：`local` 或已有 SSH 别名；目标 agent 为 `omp`、`codex`、`pi`、`agy` 之一（`agy` 需先发现并显式传入 `--model`）；使用目标设备上的绝对 cwd。
+- **执行目标**：`local` 或已有 SSH 别名；目标 agent 为 `omp`、`codex`、`pi`、`agy` 之一（新 `agy` 默认 `ocs`，不强绑默认 worker 型号，详见 [AGY 模型参考](../skill/references/agy-models.md)）；使用目标设备上的绝对 cwd。
 - **接入范围**：仅源码入口、增加技能、按任务传递技能（`--skill` / `--target-skill` / `--skills-json`），或增加 Hermes 模块。按用户指定范围选择，不默认全部安装。
 - **权限**：只读为起点；写任务需用户授权具体目标和路径。
 
@@ -100,7 +100,7 @@ Call CLI 使用 ACPX 的原生 agent 解析。OMP 可通过自定义 agent comma
 
 这只是合并片段。核对该版本 ACPX 的全局 `~/.acpx/config.json` 与 cwd 内 `.acpxrc.json` 规则，合并所需字段，不把示例整份覆盖到现有配置。Codex／Pi 使用实际安装的 ACP 适配，发现缺口先确认适配器入口，不把普通交互 CLI 或 Codex `app-server` 直接当作 ACP 程序。
 
-新增设备别名不等于新增 CLI 后端；目标接受 OMP/Codex/Pi/AGY。未指定 AGY 模型用 G4C；G4C 默认 native、G4A 默认单代理 off，可显式覆盖，worker 默认 G4H。旧任务沿记录路径。Windows Codex 的 SSH 边界见 [CODEX_SSH.md](../CODEX_SSH.md)，不自动切路由。
+新增设备别名不等于新增 CLI 后端；目标接受 OMP/Codex/Pi/AGY。新 AGY 任务默认 `ocs` 且不默认强指定 worker 型号，简称、显式模式与精确模型规则见 [AGY 模型参考](../skill/references/agy-models.md)；旧任务沿已记录路径。Windows Codex 的 SSH 边界见 [CODEX_SSH.md](../CODEX_SSH.md)，不自动切路由。
 
 ## 4. 选择入口与模块
 

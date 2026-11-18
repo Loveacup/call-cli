@@ -23,10 +23,12 @@ replay_index = 0
 dialogue_history = []
 dialogue_inputs = []
 dialogue_commands = set()
+dialogue_last_seq = 0
 answer_map = []
 deferred_seq = 0
 deferred_slots = {}
 deferred_answers = []
+teamwork_q5_slot = None
 review_prompts = 0
 review_loads = 0
 
@@ -137,10 +139,41 @@ for line in sys.stdin:
         prompted = True
         if os.environ.get('AGY_TEAMWORK_THIN'):
             body=msg['params']['prompt'][0]['text']
+            fault=os.environ['AGY_TEAMWORK_THIN']
             captured=list(saved)
             if body.startswith('CALLCLI_DIALOGUE '):
                 header,content=body.split('\n\n',1)
+                if fault=='deferred-tool-before-user':
+                    captured.append(dict(sessionUpdate='tool_call',toolCallId='intervening-tool',
+                        name='read_file',kind='read',status='completed'))
+                    update(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body)))
+                    text('Final reviewed result after intervening tool.\n')
+                    saved=captured
+                    captured=None
+                    send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                    continue
                 update(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body)))
+                if fault in {'coexisting-q1-q4','multi-q1-q4'}:
+                    header_obj,_=json.JSONDecoder().raw_decode(header[len('CALLCLI_DIALOGUE '):])
+                    cmd_id=header_obj.get('command_id')
+                    if fault=='coexisting-q1-q4':
+                        if cmd_id=='ans-1-4':
+                            text('Summary after Q1-Q4.\n')
+                        elif cmd_id=='unrelated-rev':
+                            text('Unrelated revision note applied.\n')
+                        elif cmd_id=='ans-5':
+                            text('Final review: Q1-Q5 scope confirmed.\n')
+                    else:
+                        if cmd_id=='ans-1-2':
+                            text('Partial summary after Q1-Q2.\n')
+                        elif cmd_id=='ans-3-4':
+                            text('CALLCLI_QUESTION Q5 Confirm final release?\nSummary after Q3-Q4 awaiting Q5.\n')
+                        elif cmd_id=='ans-5':
+                            text('Final review: all 5 formal questions settled.\n')
+                    saved=captured
+                    captured=None
+                    send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
+                    continue
                 if os.environ['AGY_TEAMWORK_THIN']=='cancel-dialogue':
                     (root/'dialogue-active').touch()
                     pending=json.loads(sys.stdin.readline())
@@ -319,6 +352,55 @@ for line in sys.stdin:
                 captured = None
                 send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
                 continue
+            if fault == 'multi-question':
+                if not body.startswith('CALLCLI_DIALOGUE '):
+                    update(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)))
+                    text('CALLCLI_STAGE workflow intake\nCALLCLI_QUESTION Q1 Scope?\nCALLCLI_QUESTION Q2 Target?\nCALLCLI_QUESTION Q3 Format?\n')
+                    saved = captured
+                    captured = None
+                    send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+                    continue
+                else:
+                    import select
+                    header_obj, _ = json.JSONDecoder().raw_decode(body[len('CALLCLI_DIALOGUE '):])
+                    prompt_content = body.split('\n\n', 1)[1]
+                    with (root / 'dynamic-dialogue-headers.jsonl').open('a') as f:
+                        f.write(json.dumps(dict(header=header_obj, prompt=prompt_content)) + '\n')
+                    cmd_id = str(header_obj.get('command_id'))
+                    if (root / ('gate-' + cmd_id)).exists():
+                        (root / ('inflight-' + cmd_id)).touch()
+                        cancelled_while_gated = False
+                        while not (root / ('release-' + cmd_id)).exists():
+                            if select.select([sys.stdin], [], [], 0.01)[0]:
+                                pending_line = sys.stdin.readline()
+                                if not pending_line:
+                                    break
+                                pending = json.loads(pending_line)
+                                with (root / 'requests.jsonl').open('a') as f:
+                                    f.write(json.dumps(pending) + '\n')
+                                if pending.get('method') == 'session/cancel':
+                                    (root / 'cancelled').touch()
+                                    send(dict(id=msg['id'], result=dict(stopReason='cancelled')))
+                                    captured = None
+                                    cancelled_while_gated = True
+                                    break
+                        if cancelled_while_gated:
+                            continue
+                    if (root / ('eof-' + cmd_id)).exists():
+                        raise SystemExit(7)
+                    update(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=body)))
+                    if (root / ('ask-q4-' + cmd_id)).exists():
+                        text('CALLCLI_STAGE subset recorded\nCALLCLI_QUESTION Q4 Confirm final?\n')
+                        saved = captured
+                        captured = None
+                        send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+                        continue
+                    if (root / ('hold-workflow-' + cmd_id)).exists():
+                        text('CALLCLI_STAGE awaiting remaining inputs\n')
+                        saved = captured
+                        captured = None
+                        send(dict(id=msg['id'], result=dict(stopReason='end_turn')))
+                        continue
             text('CALLCLI_STAGE workflow pending\n')
             script = '' if fault=='bad-script' else 'print("synthetic")'
             native_skip_cli = '--dangerously-skip-permissions' in sys.argv
@@ -410,20 +492,40 @@ for line in sys.stdin:
                     header, _ = json.JSONDecoder().raw_decode(body[len('CALLCLI_DIALOGUE '):])
                     seq = header['interaction_seq']
                     if (header['task'] != (root/'task-id').read_text() or header['turn'] != turn
-                            or type(seq) is not int or seq != len(dialogue_inputs)+1
+                            or type(seq) is not int or seq <= dialogue_last_seq
                             or not isinstance(header['command_id'], str) or not header['command_id']
                             or header['command_id'] in dialogue_commands):
                         raise ValueError('identity mismatch')
                     question = header.get('question')
+                    qids = header.get('question_ids')
+                    qmetas = header.get('questions')
+                    expected = {'Q1':'Q1 Format?', 'Q2':'Q2 Destination?'}
+                    if header.get('question_id') is not None and qids is not None:
+                        raise ValueError('mutually exclusive question_id and question_ids')
                     if header.get('question_id') is not None:
-                        expected = {'Q1':'Q1 Format?', 'Q2':'Q2 Destination?'}
+                        if qmetas is not None:
+                            raise ValueError('unexpected questions')
                         if (not isinstance(question, dict) or question['id'] != header['question_id']
                                 or question['interaction_seq'] != 0 or question['text'] != expected.get(question['label'])
                                 or any(q['label']==question['label'] for q in answer_map)):
                             raise ValueError('question mapping mismatch')
                         answer_map.append(question)
-                    elif question is not None:
+                    elif qids is not None:
+                        if question is not None:
+                            raise ValueError('unexpected question')
+                        if (not isinstance(qids, list) or not qids or len(set(qids)) != len(qids)
+                                or not isinstance(qmetas, list) or len(qmetas) != len(qids)):
+                            raise ValueError('question_ids mapping mismatch')
+                        for qid, qmeta in zip(qids, qmetas):
+                            if (not isinstance(qid, str) or not qid or not isinstance(qmeta, dict)
+                                    or qmeta['id'] != qid or qmeta['interaction_seq'] != 0
+                                    or qmeta['text'] != expected.get(qmeta['label'])
+                                    or any(q['label']==qmeta['label'] for q in answer_map)):
+                                raise ValueError('question_ids element mismatch')
+                            answer_map.append(qmeta)
+                    elif question is not None or qmetas is not None:
                         raise ValueError('unexpected question')
+                    dialogue_last_seq = seq
                     dialogue_commands.add(header['command_id'])
                     dialogue_inputs.append(body.split('\n\n', 1)[1])
                     (root/'answer-map.json').write_text(json.dumps(answer_map))
@@ -432,6 +534,17 @@ for line in sys.stdin:
                     send(dict(id=msg['id'], error=dict(code=-32602, message='Invalid dialogue identity')))
                     continue
                 (root/'dialogue-prompt-outstanding').touch()
+                if os.environ.get('AGY_NATIVE_DIALOGUE_CANCEL') and seq == 1:
+                    (root/'dialogue-cancel-ready').touch()
+                    for pending_line in sys.stdin:
+                        pending = json.loads(pending_line)
+                        with (root/'requests.jsonl').open('a') as f:
+                            f.write(json.dumps(pending)+'\n')
+                        if pending.get('method') == 'session/cancel':
+                            (root/'cancelled').touch()
+                            break
+                    send(dict(id=msg['id'], result=dict(stopReason='cancelled')))
+                    continue
                 if os.environ.get('AGY_NATIVE_DIALOGUE_GATE') and seq == 1:
                     deadline = time.monotonic()+5
                     while not (root/'dialogue-continue').exists() and time.monotonic()<deadline:
@@ -450,7 +563,7 @@ for line in sys.stdin:
                     dict(sessionUpdate='tool_call', toolCallId='dispatch'+str(seq), name='swarm', status='completed',
                         args=dict(action='post_message', name='worker-a')),
                     dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_STAGE coordinator-reported ACK '+str(seq)+'\n'))]
-                if seq == 2:
+                if seq == 2 or (len(answer_map) == 2 and not os.environ.get('AGY_NATIVE_DIALOGUE_QUESTION')):
                     (root/'revision.txt').write_text(';'.join(dialogue_inputs))
                     dialogue_history += [dict(sessionUpdate='tool_call', toolCallId='kill', name='swarm', status='completed',
                         args=dict(action='kill', name='worker-a')),
@@ -498,16 +611,48 @@ for line in sys.stdin:
             continue
         captured = []
         if os.environ.get('AGY_TEAMWORK_THIN'):
-            if prompted and (root/'interview').exists() and not (root/'asked').exists():
-                saved.extend([dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',
-                    kind='other',status='completed'),dict(sessionUpdate='agent_message_chunk',
-                    content=dict(type='text',text='CALLCLI_QUESTION Q1 Which audience and three checks?' if os.environ['AGY_TEAMWORK_THIN']=='unterminated-failure' else 'CALLCLI_QUESTION Q1 Which label for the brief?\n'))])
-                (root/'asked').touch()
-            if prompted and (root/'finish').exists() and not (root/'result.txt').exists():
-                (root/'result.txt').write_text('review of revised brief')
-                saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
-                    # A later response must not concatenate onto the Q2 line.
-                    text='\n- **任务状态**：失败并按指令自然停止（受原生写入权限确认超时阻塞，未扩权、未反复派工、未伪造产物）。\n- **阻塞原因**：Teamwork root（`[SESSION]`）回报称其调用原生 `write_file` 创建 [brief.md](file://[SCRATCH]/work/brief.md) 时，因等待终端控制台权限确认超时（60s timeout）被系统安全机制取消。\n' if os.environ['AGY_TEAMWORK_THIN']=='unterminated-failure' else 'Final review: revised brief inspected; invoke_subagent delegation is documented.\n')))
+            fault = os.environ['AGY_TEAMWORK_THIN']
+            if fault=='coexisting-q1-q4':
+                if prompted and (root/'interview').exists() and not (root/'asked').exists():
+                    saved.extend([
+                        dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',kind='other',status='completed'),
+                        dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                            text='CALLCLI_QUESTION Q1 Scope?\nCALLCLI_QUESTION Q2 Target?\nCALLCLI_QUESTION Q3 Format?\nCALLCLI_QUESTION Q4 Priority?\n')),
+                        dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                            text='CALLCLI_QUESTION Q5 Confirm scope?')),
+                    ])
+                    teamwork_q5_slot = len(saved)-1
+                    (root/'asked').touch()
+                if (root/'recover-q5').exists() and not (root/'recovered-q5').exists() and teamwork_q5_slot is not None:
+                    saved[teamwork_q5_slot]['content']['text'] = 'CALLCLI_QUESTION Q5 Confirm scope?\n'
+                    (root/'recovered-q5').touch()
+            elif fault=='multi-q1-q4':
+                if prompted and (root/'interview').exists() and not (root/'asked').exists():
+                    saved.extend([
+                        dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',kind='other',status='completed'),
+                        dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                            text='CALLCLI_QUESTION Q1 Scope?\nCALLCLI_QUESTION Q2 Target?\nCALLCLI_QUESTION Q3 Format?\nCALLCLI_QUESTION Q4 Priority?\n')),
+                    ])
+                    (root/'asked').touch()
+            elif fault=='deferred-tool-before-user':
+                if prompted and (root/'interview').exists() and not (root/'asked').exists():
+                    saved.extend([
+                        dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',kind='other',status='completed'),
+                        dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                            text='CALLCLI_QUESTION Q1 Which audience and scope?')),
+                    ])
+                    (root/'asked').touch()
+            else:
+                if prompted and (root/'interview').exists() and not (root/'asked').exists():
+                    saved.extend([dict(sessionUpdate='tool_call',toolCallId='interview',name='ask_question',
+                        kind='other',status='completed'),dict(sessionUpdate='agent_message_chunk',
+                        content=dict(type='text',text='CALLCLI_QUESTION Q1 Which audience and three checks?' if fault=='unterminated-failure' else 'CALLCLI_QUESTION Q1 Which label for the brief?\n'))])
+                    (root/'asked').touch()
+                if prompted and (root/'finish').exists() and not (root/'result.txt').exists():
+                    (root/'result.txt').write_text('review of revised brief')
+                    saved.append(dict(sessionUpdate='agent_message_chunk',content=dict(type='text',
+                        # A later response must not concatenate onto the Q2 line.
+                        text='\n- **任务状态**：失败并按指令自然停止（受原生写入权限确认超时阻塞，未扩权、未反复派工、未伪造产物）。\n- **阻塞原因**：Teamwork root（`[SESSION]`）回报称其调用原生 `write_file` 创建 [brief.md](file://[SCRATCH]/work/brief.md) 时，因等待终端控制台权限确认超时（60s timeout）被系统安全机制取消。\n' if fault=='unterminated-failure' else 'Final review: revised brief inspected; invoke_subagent delegation is documented.\n')))
             for entry in saved: update(entry)
             send(dict(id=msg['id'],result=metadata()))
             captured=None

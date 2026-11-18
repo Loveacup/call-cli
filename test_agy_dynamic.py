@@ -1317,5 +1317,270 @@ for line in sys.stdin:
                 self.assertEqual(stops, [False])
                 self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
 
+    def test_selected_question_ids_reach_dynamic_prompt(self):
+        with self.workspace('question', agy_approval=None) as (root, handle, task, thread, status, events, wait):
+            wait(lambda: bool(status().get('questions')))
+            ids = list(status()['questions'])
+            handle(dict(action='dialogue', task_id=task['id'], prompt='use revised label',
+                        expected_turn=1, command_id='multi-answer', question_ids=ids))
+            thread.join(6)
+            st = status()
+            prompts = [r for r in self.requests(root) if r.get('method') == 'session/prompt']
+            body = prompts[-1]['params']['prompt'][0]['text']
+            header, _ = json.JSONDecoder().raw_decode(body[len('CALLCLI_DIALOGUE '):])
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(st['state'], 'completed', st.get('settlement_note'))
+            self.assertEqual(st['commands']['multi-answer']['status'], 'returned')
+            self.assertEqual(len(prompts), 2)
+            self.assertIn('question', header)
+            self.assertIsNone(header.get('question'))
+            self.assertEqual(header.get('question_ids'), ids)
+            self.assertEqual([q['id'] for q in header['questions']], ids)
+            self.assertEqual(st['questions'], [])
+            self.assertEqual(st.get('answers'), {ids[0]: 'use revised label'})
+            self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+
+    def test_dynamic_question_ids_multi_subset_gates_and_approval_modes(self):
+        for approval in (None, 'approve-all'):
+            with self.subTest(approval=approval), self.workspace('multi-question', agy_approval=approval) as (
+                    root, handle, task, thread, status, events, wait):
+                wait(lambda: len(status().get('questions', [])) == 3)
+                q1, q2, q3 = status()['questions']
+                (root / 'gate-ans-q3-q1').touch()
+                (root / 'ask-q4-ans-q3-q1').touch()
+                try:
+                    handle(dict(action='dialogue', task_id=task['id'], prompt='Q3=json; Q1=core',
+                                expected_turn=1, command_id='ans-q3-q1', question_ids=[q3, q1]))
+                    wait(lambda: (root / 'inflight-ans-q3-q1').exists())
+                    st_inflight = status()
+                    self.assertEqual(st_inflight['commands']['ans-q3-q1']['status'], 'send_started')
+                    self.assertEqual(st_inflight['questions'], [q1, q2, q3])
+                    self.assertEqual(st_inflight.get('answers', {}), {})
+
+                    st_queued = handle(dict(action='dialogue', task_id=task['id'], prompt='queued q2',
+                                              expected_turn=1, command_id='queued-q2', question_ids=[q2]))['task']
+                    self.assertEqual(st_queued['commands']['queued-q2']['status'], 'accepted')
+                    self.assertEqual(st_queued['questions'], [q1, q2, q3])
+
+                    st_withdraw = handle(dict(action='dialogue', task_id=task['id'], expected_turn=1,
+                                                command_id='withdraw-q2', target_command_id='queued-q2',
+                                                withdraw=True))['task']
+                    self.assertEqual(st_withdraw['commands']['withdraw-q2']['status'], 'returned')
+                    self.assertEqual(st_withdraw['commands']['queued-q2']['status'], 'withdrawn')
+                finally:
+                    (root / 'release-ans-q3-q1').touch()
+
+                wait(lambda: status()['commands']['ans-q3-q1']['status'] == 'returned'
+                             and len(status().get('questions', [])) == 2)
+                st_mid = status()
+                q4 = st_mid['questions'][1]
+                self.assertEqual(st_mid['questions'], [q2, q4])
+                self.assertEqual(st_mid.get('answers'), {q3: 'Q3=json; Q1=core', q1: 'Q3=json; Q1=core'})
+                self.assertEqual(st_mid['state'], 'running')
+                reqs_mid = self.requests(root)
+                self.assertEqual(sum(r.get('method') == 'session/prompt' for r in reqs_mid), 2)
+                self.assertEqual(sum(r.get('method') == 'session/close' for r in reqs_mid), 0)
+                hdrs_mid = [json.loads(ln) for ln in (root / 'dynamic-dialogue-headers.jsonl').read_text().splitlines()]
+                self.assertEqual(len(hdrs_mid), 1)
+                h1 = hdrs_mid[0]['header']
+                self.assertIn('question', h1)
+                self.assertIsNone(h1.get('question'))
+                self.assertEqual(h1['question_ids'], [q3, q1])
+                self.assertEqual(h1['questions'], [
+                    dict(id=q3, label='Q3', interaction_seq=0, text='Q3 Format?',
+                         sha256=hashlib.sha256(b'Q3 Format?').hexdigest(), length=len('Q3 Format?')),
+                    dict(id=q1, label='Q1', interaction_seq=0, text='Q1 Scope?',
+                         sha256=hashlib.sha256(b'Q1 Scope?').hexdigest(), length=len('Q1 Scope?')),
+                ])
+
+                handle(dict(action='dialogue', task_id=task['id'], prompt='Q2=local; Q4=yes',
+                            expected_turn=1, command_id='ans-q2-q4', question_ids=[q2, q4]))
+                if approval == 'approve-all':
+                    self.approve(handle, task, status, wait)
+                thread.join(6)
+                self.assertFalse(thread.is_alive())
+                st_end = status()
+                self.assertEqual(st_end['state'], 'completed', st_end.get('settlement_note'))
+                self.assertEqual(st_end['native_phase'], 'settled')
+                self.assertEqual(st_end['questions'], [])
+                self.assertEqual(st_end['answers'], {
+                    q3: 'Q3=json; Q1=core',
+                    q1: 'Q3=json; Q1=core',
+                    q2: 'Q2=local; Q4=yes',
+                    q4: 'Q2=local; Q4=yes',
+                })
+                reqs_end = self.requests(root)
+                self.assertEqual(sum(r.get('method') == 'session/prompt' for r in reqs_end), 3)
+                hdrs_end = [json.loads(ln) for ln in (root / 'dynamic-dialogue-headers.jsonl').read_text().splitlines()]
+                self.assertEqual(len(hdrs_end), 2)
+                h2 = hdrs_end[1]['header']
+                self.assertIn('question', h2)
+                self.assertIsNone(h2.get('question'))
+                self.assertEqual(h2['question_ids'], [q2, q4])
+                self.assertEqual([q['interaction_seq'] for q in h2['questions']], [0, 1])
+                self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+
+        for outcome in ('cancel', 'eof'):
+            with self.subTest(outcome=outcome), self.workspace('multi-question', agy_approval=None) as (
+                    root, handle, task, thread, status, events, wait):
+                wait(lambda: len(status().get('questions', [])) == 3)
+                q1, q2, q3 = status()['questions']
+                if outcome == 'cancel':
+                    (root / 'gate-ans-q1-q2').touch()
+                    handle(dict(action='dialogue', task_id=task['id'], prompt='partial q1 q2',
+                                expected_turn=1, command_id='ans-q1-q2', question_ids=[q1, q2]))
+                    wait(lambda: (root / 'inflight-ans-q1-q2').exists())
+                    handle(dict(action='cancel', task_id=task['id']))
+                    thread.join(6)
+                    self.assertFalse(thread.is_alive())
+                    st = status()
+                    self.assertEqual(st['state'], 'cancelled')
+                    self.assertEqual(st['commands']['ans-q1-q2']['status'], 'cancelled')
+                    self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+                else:
+                    (root / 'eof-ans-q1-q2').touch()
+                    handle(dict(action='dialogue', task_id=task['id'], prompt='partial q1 q2',
+                                expected_turn=1, command_id='ans-q1-q2', question_ids=[q1, q2]))
+                    thread.join(6)
+                    self.assertFalse(thread.is_alive())
+                    st = status()
+                    self.assertEqual(st['state'], 'unknown')
+                    self.assertEqual(st['commands']['ans-q1-q2']['status'], 'unknown')
+                    self.assertNotIn('native_cleanup', st)
+                self.assertEqual(st['questions'], [q1, q2, q3])
+                self.assertEqual(st.get('answers', {}), {})
+
+    def test_dynamic_dialogue_header_byte_preservation_and_surfaces(self):
+        with self.workspace('multi-question', surface='hermes', agy_approval=None) as (
+                root, handle, task, thread, status, events, wait):
+            wait(lambda: len(status().get('questions', [])) == 3)
+            q1, q2, q3 = status()['questions']
+            (root / 'hold-workflow-unbound-1').touch()
+            (root / 'hold-workflow-single-q2').touch()
+
+            handle(dict(action='dialogue', task_id=task['id'], prompt='unbound follow-up note',
+                        expected_turn=1, command_id='unbound-1'))
+            wait(lambda: status()['commands']['unbound-1']['status'] == 'returned')
+            self.assertEqual(status()['questions'], [q1, q2, q3])
+
+            handle(dict(action='dialogue', task_id=task['id'], prompt='Q2=staging',
+                        expected_turn=1, command_id='single-q2', question_id=q2))
+            wait(lambda: status()['commands']['single-q2']['status'] == 'returned')
+            self.assertEqual(status()['questions'], [q1, q3])
+
+            handle(dict(action='dialogue', task_id=task['id'], prompt='Q3=yaml; Q1=all',
+                        expected_turn=1, command_id='multi-q3-q1', question_ids=[q3, q1]))
+            thread.join(6)
+            self.assertFalse(thread.is_alive())
+            st = status()
+            self.assertEqual(st['state'], 'completed', st.get('settlement_note'))
+            self.assertEqual(st['questions'], [])
+            self.assertEqual(st['answers'], {q2: 'Q2=staging', q3: 'Q3=yaml; Q1=all', q1: 'Q3=yaml; Q1=all'})
+            self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+
+            prompts = [r['params']['prompt'][0]['text'] for r in self.requests(root) if r.get('method') == 'session/prompt']
+            self.assertEqual(len(prompts), 4)
+            q1_meta = dict(id=q1, label='Q1', interaction_seq=0, text='Q1 Scope?',
+                           sha256=hashlib.sha256(b'Q1 Scope?').hexdigest(), length=len('Q1 Scope?'))
+            q2_meta = dict(id=q2, label='Q2', interaction_seq=0, text='Q2 Target?',
+                           sha256=hashlib.sha256(b'Q2 Target?').hexdigest(), length=len('Q2 Target?'))
+            q3_meta = dict(id=q3, label='Q3', interaction_seq=0, text='Q3 Format?',
+                           sha256=hashlib.sha256(b'Q3 Format?').hexdigest(), length=len('Q3 Format?'))
+            exp_unbound = ('CALLCLI_DIALOGUE ' + json.dumps(dict(
+                task=task['id'], turn=1, interaction_seq=1, command_id='unbound-1', question=None))
+                + '\n\nunbound follow-up note').encode('utf-8')
+            exp_scalar = ('CALLCLI_DIALOGUE ' + json.dumps(dict(
+                task=task['id'], turn=1, interaction_seq=2, command_id='single-q2', question=q2_meta))
+                + '\n\nQ2=staging').encode('utf-8')
+            exp_multi = ('CALLCLI_DIALOGUE ' + json.dumps(dict(
+                task=task['id'], turn=1, interaction_seq=3, command_id='multi-q3-q1',
+                question=None, question_ids=[q3, q1], questions=[q3_meta, q1_meta]))
+                + '\n\nQ3=yaml; Q1=all').encode('utf-8')
+            self.assertEqual(prompts[1].encode('utf-8'), exp_unbound)
+            self.assertEqual(prompts[2].encode('utf-8'), exp_scalar)
+            self.assertEqual(prompts[3].encode('utf-8'), exp_multi)
+
+            hdrs = [json.loads(ln)['header'] for ln in (root / 'dynamic-dialogue-headers.jsonl').read_text().splitlines()]
+            self.assertEqual(len(hdrs), 3)
+            self.assertEqual(list(hdrs[0].keys()), ['task', 'turn', 'interaction_seq', 'command_id', 'question'])
+            self.assertIsNone(hdrs[0]['question'])
+            self.assertEqual(list(hdrs[1].keys()), ['task', 'turn', 'interaction_seq', 'command_id', 'question'])
+            self.assertEqual(hdrs[1]['question'], q2_meta)
+            self.assertEqual(list(hdrs[2].keys()), ['task', 'turn', 'interaction_seq', 'command_id', 'question', 'question_ids', 'questions'])
+            self.assertIsNone(hdrs[2]['question'])
+            self.assertEqual(hdrs[2]['question_ids'], [q3, q1])
+            self.assertEqual(hdrs[2]['questions'], [q3_meta, q1_meta])
+
+        with self.workspace('multi-question', surface='omp', agy_approval=None) as (
+                root, handle, task, thread, status, events, wait):
+            wait(lambda: len(status().get('questions', [])) == 3)
+            q1, q2, q3 = status()['questions']
+            handle(dict(action='dialogue', task_id=task['id'], prompt='Q1..Q3 answered',
+                        expected_turn=1, command_id='omp-all', question_ids=[q1, q2, q3]))
+            thread.join(6)
+            self.assertFalse(thread.is_alive())
+            st = status()
+            self.assertEqual(st['state'], 'completed', st.get('settlement_note'))
+            self.assertEqual(st['commands']['omp-all']['status'], 'returned')
+            self.assertEqual(st['questions'], [])
+            self.assertEqual(st['answers'], {q1: 'Q1..Q3 answered', q2: 'Q1..Q3 answered', q3: 'Q1..Q3 answered'})
+            self.assertEqual(handle(dict(action='close', task_id=task['id']))['task']['state'], 'closed')
+
+    def test_dynamic_rejects_blocker_interaction_seq_without_silent_settle(self):
+        from bridge import Store
+        with self.workspace('multi-question', agy_approval=None) as (
+                root, handle, task, thread, status, events, wait):
+            wait(lambda: len(status().get('questions', [])) == 3
+                         and status().get('native_observation', {}).get('mode') == 'dynamic')
+            q1, q2, q3 = status()['questions']
+            with self.assertRaisesRegex(ValueError, 'incomplete_question blocker'):
+                handle(dict(action='dialogue', task_id=task['id'], prompt='reject blocker',
+                            expected_turn=1, command_id='bad-blocker', blocker_interaction_seq=0))
+            st_p1 = status()
+            self.assertEqual(st_p1.get('commands', {}), {})
+            self.assertEqual(sum(r.get('method') == 'session/prompt' for r in self.requests(root)), 1)
+            self.assertEqual(st_p1['questions'], [q1, q2, q3])
+
+            ready_to_inject = threading.Event()
+            injected = threading.Event()
+            orig_claim = Store.native_dialogue_claim
+
+            def synced_claim(store_self, *args, **kwargs):
+                res = orig_claim(store_self, *args, **kwargs)
+                if res is None and not ready_to_inject.is_set():
+                    ready_to_inject.set()
+                    injected.wait(2)
+                return res
+
+            try:
+                with patch.object(Store, 'native_dialogue_claim', synced_claim):
+                    self.assertTrue(ready_to_inject.wait(5))
+                    store = Store(root / 'tasks.db')
+                    cur = store.get(task['id'])
+                    self.assertEqual(cur['native_phase'], 'dynamic_pending')
+                    self.assertEqual(cur['questions'], [q1, q2, q3])
+                    obs = dict(cur['native_observation'])
+                    obs['question_blockers'] = [
+                        dict(interaction_seq=0, reason='incomplete_question', blocks_completion=True)
+                    ]
+                    store.update(task['id'], native_observation=obs)
+                    handle(dict(action='dialogue', task_id=task['id'], prompt='synthetic blocker supersede',
+                                expected_turn=1, command_id='injected-blocker', blocker_interaction_seq=0))
+                    injected.set()
+                    thread.join(6)
+            finally:
+                injected.set()
+
+            self.assertFalse(thread.is_alive())
+            st = status()
+            self.assertEqual(st['state'], 'unknown')
+            self.assertIn('blocker_interaction_seq', st.get('settlement_note', ''))
+            self.assertEqual(st['commands']['injected-blocker']['status'], 'unknown')
+            reqs = self.requests(root)
+            self.assertEqual(sum(r.get('method') == 'session/prompt' for r in reqs), 1)
+            self.assertEqual(st['questions'], [q1, q2, q3])
+            self.assertNotIn('native_cleanup', st)
+            self.assertEqual(sum(r.get('method') == 'session/close' for r in reqs), 0)
+
 if __name__ == '__main__':
     unittest.main()

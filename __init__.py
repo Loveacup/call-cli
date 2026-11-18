@@ -6,18 +6,18 @@ from pathlib import Path, PureWindowsPath
 import shlex
 import sqlite3
 import sys
-from .bridge import capture_origin, capture_origin_context, build_runtime_links
+from .bridge import Origin, capture_origin, capture_origin_context, build_runtime_links
 from .native_continuity import NativeStore as Store
 from .transport import device_identity
 from .backends import BACKENDS, prepare_start
 from .skills import SKILLS_SCHEMA
-from .recovery import recovery_card
+from .recovery import diagnostic_projection, recovery_card, resource_recovery_projection
 
 SCHEMA={
     'name':'call_cli',
     'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/intervene/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
-        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only','recovery_status'], 'description':'recovery_status: read-only exact-task resource projection and observed turn for current authorized release caller; no business content or control. release_only: current authorized caller releases an exact unknown task using observed expected_turn. For a settled local non-native exact record, close at most once and verify strictly; uncertainty retains HOLD. Only abandon=true explicitly releases ownership without stop proof when strict recovery is unavailable or remains HOLD; native/detached work may still be active. No business continuation or success claim'},
+        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only','recovery_status'], 'description':'list/status/events/recovery_status are strictly read-only. recovery_status: read-only exact-task resource_recovery and closed-set diagnostic projection for current authorized release profile; no business content, paths, routes, or control. intervene: retry with the same command_id after cancellation settles to launch the successor turn. release_only: current authorized caller releases an exact unknown task using observed expected_turn. For a settled local non-native exact record, close at most once and verify strictly; uncertainty retains HOLD. Only abandon=true explicitly releases ownership without stop proof when strict recovery is unavailable or remains HOLD; native/detached work may still be active. No business continuation or success claim'},
         'task_id':{'type':'string'},
         'permission_id':{'type':'string'},
         'script_sha256':{'type':'string'},
@@ -29,7 +29,7 @@ SCHEMA={
         'effort':{'type':'string','description':'AGY advertised thought_level only; standalone OC/OA have no effort option; no suffix guessing'},
         'cwd':{'type':'string','description':'Absolute working directory on execution device'},
         'prompt':{'type':'string'},
-        'command_id':{'type':'string','description':'Stable intent ID; required for dialogue/intervene and cross-controller or new no-question reply; reuse on retry'},
+        'command_id':{'type':'string','description':'Stable intent ID; required for dialogue/intervene and cross-controller or new no-question reply; reuse on retry (including settled pending intervene continuation)'},
         'write':{'type':'boolean','default':False,'description':'Reserve exclusive Call-CLI single-writer lock for authorized file edits/tests'},
         'agy_approval':{'type':'string','enum':['skip-permissions','approve-all','approve-reads'],'description':'AGY only: new tasks default to skip-permissions (native CLI permission/sandbox/dir skip); approve-all/approve-reads keep explicit non-skip gates. Independent of Call-CLI business scope and write lock.'},
         'agy_swarm':{'type':'string','enum':['native','off'],'description':'AGY route override for advertised IDs; must match shorthand: bare=off, s=native'},
@@ -38,6 +38,8 @@ SCHEMA={
         'resource':{'type':'string','description':'Optional shared workspace identity across synchronized devices'},
         'skills':SKILLS_SCHEMA,
         'question_id':{'type':'string','description':'Exact pending question event ID for a reply'},
+        'question_ids':{'type':'array','items':{'type':'string'},'minItems':1,'description':'Exact pending question event IDs for a multi-question reply or dialogue (mutually exclusive with question_id; raw bytes, no CSV)'},
+        'blocker_interaction_seq':{'type':'integer','minimum':0,'description':'Optional dialogue-only active incomplete_question blocker interaction_seq (>=0) to explicitly supersede after review; mutually exclusive with question_id, question_ids and withdraw'},
         'target_command_id':{'type':'string','description':'Optional dialogue-only target command_id to withdraw or supersede while still accepted'},
         'withdraw':{'type':'boolean','description':'Optional dialogue-only flag to withdraw target_command_id without sending a new prompt'},
         'expected_turn':{'type':'integer','description':'Observed turn; required for dialogue, release_only, cross-controller continuation, new no-question reply and native close/reconcile recovery'},
@@ -83,23 +85,25 @@ class Coordinator:
             raise ValueError('target_command_id requires dialogue')
         if 'withdraw' in args and (args.get('action') != 'dialogue' or type(args['withdraw']) is not bool):
             raise ValueError('withdraw requires dialogue and a boolean')
+        if 'question_ids' in args and args.get('action') not in {'reply', 'dialogue'}:
+            raise ValueError('question_ids requires reply or dialogue')
+        if 'question_ids' in args and not isinstance(args['question_ids'], list):
+            raise ValueError('question_ids must be a nonempty list of strings')
+        if 'blocker_interaction_seq' in args and args.get('action') != 'dialogue':
+            raise ValueError('blocker_interaction_seq requires dialogue')
+        if 'blocker_interaction_seq' in args and (type(args['blocker_interaction_seq']) is not int or args['blocker_interaction_seq'] < 0):
+            raise ValueError('blocker_interaction_seq must be a non-negative integer')
         origin=capture_origin(self.get_env,self.ctx.profile_name)
         action=args['action']
         store=Store(self.home/'call-cli'/'tasks.sqlite3', self.hermes_home, self.hermes_root, action=action)
         if action == 'recovery_status':
-            if set(args) != {'action', 'task_id'}:
+            if set(args) != {'action', 'task_id'} or not isinstance(args.get('task_id'), str) or not args['task_id'].strip():
                 raise ValueError('recovery_status accepts only exact task_id')
             task, receipt = store.recovery_snapshot(args['task_id'], origin)
-            return {'resource_recovery': {
-                'task_id': task['id'], 'turn': task['turn'],
-                'business_state': (receipt.get('business_state', task['state'])
-                                   if isinstance(receipt, dict) else task['state']),
-                'resource_state': ('released' if isinstance(receipt, dict) and receipt.get('state') == 'released'
-                                   else task.get('resource_state', task['state'])),
-                'write': task.get('write', False) is True,
-                'receipt': {key: receipt.get(key) for key in
-                    ('state', 'operation', 'business_state', 'external_close_attempted')}
-                    if isinstance(receipt, dict) else None}}
+            return {
+                'resource_recovery': resource_recovery_projection(task, receipt),
+                'diagnostic': diagnostic_projection(task),
+            }
         if action=='list':return {'tasks':[self.public(t) for t in store.list(origin, group=args.get('group'))]}
         if action in {'status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only'}:
             task=(store.release_target(args.get('task_id',''),origin) if action=='release_only'
@@ -129,6 +133,8 @@ class Coordinator:
             target_command_id=args.get('target_command_id')
             task=store.dialogue(task['id'],origin,args.get('prompt',''), expected_turn=args.get('expected_turn'),
                                 command_id=args.get('command_id'), question_id=args.get('question_id'),
+                                question_ids=args.get('question_ids'),
+                                blocker_interaction_seq=args.get('blocker_interaction_seq'),
                                 target_command_id=target_command_id, withdraw=withdraw)
             if withdraw:
                 note=f'Accepted dialogue {target_command_id} withdrawn before claim/send'
@@ -146,20 +152,22 @@ class Coordinator:
                                         clear_timeout=args.get('clear_timeout',False), expected_turn=args.get('expected_turn'))
             if launch:return self.launch(store,task)
             status=task.get('intervention',{}).get('status','')
-            note='Intervention pending cancellation settlement; use status or events to resume' if status=='pending' else f'Intervention status: {status or "none"}'
+            note='Intervention pending cancellation settlement; inspect status for settlement, then retry intervene with the same command_id to resume' if status=='pending' else f'Intervention status: {status or "none"}'
             return {'task':self.public(task),'note':note}
-        if action in {'status','events'}:
-            task,launch=store.advance_intervention(task['id'],origin)
-            if launch:
-                result=self.launch(store,task)
-                task=store.get(task['id'],origin)
-                if action=='status':return {'task':self.public(task),'native_process':result.get('native_process'),'note':result.get('note')}
-            if action=='status':return {'task':self.public(task)}
+        if action=='status':
+            res={'task':self.public(task)}
+            if (task.get('intervention',{}).get('status')=='pending'
+                    and task['state'] in {'cancelled','completed','waiting_reply'}
+                    and store._same_principal(Origin(**task.get('controller',task['origin'])).key(),origin)):
+                res['note']='Cancellation settled; retry intervene with the same command_id to launch the successor turn'
+            return res
+        if action=='events':
             return {'task_id':task['id'],'events':store.events(task['id'],origin,args.get('after',0))}
         if action=='reply':
             prompt=args.get('prompt','')
             if not prompt.strip():raise ValueError('reply requires prompt')
-            task=store.reply(task['id'],origin,args.get('question_id',''),prompt,
+            task=store.reply(task['id'],origin,(args.get('question_id') if 'question_ids' in args else args.get('question_id','')),prompt,
+                             question_ids=args.get('question_ids'),
                              clear_timeout=args.get('clear_timeout',False), expected_turn=args.get('expected_turn'),
                              command_id=args.get('command_id'))
             if task['state']=='waiting_reply':

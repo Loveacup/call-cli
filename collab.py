@@ -31,11 +31,21 @@ class _Store(Store):
                 db.execute('PRAGMA busy_timeout=0')
             yield db
 
-    def release_target(self, task_id, origin):
+    @contextmanager
+    def ro_connect(self):
+        with super().ro_connect() as db:
+            if _polling.get():
+                db.execute('PRAGMA busy_timeout=0')
+            yield db
+
+    def _release_authorized(self, task, origin):
         # The public facade validates a device-local client/host capability first.
         if origin.profile not in {'standalone', 'omp-extension'}:
             raise PermissionError('Local recovery capability required')
-        return self.get(task_id)
+        return task
+
+    def release_target(self, task_id, origin):
+        return self._release_authorized(self.get(task_id), origin)
 
 
 def _public_task(task):
@@ -47,13 +57,21 @@ def _public_task(task):
 
 
 class Collaboration:
-    def __init__(self, db=DEFAULT_DB, *, launch=None, control=None, lock=None):
-        self.store = _Store(db)
+    def __init__(self, db=DEFAULT_DB, *, launch=None, control=None, lock=None, read_only=False):
+        self.store = _Store(db, read_only=read_only)
         self.launch = launch or self._launch
         self.control = control or runner_control
         self.lock = lock or device_lock
-        with self.store.connect() as conn:
-            conn.execute('CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, declared_runtime TEXT NOT NULL)')
+        if not read_only:
+            has_clients = False
+            if self.store.path.exists():
+                with self.store.ro_connect() as conn:
+                    has_clients = bool(conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'"
+                    ).fetchone())
+            if not has_clients:
+                with self.store.connect() as conn:
+                    conn.execute('CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, declared_runtime TEXT NOT NULL)')
 
     def _launch(self, task):
         import subprocess
@@ -84,6 +102,7 @@ class Collaboration:
             raise ValueError('runtime must be omp, codex, pi or hermes')
         client = dict(client_id=str(uuid.uuid4()), declared_runtime=runtime)
         with self.store.connect() as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, declared_runtime TEXT NOT NULL)')
             conn.execute('INSERT INTO clients VALUES (?,?)', (client['client_id'], runtime))
         return client
 
@@ -136,6 +155,17 @@ class Collaboration:
         return [dict(_public_task(t), runtime_links=build_runtime_links(t))
                 for t in self.store.list(self.origin(client), group=group)]
 
+    def recovery_status(self, client, task_id):
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError('recovery_status requires exact task_id')
+        from recovery import diagnostic_projection, resource_recovery_projection
+        origin = self.origin(client)
+        task, receipt = self.store.recovery_snapshot(task_id, origin)
+        return {
+            'resource_recovery': resource_recovery_projection(task, receipt),
+            'diagnostic': diagnostic_projection(task),
+        }
+
     def intervene(self, client, task_id, prompt, *, command_id=None, clear_timeout=False, expected_turn=None):
         task, launch = self.store.intervene(task_id, self.origin(client), prompt, command_id,
                                            clear_timeout=clear_timeout, expected_turn=expected_turn)
@@ -148,9 +178,10 @@ class Collaboration:
         return self.status(client, task_id)
 
     def dialogue(self, client, task_id, prompt='', *, expected_turn, command_id, question_id=None,
-                 target_command_id=None, withdraw=False):
+                 question_ids=None, blocker_interaction_seq=None, target_command_id=None, withdraw=False):
         self.store.dialogue(task_id, self.origin(client), prompt, expected_turn=expected_turn,
-                            command_id=command_id, question_id=question_id,
+                            command_id=command_id, question_id=question_id, question_ids=question_ids,
+                            blocker_interaction_seq=blocker_interaction_seq,
                             target_command_id=target_command_id, withdraw=withdraw)
         return self.status(client, task_id)
 
@@ -195,10 +226,11 @@ class Collaboration:
         finally:
             _polling.reset(token)
 
-    def reply(self, client, task_id, question_id, prompt, *, clear_timeout=False, expected_turn=None, command_id=None):
+    def reply(self, client, task_id, question_id=None, prompt='', *, question_ids=None,
+              clear_timeout=False, expected_turn=None, command_id=None):
         task = self.store.reply(task_id, self.origin(client), question_id, prompt,
-                                clear_timeout=clear_timeout, require_question=True,
-                                expected_turn=expected_turn, command_id=command_id)
+                                question_ids=question_ids, clear_timeout=clear_timeout,
+                                require_question=True, expected_turn=expected_turn, command_id=command_id)
         if task['state'] == 'queued' and task.get('launch_turn') != task['turn']:
             self._dispatch(task)
         return self.status(client, task_id)
@@ -228,7 +260,11 @@ class Collaboration:
         return dict(self.status(client, task_id), close_receipt=public_close_receipt(receipt))
 
     def origin(self, client):
-        with self.store.connect() as conn:
+        if not self.store.path.exists():
+            raise PermissionError('Unknown client handle')
+        with self.store.ro_connect() as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'").fetchone():
+                raise PermissionError('Unknown client handle')
             row = conn.execute('SELECT declared_runtime FROM clients WHERE id=?', (client,)).fetchone()
         if not row:
             raise PermissionError('Unknown client handle')
@@ -268,7 +304,7 @@ def main(argv=None):
     start.add_argument('--skills-json', help='JSON array of selections including optional source provenance')
     list_parser = sub.add_parser('list')
     list_parser.add_argument('--group', help='Filter listed tasks within this client origin by group label')
-    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']:
+    for action in ['status', 'events', 'wait', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only', 'recovery_status']:
         p = sub.add_parser(action)
         p.add_argument('--task', required=True)
         if action == 'release_only':
@@ -286,12 +322,15 @@ def main(argv=None):
             p.add_argument('--expected-turn', type=int, help='Observed turn being answered; rejects stale intent when supplied')
             p.add_argument('--command-id', help='Stable intent ID; reuse unchanged for retry-safe submission')
         if action == 'reply':
-            p.add_argument('--question-id', required=True)
+            p.add_argument('--question-id')
+            p.add_argument('--question-ids', nargs='+', action='extend', default=None)
         if action == 'dialogue':
             p.add_argument('--prompt', default='')
             p.add_argument('--expected-turn', type=int, required=True)
             p.add_argument('--command-id', required=True)
             p.add_argument('--question-id')
+            p.add_argument('--question-ids', nargs='+', action='extend', default=None)
+            p.add_argument('--blocker-interaction-seq', type=int, default=None)
             p.add_argument('--target-command-id')
             p.add_argument('--withdraw', action='store_true')
         if action == 'permission':
@@ -308,7 +347,7 @@ def main(argv=None):
     try:
         if action != 'connect' and not client:
             raise ValueError('--client is required for this action')
-        c = Collaboration(db)
+        c = Collaboration(db, read_only=(action in {'list', 'status', 'events', 'recovery_status'}))
         if action == 'start':
             skills = json.loads(opts.pop('skills_json') or '[]')
             if not isinstance(skills, list):

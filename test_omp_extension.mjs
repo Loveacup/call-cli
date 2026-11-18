@@ -376,11 +376,15 @@ test('OMP unknown snapshot wakes once per turn and preserves actionable HOLD', a
   assert.deepEqual(f.sent[0].options,{deliverAs:'followUp',triggerTurn:true});
   assert.equal(f.calls.at(-1).host.session_id,'host-a');
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0,'status must not reactivate paused polling');
   f.setPacket({task,events:[{seq:7,kind:'unknown',turn:1,text:'no final answer',attention_required:true}]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-1',expected_turn:1,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,1,'late terminal event must not repeat snapshot attention');
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task:{...task,turn:2},events:[]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-2',expected_turn:2,prompt:'follow-up-2'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,2,'a different execution turn has a new obligation');
   assert.equal(JSON.parse(f.sent[1].message.content).events[0].turn,2);
@@ -395,7 +399,9 @@ test('OMP terminal attention is deduplicated without hiding legacy unknown event
   await f.timers.shift()();
   assert.equal(f.sent.length,1);
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task,events:[{seq:2,kind:'unknown',turn:1,attention_required:true,text:'same obligation'}]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-dedupe',expected_turn:1,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,1);
   const legacy=fixture();
@@ -419,6 +425,8 @@ test('late prior-turn unknown cannot block current-turn snapshot attention', asy
     {seq:4,kind:'answer',turn:2,text:'answer'},
     {seq:5,kind:'skill',turn:2,text:'skill'}]});
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-late',expected_turn:2,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,2);
   const events=JSON.parse(f.sent[1].message.content).events;
@@ -449,7 +457,9 @@ test('legacy unknown without turn uses current task turn without duplicate fallb
   await f.timers.shift()();
   assert.deepEqual(JSON.parse(f.sent[0].message.content).events.map(e=>e.kind),['unknown','question']);
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task,events:[]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-legacy',expected_turn:2,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,1);
   assert.equal(f.timers.length,0);
@@ -463,16 +473,20 @@ for (const previouslyNotified of [true,false]) test(`historical turn attention $
     f.setPacket({task:{...task,turn:1},events:[]});
     await f.timers.shift()();
     await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+    assert.equal(f.timers.length,0);
+    await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-hist-1',expected_turn:1,prompt:'follow-up'},f.ctx);
   }
   f.setPacket({task:{...task,turn:2},events:[]});
   await f.timers.shift()();
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task:{...task,turn:3,state:'running'},events:[
     {seq:1,kind:'unknown',turn:1,text:'late turn one'},
     {seq:2,kind:'stage',turn:3,text:'progress'},
     {seq:3,kind:'question',turn:3,text:'question'},
     {seq:4,kind:'answer',turn:3,text:'answer'},
     {seq:5,kind:'skill',turn:3,text:'skill'}]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-hist-2',expected_turn:3,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   const delivered=f.sent.flatMap(s=>JSON.parse(s.message.content).events);
   assert.deepEqual(delivered.filter(e=>e.kind==='unknown').map(e=>e.turn),previouslyNotified ? [1,2] : [2,1]);
@@ -492,14 +506,20 @@ test('unattributed legacy unknown events stay visible without repeated snapshot 
   f.setPacket({task,events:[]});
   await f.timers.shift()();
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-unattr-1',expected_turn:1,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,1,'a no-turn snapshot still has a remembered fallback obligation');
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task,events:[{seq:1,kind:'unknown',text:'unattributed legacy terminal'}]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-unattr-2',expected_turn:1,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,2,'unknown-turn events remain cursor-visible');
   await f.adapter.execute({action:'status',task_id:'task-a'},f.ctx);
+  assert.equal(f.timers.length,0);
   f.setPacket({task,events:[]});
+  await f.adapter.execute({action:'dialogue',task_id:'task-a',command_id:'rearm-unattr-3',expected_turn:1,prompt:'follow-up'},f.ctx);
   await f.timers.shift()();
   assert.equal(f.sent.length,2);
 });
@@ -667,4 +687,676 @@ test('running stream interruption diagnostic immediately triggers followUp witho
   const terminalBatch = JSON.parse(f.sent[1].message.content);
   assert.deepEqual(terminalBatch.events.map(e => e.seq), [1, 3, 4]);
   f.adapter.detach();
+});
+
+test('registered OMP tool Zod schema advertises question_ids while keeping question_id scalar string', () => {
+  const objectShapes = [];
+  const makeNode = (kind, args = []) => {
+    const ops = [{kind, args}];
+    const node = new Proxy({ops}, {
+      get(target, prop) {
+        if (prop === 'ops') return target.ops;
+        return (...methodArgs) => {
+          target.ops.push({kind: prop, args: methodArgs});
+          return node;
+        };
+      },
+    });
+    return node;
+  };
+  const z = new Proxy({}, {
+    get(_target, name) {
+      return (...args) => {
+        if (name === 'object') objectShapes.push(args[0]);
+        return makeNode(name, args);
+      };
+    },
+  });
+  let registered;
+  register({zod: z, registerTool: tool => {registered = tool;}, on: () => {}});
+  assert.equal(registered.name, 'call_cli_omp');
+  const shape = objectShapes.find(s => Object.hasOwn(s, 'action'));
+  assert.ok(shape);
+  assert.ok(Object.hasOwn(shape, 'question_id'));
+  assert.ok(Object.hasOwn(shape, 'question_ids'));
+  assert.deepEqual(shape.question_id.ops.map(op => op.kind), ['string', 'optional']);
+  assert.equal(shape.question_ids.ops[0].kind, 'array');
+  const elemNode = shape.question_ids.ops[0].args[0];
+  assert.deepEqual(elemNode.ops.map(op => [op.kind, op.args]), [['string', []], ['min', [1]]]);
+  assert.ok(shape.question_ids.ops.some(op => op.kind === 'min' && op.args[0] === 1));
+  assert.ok(shape.question_ids.ops.some(op => op.kind === 'optional'));
+  assert.ok(shape.question_ids.ops.some(op => op.kind === 'describe'));
+});
+
+test('createAdapter.execute forwards question_ids on dialogue and reply while keeping polling scheduled', async () => {
+  const f = fixture();
+  await f.adapter.execute({action: 'start', agent: 'agy', cwd: '/work', prompt: 'owned'}, f.ctx);
+  f.setPacket({task: {id: 'task-a', state: 'running', turn: 1}, events: []});
+  await f.adapter.execute({
+    action: 'dialogue',
+    task_id: 'task-a',
+    prompt: 'multi answer',
+    command_id: 'd1',
+    expected_turn: 1,
+    question_ids: [' 1:raw ', '1:2'],
+  }, f.ctx);
+  assert.deepEqual(f.calls.at(-1).args, {
+    action: 'dialogue',
+    task_id: 'task-a',
+    prompt: 'multi answer',
+    command_id: 'd1',
+    expected_turn: 1,
+    question_ids: [' 1:raw ', '1:2'],
+  });
+  assert.equal(f.timers.length, 1);
+
+  f.setPacket({task: {id: 'task-a', state: 'waiting_reply', turn: 1}, events: []});
+  await f.adapter.execute({
+    action: 'reply',
+    task_id: 'task-a',
+    question_ids: [' 1:raw ', '1:2'],
+    prompt: 'shared',
+    expected_turn: 1,
+    command_id: 'r1',
+  }, f.ctx);
+  assert.deepEqual(f.calls.at(-1).args, {
+    action: 'reply',
+    task_id: 'task-a',
+    question_ids: [' 1:raw ', '1:2'],
+    prompt: 'shared',
+    expected_turn: 1,
+    command_id: 'r1',
+  });
+  assert.equal(f.timers.length, 1);
+
+  f.setPacket({task: {id: 'task-a', state: 'queued', turn: 2}, events: []});
+  await f.adapter.execute({
+    action: 'reply',
+    task_id: 'task-a',
+    question_ids: ['1:3'],
+    prompt: 'last',
+    expected_turn: 1,
+    command_id: 'r2',
+  }, f.ctx);
+  assert.deepEqual(f.calls.at(-1).args.question_ids, ['1:3']);
+  assert.equal(f.timers.length, 1);
+  f.adapter.detach();
+});
+
+test('createAdapter.execute rejects invalid question_ids and question_id combinations before mutating state', async () => {
+  const f = fixture();
+  for (const preBindInvalid of [
+    {action: 'list', question_ids: ['1:2']},
+    {action: 'list', question_ids: null},
+    {action: 'start', cwd: '/work', prompt: 'x', question_ids: ['1:2']},
+  ]) {
+    await assert.rejects(f.adapter.execute(preBindInvalid, f.ctx));
+  }
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.timers.length, 0);
+
+  await f.adapter.execute({action: 'start', agent: 'agy', cwd: '/work', prompt: 'owned'}, f.ctx);
+  const callsAfterStart = f.calls.length;
+  const timersAfterStart = f.timers.length;
+
+  const rejectCases = [
+    {action: 'status', task_id: 'task-a', question_ids: ['1:2']},
+    {action: 'status', task_id: 'task-a', question_ids: null},
+    {action: 'intervene', task_id: 'task-a', command_id: 'i1', prompt: 'rev', question_ids: ['1:2']},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_id: '1:1', question_ids: ['1:2']},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_id: '', question_ids: ['1:2']},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_id: '1:1', question_ids: ['1:2']},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_id: '', question_ids: ['1:2']},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: []},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: []},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: null},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: null},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: '1:2,1:3'},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: '1:2,1:3'},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: ['']},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: ['']},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: [1]},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: [1]},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: ['1:2', '1:2']},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_ids: ['1:2', '1:2']},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_id: 123},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_id: 123},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_id: null},
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_id: null},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'w1', expected_turn: 1, target_command_id: 'd1', withdraw: true, question_id: '1:2'},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'w1', expected_turn: 1, target_command_id: 'd1', withdraw: true, question_id: ''},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'w1', expected_turn: 1, target_command_id: 'd1', withdraw: true, question_ids: ['1:2']},
+  ];
+  for (const invalid of rejectCases) {
+    await assert.rejects(f.adapter.execute(invalid, f.ctx));
+  }
+  assert.equal(f.calls.length, callsAfterStart);
+  assert.equal(f.timers.length, timersAfterStart);
+  f.adapter.detach();
+});
+
+test('end-to-end real omp_bridge.py subprocess exercises question_ids on dialogue and reply (subset + D4 merge + raw bytes)', async () => {
+  const {existsSync} = await import('node:fs');
+  const {mkdtemp, writeFile, rm} = await import('node:fs/promises');
+  const {execFileSync} = await import('node:child_process');
+  const {tmpdir} = await import('node:os');
+  const {join, dirname} = await import('node:path');
+  const {fileURLToPath} = await import('node:url');
+  const root = await mkdtemp(join(tmpdir(), 'callcli-omp-qids-e2e-'));
+  const previous = process.env.CALL_CLI_PYTHON;
+  const implDir = dirname(fileURLToPath(import.meta.url));
+  const dbPath = join(root, 'tasks.db');
+  try {
+    process.env.CALL_CLI_PYTHON = 'python3';
+    const f = fixture();
+    const adapter = createAdapter({sendMessage: () => {}}, {db: dbPath, pollMs: 60000});
+
+    // Pre-bind list must observe read-only without initializing DB; bind host-a/main cleanly via start+close.
+    const initialList = await adapter.execute({action: 'list'}, f.ctx);
+    assert.deepEqual(initialList.tasks, []);
+    assert.equal(existsSync(dbPath), false);
+
+    const wrapper = join(root, 'no-launch-python.sh');
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nPYTHONPATH=${JSON.stringify(implDir)} exec python3 -B -c 'import runpy,sys,collab; collab.Collaboration._launch=lambda self,t:None; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' "$2"\n`,
+      {mode: 0o700},
+    );
+    process.env.CALL_CLI_PYTHON = wrapper;
+    const bindSeed = await adapter.execute({action: 'start', agent: 'omp', cwd: root, prompt: 'bind host'}, f.ctx);
+    await adapter.execute({action: 'cancel', task_id: bindSeed.task.id}, f.ctx);
+    await adapter.execute({action: 'close', task_id: bindSeed.task.id}, f.ctx);
+    process.env.CALL_CLI_PYTHON = 'python3';
+
+    const seedScript = `
+import json, sys
+from bridge import Origin
+from omp_bridge import HostBridge
+
+db_path, cwd = sys.argv[1], sys.argv[2]
+bridge = HostBridge(db_path, launch=lambda t: None)
+host = {'session_id': 'host-a', 'agent_id': 'main'}
+origin = Origin('omp-extension', host['session_id'], bridge.identity(host), 'omp')
+
+dlg = bridge.store.create(origin, 'local', 'agy', cwd, 'native prompt', False)
+bridge.store.update(dlg['id'], state='running', runner_pid=123, launch_turn=1, launch_id='l1', agy_swarm='native', agy_mode='swarm')
+bridge.store.native_input_open(dlg['id'], 1, 'l1', 1)
+for tok, text in [(' 1:raw ', 'Q1 raw?'), ('1:2', 'Q2 second?'), ('1:3', 'Q3 third?')]:
+    bridge.store.event(dlg['id'], tok, 'question', text, turn=1)
+
+rep = bridge.store.create(origin, 'local', 'codex', cwd, 'reply prompt', False)
+bridge.store.update(rep['id'], state='waiting_reply', timeout=300)
+for tok, text in [(' 1:raw ', 'Q1 raw?'), ('1:2', 'Q2 second?'), ('1:3', 'Q3 third?')]:
+    bridge.store.event(rep['id'], tok, 'question', text, turn=1)
+
+print(json.dumps({'dlg': dlg['id'], 'rep': rep['id']}))
+`;
+    const seeded = JSON.parse(execFileSync('python3', ['-B', '-c', seedScript, dbPath, root], {
+      cwd: implDir,
+      encoding: 'utf8',
+    }));
+
+    // Trimmed token must reject in real omp_bridge.py.
+    await assert.rejects(adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'trimmed',
+      command_id: 'dq-trim',
+      expected_turn: 1,
+      question_ids: ['1:raw'],
+    }, f.ctx));
+
+    // Exact raw bytes on dialogue via real python3 -B omp_bridge.py.
+    const dlgRes = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'multi dlg',
+      command_id: 'dq1',
+      expected_turn: 1,
+      question_ids: [' 1:raw ', '1:2'],
+    }, f.ctx);
+    assert.equal(dlgRes.task.commands.dq1.status, 'accepted');
+    assert.deepEqual(dlgRes.task.commands.dq1.question_ids, [' 1:raw ', '1:2']);
+    assert.deepEqual(dlgRes.task.commands.dq1.questions.map(q => q.id), [' 1:raw ', '1:2']);
+    assert.deepEqual(dlgRes.task.questions, [' 1:raw ', '1:2', '1:3']);
+
+    // Idempotent replay with reordered question_ids via real python3 -B omp_bridge.py.
+    const dlgReplay = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'multi dlg',
+      command_id: 'dq1',
+      expected_turn: 1,
+      question_ids: ['1:2', ' 1:raw '],
+    }, f.ctx);
+    assert.deepEqual(dlgReplay.task.commands.dq1, dlgRes.task.commands.dq1);
+
+    // Withdraw releases both bound IDs so a follow-up dialogue can re-bind ' 1:raw '.
+    await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      command_id: 'wq1',
+      expected_turn: 1,
+      target_command_id: 'dq1',
+      withdraw: true,
+    }, f.ctx);
+    const dlgRebound = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'rebound',
+      command_id: 'dq2',
+      expected_turn: 1,
+      question_ids: [' 1:raw '],
+    }, f.ctx);
+    assert.equal(dlgRebound.task.commands.dq2.status, 'accepted');
+    assert.deepEqual(dlgRebound.task.commands.dq2.question_ids, [' 1:raw ']);
+
+    // Subset reply via real python3 -B omp_bridge.py (stays waiting_reply, no runner launch).
+    await assert.rejects(adapter.execute({
+      action: 'reply',
+      task_id: seeded.rep,
+      question_ids: ['1:raw'],
+      prompt: 'trimmed',
+      expected_turn: 1,
+      command_id: 'rq-trim',
+    }, f.ctx));
+    const subRes = await adapter.execute({
+      action: 'reply',
+      task_id: seeded.rep,
+      question_ids: [' 1:raw ', '1:2'],
+      prompt: 'shared',
+      expected_turn: 1,
+      command_id: 'rq1',
+      clear_timeout: true,
+    }, f.ctx);
+    assert.equal(subRes.task.state, 'waiting_reply');
+    assert.equal(subRes.task.turn, 1);
+    assert.deepEqual(subRes.task.questions, ['1:3']);
+    assert.equal(subRes.task.question_id, '1:3');
+    assert.deepEqual(subRes.task.answers, {' 1:raw ': 'shared', '1:2': 'shared'});
+
+    const subReplay = await adapter.execute({
+      action: 'reply',
+      task_id: seeded.rep,
+      question_ids: ['1:2', ' 1:raw '],
+      prompt: 'shared',
+      expected_turn: 1,
+      command_id: 'rq1',
+      clear_timeout: true,
+    }, f.ctx);
+    assert.deepEqual(subReplay.task.answers, subRes.task.answers);
+
+    // Final reply settles all questions into turn 2; reuse no-launch python3 wrapper to avoid spawning runner.py.
+    process.env.CALL_CLI_PYTHON = wrapper;
+    const finalRes = await adapter.execute({
+      action: 'reply',
+      task_id: seeded.rep,
+      question_ids: ['1:3'],
+      prompt: 'last',
+      expected_turn: 1,
+      command_id: 'rq2',
+    }, f.ctx);
+    assert.equal(finalRes.task.state, 'queued');
+    assert.equal(finalRes.task.turn, 2);
+    assert.equal(finalRes.task.timeout, null);
+    assert.deepEqual(finalRes.task.questions, []);
+    assert.deepEqual(finalRes.task.answers, {});
+
+    const persisted = JSON.parse(execFileSync('python3', [
+      '-B', '-c',
+      'import json,sys; from bridge import Store; print(json.dumps(Store(sys.argv[1]).get(sys.argv[2])))',
+      dbPath, seeded.rep,
+    ], {cwd: implDir, encoding: 'utf8'}));
+    assert.equal(persisted.prompt, ' 1:raw : shared\n1:2: shared\n1:3: last');
+
+    adapter.detach();
+  } finally {
+    if (previous === undefined) delete process.env.CALL_CLI_PYTHON;
+    else process.env.CALL_CLI_PYTHON = previous;
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('registered OMP tool Zod schema advertises blocker_interaction_seq as optional non-negative int', () => {
+  const objectShapes = [];
+  const makeNode = (kind, args = []) => {
+    const ops = [{kind, args}];
+    const node = new Proxy({ops}, {
+      get(target, prop) {
+        if (prop === 'ops') return target.ops;
+        return (...methodArgs) => {
+          target.ops.push({kind: prop, args: methodArgs});
+          return node;
+        };
+      },
+    });
+    return node;
+  };
+  const z = new Proxy({}, {
+    get(_target, name) {
+      return (...args) => {
+        if (name === 'object') objectShapes.push(args[0]);
+        return makeNode(name, args);
+      };
+    },
+  });
+  let registered;
+  register({zod: z, registerTool: tool => {registered = tool;}, on: () => {}});
+  const shape = objectShapes.find(s => Object.hasOwn(s, 'action'));
+  assert.ok(shape);
+  assert.ok(Object.hasOwn(shape, 'blocker_interaction_seq'));
+  assert.deepEqual(
+    shape.blocker_interaction_seq.ops.map(op => [op.kind, op.args]),
+    [['number', []], ['int', []], ['min', [0]], ['optional', []], ['describe', shape.blocker_interaction_seq.ops.at(-1).args]],
+  );
+});
+
+test('createAdapter.execute forwards and validates blocker_interaction_seq without mutating state on rejection', async () => {
+  const f = fixture();
+  for (const preBindBad of [
+    {action: 'list', blocker_interaction_seq: 0},
+    {action: 'start', cwd: '/work', prompt: 'x', blocker_interaction_seq: 0},
+  ]) {
+    await assert.rejects(f.adapter.execute(preBindBad, f.ctx));
+  }
+  assert.equal(f.calls.length, 0);
+
+  await f.adapter.execute({action: 'start', agent: 'agy', cwd: '/work', prompt: 'owned'}, f.ctx);
+  const callsAfterStart = f.calls.length;
+  const timersAfterStart = f.timers.length;
+
+  const badCases = [
+    {action: 'reply', task_id: 'task-a', prompt: 'p', question_id: '1:1', blocker_interaction_seq: 0},
+    {action: 'status', task_id: 'task-a', blocker_interaction_seq: 0},
+    {action: 'intervene', task_id: 'task-a', command_id: 'i1', prompt: 'p', blocker_interaction_seq: 0},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: true},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: false},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: null},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: -1},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: 1.5},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: '0'},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', blocker_interaction_seq: [0]},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_id: '1:1', blocker_interaction_seq: 0},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'd1', expected_turn: 1, prompt: 'p', question_ids: ['1:1'], blocker_interaction_seq: 0},
+    {action: 'dialogue', task_id: 'task-a', command_id: 'w1', expected_turn: 1, target_command_id: 'd1', withdraw: true, blocker_interaction_seq: 0},
+  ];
+  for (const invalid of badCases) {
+    await assert.rejects(f.adapter.execute(invalid, f.ctx));
+  }
+  assert.equal(f.calls.length, callsAfterStart);
+  assert.equal(f.timers.length, timersAfterStart);
+
+  f.setPacket({task: {id: 'task-a', state: 'running', turn: 1}, events: []});
+  await f.adapter.execute({
+    action: 'dialogue',
+    task_id: 'task-a',
+    prompt: 'explicit review 0',
+    command_id: 'd-blk-0',
+    expected_turn: 1,
+    blocker_interaction_seq: 0,
+  }, f.ctx);
+  assert.deepEqual(f.calls.at(-1).args, {
+    action: 'dialogue',
+    task_id: 'task-a',
+    prompt: 'explicit review 0',
+    command_id: 'd-blk-0',
+    expected_turn: 1,
+    blocker_interaction_seq: 0,
+  });
+  f.adapter.detach();
+});
+
+test('end-to-end real omp_bridge.py subprocess exercises blocker_interaction_seq=0 accept, withdraw, re-bind and settled idempotency', async () => {
+  const {existsSync} = await import('node:fs');
+  const {mkdtemp, writeFile, rm} = await import('node:fs/promises');
+  const {execFileSync} = await import('node:child_process');
+  const {tmpdir} = await import('node:os');
+  const {join, dirname} = await import('node:path');
+  const {fileURLToPath} = await import('node:url');
+  const root = await mkdtemp(join(tmpdir(), 'callcli-omp-blk-e2e-'));
+  const previous = process.env.CALL_CLI_PYTHON;
+  const implDir = dirname(fileURLToPath(import.meta.url));
+  const dbPath = join(root, 'tasks.db');
+  try {
+    process.env.CALL_CLI_PYTHON = 'python3';
+    const f = fixture();
+    const adapter = createAdapter({sendMessage: () => {}}, {db: dbPath, pollMs: 60000});
+    assert.deepEqual((await adapter.execute({action: 'list'}, f.ctx)).tasks, []);
+    assert.equal(existsSync(dbPath), false);
+
+    const wrapper = join(root, 'no-launch-python.sh');
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nPYTHONPATH=${JSON.stringify(implDir)} exec python3 -B -c 'import runpy,sys,collab; collab.Collaboration._launch=lambda self,t:None; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' "$2"\n`,
+      {mode: 0o700},
+    );
+    process.env.CALL_CLI_PYTHON = wrapper;
+    const bindSeed = await adapter.execute({action: 'start', agent: 'omp', cwd: root, prompt: 'bind host'}, f.ctx);
+    await adapter.execute({action: 'cancel', task_id: bindSeed.task.id}, f.ctx);
+    await adapter.execute({action: 'close', task_id: bindSeed.task.id}, f.ctx);
+    process.env.CALL_CLI_PYTHON = 'python3';
+
+    const seedScript = `
+import json, sys
+from bridge import Origin
+from omp_bridge import HostBridge
+
+db_path, cwd = sys.argv[1], sys.argv[2]
+bridge = HostBridge(db_path, launch=lambda t: None)
+host = {'session_id': 'host-a', 'agent_id': 'main'}
+origin = Origin('omp-extension', host['session_id'], bridge.identity(host), 'omp')
+dlg = bridge.store.create(origin, 'local', 'agy', cwd, 'native prompt', False)
+bridge.store.update(dlg['id'], state='running', runner_pid=123, launch_turn=1, launch_id='l1', agy_swarm='native', agy_mode='swarm',
+    native_observation=dict(turn=1, input_available=True, question_ids=[],
+        question_blockers=[dict(interaction_seq=0, reason='incomplete_question', available_actions=['observe','dialogue','cancel'], blocks_completion=True)]))
+bridge.store.native_input_open(dlg['id'], 1, 'l1', 1)
+print(json.dumps({'dlg': dlg['id']}))
+`;
+    const seeded = JSON.parse(execFileSync('python3', ['-B', '-c', seedScript, dbPath, root], {cwd: implDir, encoding: 'utf8'}));
+
+    const accepted = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'review fragment 0',
+      command_id: 'b0',
+      expected_turn: 1,
+      blocker_interaction_seq: 0,
+    }, f.ctx);
+    assert.equal(accepted.task.commands.b0.status, 'accepted');
+    assert.equal(accepted.task.commands.b0.blocker_interaction_seq, 0);
+
+    await assert.rejects(adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'dup 0',
+      command_id: 'b0-dup',
+      expected_turn: 1,
+      blocker_interaction_seq: 0,
+    }, f.ctx));
+
+    await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      command_id: 'wb0',
+      expected_turn: 1,
+      target_command_id: 'b0',
+      withdraw: true,
+    }, f.ctx);
+
+    const rebound = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'rebound 0',
+      command_id: 'b1',
+      expected_turn: 1,
+      blocker_interaction_seq: 0,
+    }, f.ctx);
+    assert.equal(rebound.task.commands.b1.blocker_interaction_seq, 0);
+
+    const settleScript = `
+import sys
+from bridge import Store
+s = Store(sys.argv[1])
+tid = sys.argv[2]
+s.native_dialogue_claim(tid, 1, 'l1', 1)
+s.native_dialogue_state(tid, 1, 'l1', 1, 'b1', 'send_started')
+s.native_dialogue_state(tid, 1, 'l1', 1, 'b1', 'returned')
+s.update(tid, state='completed', native_input=dict(accepting=False, settling=True, turn=1, launch_id='l1', epoch=1),
+         native_observation=dict(turn=1, input_available=False, question_ids=[], question_blockers=[]))
+`;
+    execFileSync('python3', ['-B', '-c', settleScript, dbPath, seeded.dlg], {cwd: implDir, encoding: 'utf8'});
+    const settledRetry = await adapter.execute({
+      action: 'dialogue',
+      task_id: seeded.dlg,
+      prompt: 'rebound 0',
+      command_id: 'b1',
+      expected_turn: 1,
+      blocker_interaction_seq: 0,
+    }, f.ctx);
+    assert.equal(settledRetry.task.state, 'completed');
+    assert.equal(settledRetry.task.commands.b1.blocker_interaction_seq, 0);
+
+    adapter.detach();
+  } finally {
+    if (previous === undefined) delete process.env.CALL_CLI_PYTHON;
+    else process.env.CALL_CLI_PYTHON = previous;
+    await rm(root, {recursive: true, force: true});
+  }
+});
+
+test('recovery_status works pre-bind via read-only observe without scheduling timer and enforces strict task_id validation', async () => {
+  const f = fixture(async value => {
+    if (value.action === 'bind') return {capability: 'private-cap'};
+    return {
+      resource_recovery: {task_id: 'foreign-1', turn: 1, business_state: 'unknown', resource_state: 'unknown', write: true, receipt: null},
+      diagnostic: {agent: 'agy', agy_mode: 'swarm', native_phase: 'unknown', stop_reason: null, exit_code: null, pending_question_count: 0, intervention_status: 'none', native_diagnostic: null},
+    };
+  });
+  for (const [invalid, pattern] of [
+    [{action: 'recovery_status'}, /recovery_status accepts only nonempty task_id/],
+    [{action: 'recovery_status', task_id: ''}, /recovery_status accepts only nonempty task_id/],
+    [{action: 'recovery_status', task_id: '   '}, /recovery_status accepts only nonempty task_id/],
+    [{action: 'recovery_status', task_id: 't1', prompt: 'x'}, /recovery_status accepts only nonempty task_id/],
+    [{action: 'recovery_status', task_id: 't1', expected_turn: 1}, /recovery_status accepts only nonempty task_id/],
+    [{action: 'recovery_status', task_id: 't1', group: 'ops'}, /group requires start or list/],
+    [{action: 'recovery_status', task_id: 't1', abandon: true}, /abandon requires release_only/],
+  ]) {
+    await assert.rejects(f.adapter.execute(invalid, f.ctx), pattern);
+  }
+  assert.equal(f.calls.length, 0);
+
+  const res = await f.adapter.execute({action: 'recovery_status', task_id: 'foreign-1'}, f.ctx);
+  assert.equal(res.resource_recovery.task_id, 'foreign-1');
+  assert.equal(res.diagnostic.agent, 'agy');
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].action, 'observe');
+  assert.equal(f.calls[0].args.action, 'recovery_status');
+  assert.equal(f.timers.length, 0);
+  f.adapter.detach();
+});
+
+test('status never starts, activates, or stops polling for owned or nonowned tasks while start/control wait remains active', async () => {
+  const f = fixture(async value => {
+    if (value.action === 'bind') return {capability: 'private-cap'};
+    if (value.args.action === 'start') return {task: {id: 'owned-1', state: 'queued', host_binding: 'omp-extension', owned_by_bound_host: true}};
+    if (value.args.action === 'close') return {task: {id: 'owned-1', state: 'closed', host_binding: 'omp-extension', owned_by_bound_host: true}};
+    if (value.args.action === 'status' && value.args.task_id === 'foreign') {
+      return {task: {id: 'foreign', state: 'running', host_binding: 'omp-extension', owned_by_bound_host: false}};
+    }
+    if (value.args.action === 'status' && value.args.task_id === 'owned-2') {
+      return {task: {id: 'owned-2', state: 'running', host_binding: 'omp-extension', owned_by_bound_host: true}};
+    }
+    return {task: {id: value.args.task_id, state: 'completed'}, events: []};
+  });
+  await f.adapter.execute({action: 'list'}, f.ctx);
+  assert.equal(f.timers.length, 0);
+
+  // Bind host via start+close so no track is active; owned and nonowned status must keep timers=0.
+  await f.adapter.execute({action: 'start', cwd: '/work', prompt: 'owned'}, f.ctx);
+  assert.equal(f.timers.length, 1);
+  await f.adapter.execute({action: 'close', task_id: 'owned-1'}, f.ctx);
+  assert.equal(f.timers.length, 0);
+
+  await f.adapter.execute({action: 'status', task_id: 'foreign'}, f.ctx);
+  assert.equal(f.timers.length, 0, 'unowned task status must never activate polling');
+  await f.adapter.execute({action: 'status', task_id: 'owned-2'}, f.ctx);
+  assert.equal(f.timers.length, 0, 'owned task status must never activate polling');
+
+  // Re-start owned-1: active polling stays intact across foreign and owned status calls.
+  await f.adapter.execute({action: 'start', cwd: '/work', prompt: 'owned again'}, f.ctx);
+  assert.equal(f.timers.length, 1);
+  await f.adapter.execute({action: 'status', task_id: 'foreign'}, f.ctx);
+  await f.adapter.execute({action: 'status', task_id: 'owned-2'}, f.ctx);
+  assert.equal(f.timers.length, 1, 'status must not disturb existing control-started wait');
+  f.adapter.detach();
+});
+
+test('end-to-end real omp_bridge.py subprocess supports pre-bind list and recovery_status with zero DB/dir/mode writes', async () => {
+  const {existsSync} = await import('node:fs');
+  const {mkdtemp, readFile, rm, stat} = await import('node:fs/promises');
+  const {execFileSync} = await import('node:child_process');
+  const {tmpdir} = await import('node:os');
+  const {join, dirname} = await import('node:path');
+  const {fileURLToPath} = await import('node:url');
+  const root = await mkdtemp(join(tmpdir(), 'callcli-omp-rec-e2e-'));
+  const previous = process.env.CALL_CLI_PYTHON;
+  const implDir = dirname(fileURLToPath(import.meta.url));
+  const missingDb = join(root, 'missing-dir', 'tasks.db');
+  const dbPath = join(root, 'tasks.db');
+  try {
+    process.env.CALL_CLI_PYTHON = 'python3';
+    const fMissing = fixture();
+    const missingAdapter = createAdapter({sendMessage: () => {}}, {db: missingDb, pollMs: 60000});
+    assert.deepEqual((await missingAdapter.execute({action: 'list'}, fMissing.ctx)).tasks, []);
+    await assert.rejects(missingAdapter.execute({action: 'recovery_status', task_id: 'missing'}, fMissing.ctx), /KeyError/);
+    assert.equal(existsSync(dirname(missingDb)), false);
+    assert.equal(existsSync(missingDb), false);
+    assert.equal(fMissing.timers.length, 0);
+    missingAdapter.detach();
+
+    const seedScript = `
+import json, sys
+from bridge import Origin
+from omp_bridge import HostBridge
+
+db_path, cwd = sys.argv[1], sys.argv[2]
+bridge = HostBridge(db_path, launch=lambda t: None)
+other = {'session_id': 'other-secret-sid', 'agent_id': 'other-secret-agent'}
+cap = bridge.bind(other)
+t = bridge.handle(other, cap, {'action': 'start', 'agent': 'agy', 'cwd': cwd, 'prompt': 'CANARY_PROMPT'})['task']
+bridge.store.update(t['id'], state='unknown', runner_pid=0, settlement_note='CANARY_NOTE',
+    native_observation={'turn': 1, 'history_degraded': True, 'pending_tools': [{'id': 'CANARY_TID', 'name': 'CANARY_TOOL', 'kind': 'read', 'status': 'in_progress'}]})
+print(json.dumps({'task_id': t['id']}))
+`;
+    const seeded = JSON.parse(execFileSync('python3', ['-B', '-c', seedScript, dbPath, root], {cwd: implDir, encoding: 'utf8'}));
+
+    const f = fixture();
+    const adapter = createAdapter({sendMessage: () => {}}, {db: dbPath, pollMs: 60000});
+    const before = await readFile(dbPath);
+    const beforeMode = (await stat(dbPath)).mode & 0o777;
+    const listed = await adapter.execute({action: 'list'}, f.ctx);
+    assert.deepEqual(listed.tasks, []);
+    assert.deepEqual(await readFile(dbPath), before);
+    assert.equal((await stat(dbPath)).mode & 0o777, beforeMode);
+
+    const first = await adapter.execute({action: 'recovery_status', task_id: seeded.task_id}, f.ctx);
+    assert.deepEqual(await readFile(dbPath), before);
+    assert.equal((await stat(dbPath)).mode & 0o777, beforeMode);
+    const second = await adapter.execute({action: 'recovery_status', task_id: seeded.task_id}, f.ctx);
+    assert.deepEqual(await readFile(dbPath), before);
+    assert.equal(second.resource_recovery.task_id, seeded.task_id);
+    assert.equal(second.diagnostic.agent, 'agy');
+    assert.equal(second.diagnostic.native_diagnostic.history_degraded, true);
+    assert.deepEqual(second.diagnostic.native_diagnostic.pending_tool_kinds, ['read']);
+    for (const secret of ['CANARY_', 'other-secret-sid', 'other-secret-agent', 'host-a']) {
+      assert.ok(!JSON.stringify(first).includes(secret));
+      assert.ok(!JSON.stringify(second).includes(secret));
+    }
+    assert.equal(f.timers.length, 0);
+    adapter.detach();
+  } finally {
+    if (previous === undefined) delete process.env.CALL_CLI_PYTHON;
+    else process.env.CALL_CLI_PYTHON = previous;
+    await rm(root, {recursive: true, force: true});
+  }
 });

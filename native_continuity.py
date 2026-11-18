@@ -30,22 +30,7 @@ class NativeStore(Store):
         self.hermes_home = Path(hermes_home) if hermes_home is not None else None
         self.hermes_root = Path(hermes_root) if hermes_root is not None else None
         self.action = action
-        if action == 'recovery_status':
-            self.path = Path(path)  # No mkdir, schema initialization or chmod on reads.
-        else:
-            super().__init__(path)
-
-    @contextmanager
-    def connect(self):
-        if self.action != 'recovery_status':
-            with super().connect() as db:
-                yield db
-            return
-        with closing(sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro',
-                                     uri=True, timeout=15)) as db:
-            db.row_factory = sqlite3.Row
-            db.execute('PRAGMA query_only=ON')
-            yield db
+        super().__init__(path, read_only=(action in {'list', 'status', 'events', 'recovery_status'}))
 
     def _same_principal(self, owner, origin):
         if super()._allows(owner, origin):
@@ -116,26 +101,14 @@ class NativeStore(Store):
         task.update(controller=dataclasses.asdict(origin),
                     control_epoch=task.get('control_epoch', 1)+1)
 
-    def recovery_snapshot(self, task_id, origin):
-        with self.connect() as db:
-            db.execute('BEGIN')
-            row = db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()
-            if row is None:
-                raise KeyError('Unknown call-cli task')
-            task = self._release_authorized(json.loads(row[0]), origin)
-            receipt = None
-            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_fences'").fetchone():
-                row = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
-                if row:
-                    receipt = json.loads(row[0])
-            return task, receipt
-
     def release_target(self, task_id, origin):
         return self._release_authorized(super().get(task_id), origin)
 
     @staticmethod
     def _release_authorized(task, origin):
-        if (task['origin']['profile'] not in {'standalone', 'omp-extension', origin.profile}
+        orig = task.get('origin') if isinstance(task, dict) else None
+        profile = orig.get('profile') if isinstance(orig, dict) else None
+        if (profile not in {'standalone', 'omp-extension', origin.profile}
                 or origin.profile in {'standalone', 'omp-extension'}):
             raise PermissionError('Release-only requires the current trusted host profile')
         return task
@@ -197,27 +170,31 @@ class NativeStore(Store):
                             CASE WHEN model_config IS NULL THEN 1
                                  WHEN json_valid(model_config) THEN
                                      json_type(model_config) = 'object'
-                                     AND json_type(model_config, '$._reset_from') IS NULL
+                                     AND (json_type(model_config, '$._reset_from') IS NULL
+                                          OR (? = ? AND json_type(model_config, '$._reset_from') = 'text'))
                                      AND json_type(model_config, '$._branched_from') IS NULL
                                      AND json_type(model_config, '$._delegate_from') IS NULL
                                      AND json_type(model_config, '$._compressed_from') IS NULL
                                  ELSE 0 END,
                             source
                         FROM sessions WHERE id = ? AND COALESCE(profile_name, ?) = ?
-                    ''', (current, profile, profile)).fetchone()
+                    ''', (current, ancestor, current, profile, profile)).fetchone()
                     if row is None:
                         return False
                     parent, reason, ended, clean, source = row
-                    if clean != 1 or source not in _NATIVE_SOURCES:
-                        return False
-                    if child is None:
-                        if ended is not None or reason is not None:
+                    if not found:
+                        if clean != 1 or source not in _NATIVE_SOURCES:
                             return False
-                    elif (reason != 'compression' or not isinstance(ended, (int, float))
-                          or not math.isfinite(ended) or ended <= 0 or source != child[4]):
-                        return False
-                    if current == ancestor:
-                        found = child is not None
+                        if child is None:
+                            if ended is not None or reason is not None:
+                                return False
+                        elif (reason != 'compression' or not isinstance(ended, (int, float))
+                              or not math.isfinite(ended) or ended <= 0 or source != child[4]):
+                            return False
+                        if current == ancestor:
+                            found = child is not None
+                    # Before the task's origin, inspect ancestry only for cycles.
+                    # A reset there does not invalidate work started after it.
                     if parent is None:
                         return found
                     if not isinstance(parent, str) or not parent:
@@ -231,7 +208,9 @@ class NativeStore(Store):
         # Only same-route owner identities are candidates; no foreign task data
         # leaves the Store. Each returned row passes the same authorization check.
         target = normalize_group(group)
-        with self.connect() as db:
+        if self.read_only and not self.path.exists():
+            return []
+        with self.ro_connect() as db:
             rows = db.execute('''SELECT owner, data FROM tasks
                 WHERE CASE WHEN json_valid(owner) THEN
                   json_extract(owner, '$.profile') = ? ELSE 0 END''', (origin.profile,)).fetchall()

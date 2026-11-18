@@ -12,8 +12,10 @@ import time
 
 try:
     from .bridge import Store, Origin
+    from .recovery import _is_settled_missing_final, _runner_inactive
 except ImportError:
     from bridge import Store, Origin
+    from recovery import _is_settled_missing_final, _runner_inactive
 
 
 def canonical(value):
@@ -218,8 +220,8 @@ class Release:
             task, current = self._snapshot(db)
             if current != binding:
                 raise ValueError('Release snapshot changed; prepare again')
-            reserving = dict(task, state='unknown')
-            self.store._check_writers(db, reserving)
+            if task['state'] in {'completed', 'cancelled'} and self.store._has_conflicting_writer(db, task):
+                task['resource_state'] = 'superseded'
             receipt = dict(operation='release-only', target=self.policy, binding=binding,
                            epoch=1, state='unknown', phase='admitted', admitted_at=self.clock())
             receipt['attempts'] = [dict(number=1, operation='close', stage='close',
@@ -251,6 +253,8 @@ class Release:
                 raise ValueError('Backend close not verified')
             receipt.update(state='released', phase='verified', proof=proof, finished_at=self.clock())
             receipt['attempts'][-1].update(stage='verify', reason_code='verified', finished_at=self.clock())
+            if task.get('resource_state') == 'superseded':
+                task.pop('resource_state', None)
             task['state'] = 'closed'
         except Exception as exc:
             receipt.update(phase='hold', error=type(exc).__name__, finished_at=self.clock())
@@ -321,6 +325,8 @@ class Release:
             receipt.update(phase='verified' if verified else 'hold', stage=stage, reason_code=reason)
             if verified:
                 receipt.update(state='released', reconciliation=proof, reconciled_at=self.clock())
+                if task.get('resource_state') == 'superseded':
+                    task.pop('resource_state', None)
                 task['state'] = 'closed'
             self._publish(db, task, receipt)
         return receipt
@@ -355,18 +361,8 @@ def release_resources(db, task, *, source, actor):
 def check_release_task(task):
     if task['state'] not in {'unknown', 'closed'}:
         raise ValueError('Release-only requires unknown/HOLD; active writers must settle first')
-    pid = task.get('runner_pid')
-    if pid:
-        if type(pid) is not int or pid < 1:
-            raise ValueError('Invalid runner identity; retain reservation')
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            pass
-        except (OSError, TypeError, ValueError, OverflowError):
-            raise ValueError('Runner activity unverified; retain reservation') from None
-        else:
-            raise ValueError('Runner is still active; retain reservation')
+    if not _runner_inactive(task):
+        raise ValueError('Runner activity unverified or still active; retain reservation')
 
 
 def release_only_task(store, origin, task_id, expected_turn, *, backend=None, abandon=False):
@@ -397,7 +393,13 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
         # not proof that arbitrary descendant processes died.
         with store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            current = store._owned(db, task_id, origin)
+            # Receipt settlement is not admission to control the ended owner's work.
+            current = Store._owned(store, db, task_id, origin)
+            current_same = getattr(store, '_same_principal', store._allows)(
+                Origin(**current.get('controller', current['origin'])).key(), origin)
+            trusted = store.native_cleanup_verified(db, current)
+            if not current_same and (not trusted or current.get('runner_pid')):
+                raise ValueError('Ended-owner close requires a bound owner cleanup receipt')
             if (current['state']=='closed' and current.get('agy_swarm')=='native'
                     and store._native_binding(current)==store._native_binding(task)
                     and current.get('controller',current['origin'])==task.get('controller',task['origin'])
@@ -409,11 +411,10 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
             if current['state'] not in {'completed', 'cancelled', 'unknown'}:
                 raise ValueError('Native owner must settle before close')
             cleanup = current.get('native_cleanup', {})
-            verified = (current['state'] == 'completed' and cleanup.get('session_unloaded') is True
+            verified = (current_same and current['state'] == 'completed' and cleanup.get('session_unloaded') is True
                         and cleanup.get('turn') == current['turn'] and isinstance(cleanup.get('workers'), list)
                         and bool(cleanup['workers']) and current.get('native_result', {}).get('turn') == current['turn']
                         and cleanup.get('evidence') == 'native-add-kill-completed-and-session-unload')
-            trusted = store.native_cleanup_verified(db, current)
             verified = verified or bool(trusted and trusted.get('kind')=='native-mode-settled'
                 and trusted.get('mode')==current.get('agy_mode')=='dynamic'
                 and trusted.get('evidence')=='parent-end-turn-complete-tool-history-and-unload'
@@ -430,12 +431,15 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                 and trusted.get('fresh') is True and trusted.get('baseline_empty') is True
                 and trusted.get('no_prompt') is True and not current.get('native_prompt_submitted')
                 and not current.get('runner_pid') and current['state'] in {'cancelled','unknown'})
-            verified = verified or (current['state'] == 'cancelled'
+            verified = verified or (current_same and current['state'] == 'cancelled'
                         and current.get('session_creation_attempted') is False
                         and not current.get('native_session_id') and not current.get('native_prompt_submitted'))
+            if not current_same and not verified:
+                raise ValueError('Ended-owner cleanup receipt does not prove settlement')
             if not verified:
+                if current['state'] in {'completed', 'cancelled'} and store._has_conflicting_writer(db, current):
+                    current['resource_state'] = 'superseded'
                 current['state'] = 'unknown'
-                store._check_writers(db, current)
                 store._save(db, current)
                 return dict(state='unknown', phase='hold', stage='native-proof',
                             reason_code='native_workers_unproven', external_close_attempted=False)
@@ -470,26 +474,15 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
                 raise ValueError('Close snapshot changed')
             if current['state'] not in {'completed','cancelled','unknown'}:
                 raise ValueError('Task is not settled for closing')
+            if current['state'] in {'completed','cancelled'} and store._has_conflicting_writer(db,current):
+                current['resource_state'] = 'superseded'
             current['state'] = 'unknown'
-            store._check_writers(db,current)
             store._save(db,current)
         return dict(state='unknown',phase='hold',stage='resolve',reason_code='exact_record_unavailable',
                     task=task_id,external_close_attempted=False)
     return recover_native(store, origin, task_id, expected_turn, 'close', backend)
 
 
-def _settled_close_eligible(task):
-    if task.get('state') != 'unknown' or task.get('runner_pid'):
-        return False
-    ts = task.get('turn_settlement')
-    if not isinstance(ts, dict) or ts.get('protocol_settled') is not True:
-        return False
-    req = task.get('backend_request_id')
-    if ts.get('turn') != task.get('turn') or not req or ts.get('request_id') != req:
-        return False
-    if task.get('launch_id') and ts.get('launch_id') != task.get('launch_id'):
-        return False
-    return True
 
 
 def recover_native(store, origin, task_id, expected_turn, operation, backend=None, *, abandon=False):
@@ -595,8 +588,9 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
         fence = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
         if not fence:
             business_state = current['state']
+            if business_state in {'completed', 'cancelled'} and store._has_conflicting_writer(db, current):
+                current['resource_state'] = 'superseded'
             current.update(state='unknown', release_epoch=1)
-            store._check_writers(db, current)
             for entry in current.get('commands', {}).values():
                 if entry.get('status') in {'pending','queued','target_started'}:
                     entry['status'] = 'release-revoked'
@@ -613,7 +607,7 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
         elif operation == 'close':
             existing_receipt = json.loads(fence[0])
             has_close_attempt = any(a.get('operation') == 'close' for a in existing_receipt.get('attempts', []))
-            if not (_settled_close_eligible(current) and not has_close_attempt):
+            if not (_is_settled_missing_final(current) and not has_close_attempt):
                 # Existing uncertainty is reconciled, never another external close.
                 operation = 'reconcile'
     if operation == 'close':
@@ -622,7 +616,7 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
             row = db.execute('SELECT data,receipt FROM release_fences WHERE task=?',(task_id,)).fetchone()
             reserved, receipt = json.loads(row[0]), json.loads(row[1])
             has_close = any(a.get('operation') == 'close' for a in receipt.get('attempts', []))
-            if receipt['state'] == 'released' or (has_close if _settled_close_eligible(reserved) else receipt.get('attempts')):
+            if receipt['state'] == 'released' or (has_close if _is_settled_missing_final(reserved) else receipt.get('attempts')):
                 return receipt
             receipt['attempts'].append(dict(number=1,operation='close',stage='close',
                                            reason_code='in_progress',started_at=time.time()))

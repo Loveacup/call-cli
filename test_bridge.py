@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -117,6 +118,9 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(sealed['native_input']['accepting'])
         self.assertIsNone(self.store.native_dialogue_claim(task['id'],1,'launch',1))
         self.assertEqual(sealed['commands']['queued']['status'],'not_sent')
+        self.assertFalse(hasattr(self.store, 'native_cancel_cleanup_state'))
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'late', expected_turn=1, command_id='late')
         receipt = dict(kind='verified-cancellation',task=task['id'],turn=1,launch_id='launch',epoch=1,
             session_id='session',cancel_id=sealed['native_cancel_id'],session_unloaded=True,workers=['worker'])
         for key, value in [('task','other'),('turn',2),('launch_id','stale'),('epoch',2),('session_id','other'),('cancel_id','other')]:
@@ -134,26 +138,102 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(notice['kind'],'cancelled')
         self.assertIsNone(self.store.native_cancel_notice(task['id'],1,'launch',1))
 
-    def test_cancel_cleanup_send_is_bound_once_and_seals_concurrent_dialogue(self):
-        import concurrent.futures
-        task=self.store.create(self.a,'local','agy','/one','owned',True)
-        self.store.update(task['id'],state='running',agy_swarm='native',launch_id='launch',runner_pid=1,native_session_id='session')
-        self.store.native_input_open(task['id'],1,'launch',1)
-        self.store.request_cancel(task['id'],self.a)
-        sealed=self.store.native_cancel_seal(task['id'],1,'launch',1)
-        cancel_id=sealed['native_cancel_id']
-        for args in ((2,'launch',1,cancel_id),(1,'stale',1,cancel_id),(1,'launch',2,cancel_id),(1,'launch',1,'other')):
-            with self.assertRaises(ValueError):self.store.native_cancel_cleanup_state(task['id'],*args,'send_started',['a'])
-        def claim(_):
-            try:self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'send_started',['a']); return True
-            except ValueError:return False
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            self.assertEqual(sorted(pool.map(claim,range(2))),[False,True])
-        with self.assertRaises(ValueError):self.store.dialogue(task['id'],self.a,'late',expected_turn=1,command_id='late')
-        self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'unknown',['a'])
-        self.store.request_cancel(task['id'],self.a)
-        with self.assertRaises(ValueError):self.store.native_cancel_cleanup_state(task['id'],1,'launch',1,cancel_id,'send_started',['a'])
-        self.assertEqual(self.store.get(task['id'])['native_cancel_cleanup']['status'],'unknown')
+    def test_native_cancel_seal_and_repeat_cancel_preserve_cancel_id_and_reject_stale_or_non_cancelling(self):
+        task = self.store.create(self.a, 'local', 'agy', '/one', 'owned', True)
+        self.store.update(task['id'], state='running', agy_swarm='native', launch_id='launch',
+                          runner_pid=123, native_session_id='session')
+        token = self.store.native_cleanup_owner(task['id'], 1, 'launch', 1)
+        self.store.native_input_open(task['id'], 1, 'launch', 1)
+        self.store.dialogue(task['id'], self.a, 'queued', expected_turn=1, command_id='queued')
+
+        # Non-cancelling ('running') rejects seal even with exact (turn, launch_id, epoch) binding
+        with self.assertRaisesRegex(ValueError, 'cancellation not requested'):
+            self.store.native_cancel_seal(task['id'], 1, 'launch', 1)
+        running_state = self.store.get(task['id'])
+        self.assertNotIn('native_cancel_id', running_state)
+        self.assertTrue(running_state['native_input']['accepting'])
+        self.assertEqual(running_state['commands']['queued']['status'], 'accepted')
+
+        # First request_cancel mints native_cancel_id; stale turn/launch/epoch seal calls reject without mutating
+        first_cancel = self.store.request_cancel(task['id'], self.a)
+        cancel_id = first_cancel['native_cancel_id']
+        self.assertTrue(cancel_id)
+        self.assertEqual(first_cancel['state'], 'cancelling')
+        self.assertFalse(first_cancel['native_input']['accepting'])
+        for bad_binding in ((2, 'launch', 1), (1, 'stale', 1), (1, 'launch', 2)):
+            with self.subTest(pre_seal_bad_binding=bad_binding), self.assertRaisesRegex(ValueError, 'stale or fenced'):
+                self.store.native_cancel_seal(task['id'], *bad_binding)
+        self.assertEqual(self.store.get(task['id'])['commands']['queued']['status'], 'accepted')
+        self.assertEqual(self.store.get(task['id'])['native_cancel_id'], cancel_id)
+
+        # Valid seal preserves native_cancel_id, marks accepted dialogue not_sent, and rejects post-seal dialogue
+        sealed = self.store.native_cancel_seal(task['id'], 1, 'launch', 1)
+        self.assertEqual(sealed['native_cancel_id'], cancel_id)
+        self.assertFalse(sealed['native_input']['accepting'])
+        self.assertEqual(sealed['commands']['queued']['status'], 'not_sent')
+        self.assertIsNone(self.store.native_dialogue_claim(task['id'], 1, 'launch', 1))
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'late', expected_turn=1, command_id='late')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, expected_turn=1, command_id='w-late',
+                                target_command_id='queued', withdraw=True)
+        self.assertNotIn('late', self.store.get(task['id'])['commands'])
+
+        # Repeated request_cancel and repeated native_cancel_seal on same (turn, launch_id, epoch) keep exact cancel_id
+        for _ in range(2):
+            repeated_cancel = self.store.request_cancel(task['id'], self.a)
+            self.assertEqual(repeated_cancel['native_cancel_id'], cancel_id)
+            self.assertEqual(repeated_cancel['state'], 'cancelling')
+            self.assertFalse(repeated_cancel['native_input']['accepting'])
+            repeated_seal = self.store.native_cancel_seal(task['id'], 1, 'launch', 1)
+            self.assertEqual(repeated_seal['native_cancel_id'], cancel_id)
+            self.assertEqual(repeated_seal['commands']['queued']['status'], 'not_sent')
+            self.assertFalse(repeated_seal['native_input']['accepting'])
+        for bad_binding in ((2, 'launch', 1), (1, 'stale', 1), (1, 'launch', 2)):
+            with self.subTest(post_seal_bad_binding=bad_binding), self.assertRaisesRegex(ValueError, 'stale or fenced'):
+                self.store.native_cancel_seal(task['id'], *bad_binding)
+        with self.assertRaises(ValueError):
+            self.store.dialogue(task['id'], self.a, 'late-2', expected_turn=1, command_id='late-2')
+        self.assertEqual(self.store.get(task['id'])['native_cancel_id'], cancel_id)
+
+        # Original cancel_id still commits verified-cancellation; once cancelled, seal rejects as non-cancelling
+        receipt = dict(kind='verified-cancellation', task=task['id'], turn=1, launch_id='launch', epoch=1,
+                       session_id='session', cancel_id=cancel_id, session_unloaded=True, workers=['worker'])
+        self.store.native_cleanup_commit(task['id'], 1, 'launch', 1, token, receipt)
+        with self.assertRaises(ValueError):
+            self.store.native_cancel_seal(task['id'], 1, 'launch', 1)
+        self.assertEqual(self.store.get(task['id'])['native_cancel_id'], cancel_id)
+
+        # Intervene-initiated cancelling (seal mints native_cancel_id first) also keeps stable cancel_id across repeats
+        t_iv = self.store.create(self.a, 'local', 'agy', '/intervene-seal', 'owned', True)
+        self.store.update(t_iv['id'], state='running', agy_swarm='native', launch_id='l-iv',
+                          runner_pid=124, native_session_id='sess-iv')
+        self.store.native_input_open(t_iv['id'], 1, 'l-iv', 1)
+        self.store.dialogue(t_iv['id'], self.a, 'd-iv', expected_turn=1, command_id='d-iv')
+        self.store.intervene(t_iv['id'], self.a, 'revise', 'iv-1', expected_turn=1)
+        iv_sealed = self.store.native_cancel_seal(t_iv['id'], 1, 'l-iv', 1)
+        iv_cancel_id = iv_sealed['native_cancel_id']
+        self.assertTrue(iv_cancel_id)
+        self.assertEqual(iv_sealed['commands']['d-iv']['status'], 'not_sent')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t_iv['id'], self.a, 'late-iv', expected_turn=1, command_id='late-iv')
+        self.assertEqual(self.store.native_cancel_seal(t_iv['id'], 1, 'l-iv', 1)['native_cancel_id'], iv_cancel_id)
+        self.assertEqual(self.store.request_cancel(t_iv['id'], self.a)['native_cancel_id'], iv_cancel_id)
+        self.assertEqual(self.store.native_cancel_seal(t_iv['id'], 1, 'l-iv', 1)['native_cancel_id'], iv_cancel_id)
+
+        # All other non-cancelling states and release_epoch-fenced cancelling reject native_cancel_seal without mutation
+        for idx, (st, extra) in enumerate([
+            ('queued', {}), ('waiting_reply', {}), ('completed', {}), ('cancelled', {}),
+            ('unknown', {}), ('closing', {}), ('closed', {}), ('cancelling', {'release_epoch': 1}),
+        ]):
+            with self.subTest(state=st, extra=extra):
+                other = self.store.create(self.a, 'local', 'agy', f'/non-cancelling-{idx}', 'inspect', False)
+                self.store.update(other['id'], state=st, agy_swarm='native', launch_id='launch',
+                                  runner_pid=125, native_session_id=f's-{idx}', **extra)
+                before = self.store.get(other['id'])
+                with self.assertRaises(ValueError):
+                    self.store.native_cancel_seal(other['id'], 1, 'launch', 1)
+                self.assertEqual(self.store.get(other['id']), before)
 
     def test_atomic_cancel_receipt_preserves_pending_intervention_until_controller_advances(self):
         task=self.store.create(self.a,'local','agy','/one','owned',True)
@@ -167,7 +247,9 @@ class StoreTests(unittest.TestCase):
         self.store.native_cleanup_commit(task['id'],1,'launch',1,token,receipt)
         current=self.store.get(task['id'])
         self.assertEqual((current['state'],current['turn'],current['commands']['revision']['status']),('cancelled',1,'pending'))
+        self.store.update(task['id'], native_cancel_cleanup={'status': 'unknown', 'workers': ['worker']})
         successor,launch=self.store.advance_intervention(task['id'],self.a)
+        self.assertNotIn('native_cancel_cleanup', successor)
         self.assertTrue(launch)
         self.assertEqual(successor['turn'],2)
         self.assertFalse(self.store.advance_intervention(task['id'],self.a)[1])
@@ -874,6 +956,356 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.native_begin_unload(tf2['id'], 1, 'lf2', 1, obs2, fence_pending_intervention=True), 'ok')
         with self.assertRaisesRegex(ValueError, 'unloading session'):
             self.store.intervene(tf2['id'], self.a, 'late iv', 'iv-late', expected_turn=1)
+
+    def test_dialogue_and_reply_question_ids_validation_mutual_exclusion_and_raw_bytes(self):
+        from collab import Collaboration
+
+        # 1) dialogue strict validation, mutual exclusion, raw-byte matching, non-current-turn/missing event
+        t = self.store.create(self.a, 'local', 'agy', '/dlg-valid', 'inspect', False)
+        self.store.update(t['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(t['id'], 1, 'launch', 1)
+        self.store.event(t['id'], '1:q:1', 'question', 'Q1 Format?', turn=1, interaction_seq=0)
+        self.store.event(t['id'], '1:q:2', 'question', 'Q2 Dest?', turn=1, interaction_seq=0)
+        self.store.event(t['id'], ' 1:raw ', 'question', 'Q3 Raw?', turn=1, interaction_seq=0)
+        # Missing event token inserted synthetically into task['questions'] and stale-turn event
+        t_cur = self.store.get(t['id'])
+        self.store.update(t['id'], questions=list(t_cur['questions']) + ['1:missing', '0:old'])
+        with self.store.connect() as db:
+            db.execute(
+                'INSERT INTO events VALUES (?,?,?)',
+                (t['id'], '0:old', json.dumps(dict(token='0:old', kind='question', text='Q9 Old?', turn=0))),
+            )
+
+        before = self.store.get(t['id'])
+        bad_dialogue_kwargs = [
+            dict(prompt='both', question_id='1:q:1', question_ids=['1:q:2']),
+            dict(prompt='both-empty-scalar', question_id='', question_ids=['1:q:1']),
+            dict(prompt='empty-list', question_ids=[]),
+            dict(prompt='empty-elem', question_ids=['']),
+            dict(prompt='non-str-elem', question_ids=[123]),
+            dict(prompt='csv-str', question_ids='1:q:1,1:q:2'),
+            dict(prompt='dup-ids', question_ids=['1:q:1', '1:q:1']),
+            dict(prompt='list-in-scalar', question_id=['1:q:1']),
+            dict(prompt='empty-scalar', question_id=''),
+            dict(prompt='trimmed-scalar', question_id=' 1:q:1 '),
+            dict(prompt='trimmed-list', question_ids=[' 1:q:1 ']),
+            dict(prompt='trimmed-raw', question_ids=['1:raw']),
+            dict(prompt='csv-in-scalar', question_id='1:q:1,1:q:2'),
+            dict(prompt='csv-in-list', question_ids=['1:q:1,1:q:2']),
+            dict(prompt='missing-event', question_ids=['1:missing']),
+            dict(prompt='stale-turn-event', question_ids=['0:old']),
+        ]
+        for idx, kwargs in enumerate(bad_dialogue_kwargs):
+            with self.subTest(case='dialogue_reject', idx=idx):
+                with self.assertRaises(ValueError):
+                    self.store.dialogue(t['id'], self.a, expected_turn=1, command_id=f'bad-{idx}', **kwargs)
+                self.assertEqual(self.store.get(t['id']), before)
+
+        # withdraw=True rejects question_ids (non-empty and empty)
+        self.store.dialogue(t['id'], self.a, 'valid', expected_turn=1, command_id='d-ok', question_ids=['1:q:1'])
+        before_wd = self.store.get(t['id'])
+        for qids in (['1:q:1'], []):
+            with self.assertRaises(ValueError):
+                self.store.dialogue(t['id'], self.a, expected_turn=1, command_id='wd-bad',
+                                    target_command_id='d-ok', withdraw=True, question_ids=qids)
+            self.assertEqual(self.store.get(t['id']), before_wd)
+        self.store.dialogue(t['id'], self.a, expected_turn=1, command_id='wd-ok', target_command_id='d-ok', withdraw=True)
+
+        # Exact raw-byte match for ' 1:raw ' without trimming
+        self.store.dialogue(t['id'], self.a, 'raw answer', expected_turn=1, command_id='d-raw', question_ids=[' 1:raw '])
+        self.store.native_dialogue_claim(t['id'], 1, 'launch', 1)
+        self.store.native_dialogue_state(t['id'], 1, 'launch', 1, 'd-raw', 'send_started')
+        self.store.native_dialogue_state(t['id'], 1, 'launch', 1, 'd-raw', 'returned')
+        after_raw = self.store.get(t['id'])
+        self.assertEqual(after_raw['answers'], {' 1:raw ': 'raw answer'})
+        self.assertNotIn(' 1:raw ', after_raw['questions'])
+
+        # 2) reply strict validation, mutual exclusion, raw-byte matching, non-current-turn/missing event
+        c = Collaboration(self.store.path, launch=lambda task: None)
+        client = c.connect('omp')['client_id']
+        rt = c.start(client, prompt='inspect', cwd='/reply-valid')
+        self.store.update(rt['id'], state='waiting_reply')
+        self.store.event(rt['id'], '1:q:1', 'question', 'Q1 Format?', turn=1)
+        self.store.event(rt['id'], '1:q:2', 'question', 'Q2 Dest?', turn=1)
+        self.store.event(rt['id'], ' 1:raw ', 'question', 'Q3 Raw?', turn=1)
+        rt_cur = self.store.get(rt['id'])
+        self.store.update(rt['id'], questions=list(rt_cur['questions']) + ['1:missing', '0:old'])
+        with self.store.connect() as db:
+            db.execute(
+                'INSERT INTO events VALUES (?,?,?)',
+                (rt['id'], '0:old', json.dumps(dict(token='0:old', kind='question', text='Q9 Old?', turn=0))),
+            )
+        before_rt = self.store.get(rt['id'])
+        bad_reply_cases = [
+            dict(question_id='1:q:1', question_ids=['1:q:2']),
+            dict(question_id='', question_ids=['1:q:1']),
+            dict(question_ids=[]),
+            dict(question_ids=['']),
+            dict(question_ids=[123]),
+            dict(question_ids='1:q:1,1:q:2'),
+            dict(question_ids=['1:q:1', '1:q:1']),
+            dict(question_id=['1:q:1']),
+            dict(question_id=' 1:q:1 '),
+            dict(question_ids=[' 1:q:1 ']),
+            dict(question_ids=['1:raw']),
+            dict(question_id='1:q:1,1:q:2'),
+            dict(question_ids=['1:q:1,1:q:2']),
+            dict(question_ids=['1:missing']),
+            dict(question_ids=['0:old']),
+        ]
+        for idx, kwargs in enumerate(bad_reply_cases):
+            with self.subTest(case='reply_reject', idx=idx):
+                with self.assertRaises(ValueError):
+                    c.reply(client, rt['id'], prompt='ans', **kwargs)
+                self.assertEqual(self.store.get(rt['id']), before_rt)
+        partial_raw = c.reply(client, rt['id'], prompt='raw reply', question_ids=[' 1:raw '])
+        self.assertEqual(partial_raw['answers'], {' 1:raw ': 'raw reply'})
+        self.assertEqual(partial_raw['state'], 'waiting_reply')
+
+    def test_dialogue_and_reply_question_ids_command_idempotency_and_overlap_release(self):
+        # Dialogue idempotency with permuted order + raw ID preservation + conflict checks
+        t = self.store.create(self.a, 'local', 'agy', '/dlg-idem', 'inspect', False)
+        self.store.update(t['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(t['id'], 1, 'launch', 1)
+        self.store.event(t['id'], '1:q:1', 'question', 'Q1 A?', turn=1, interaction_seq=0)
+        self.store.event(t['id'], '1:q:2', 'question', 'Q2 B?', turn=1, interaction_seq=0)
+        self.store.event(t['id'], '1:q:3', 'question', 'Q3 C?', turn=1, interaction_seq=0)
+
+        first = self.store.dialogue(t['id'], self.a, 'ans12', expected_turn=1, command_id='d1',
+                                    question_ids=['1:q:2', '1:q:1'])
+        self.assertEqual(first['commands']['d1']['question_ids'], ['1:q:2', '1:q:1'])
+        # Permuted retry succeeds idempotently
+        retried = self.store.dialogue(t['id'], self.a, 'ans12', expected_turn=1, command_id='d1',
+                                      question_ids=['1:q:1', '1:q:2'])
+        self.assertEqual(retried, first)
+        self.assertEqual(retried['commands']['d1']['question_ids'], ['1:q:2', '1:q:1'])
+        # Scalar vs list or different set with same command_id raises ValueError
+        for conflict in (dict(question_id='1:q:1'), dict(question_ids=['1:q:1']), dict(question_ids=['1:q:1', '1:q:3'])):
+            with self.assertRaises(ValueError):
+                self.store.dialogue(t['id'], self.a, 'ans12', expected_turn=1, command_id='d1', **conflict)
+
+        # Overlap rejected across scalar and list
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t['id'], self.a, 'overlap', expected_turn=1, command_id='ov1', question_id='1:q:2')
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t['id'], self.a, 'overlap', expected_turn=1, command_id='ov2', question_ids=['1:q:2', '1:q:3'])
+
+        # Withdraw releases all bound IDs atomically
+        self.store.dialogue(t['id'], self.a, expected_turn=1, command_id='w1', target_command_id='d1', withdraw=True)
+        d2 = self.store.dialogue(t['id'], self.a, 'ans1', expected_turn=1, command_id='d2', question_id='1:q:1')
+        self.assertEqual(d2['commands']['d2']['status'], 'accepted')
+        # Supersede scalar with list, then list with subset list releasing 1:q:2
+        d3 = self.store.dialogue(t['id'], self.a, 'ans123', expected_turn=1, command_id='d3',
+                                 target_command_id='d2', question_ids=['1:q:1', '1:q:2', '1:q:3'])
+        self.assertEqual(d3['commands']['d2']['status'], 'superseded')
+        d4 = self.store.dialogue(t['id'], self.a, 'ans13', expected_turn=1, command_id='d4',
+                                 target_command_id='d3', question_ids=['1:q:1', '1:q:3'])
+        self.assertEqual(d4['commands']['d3']['status'], 'superseded')
+        d5 = self.store.dialogue(t['id'], self.a, 'ans2', expected_turn=1, command_id='d5', question_id='1:q:2')
+        self.assertEqual(d5['commands']['d5']['status'], 'accepted')
+
+        # Reply idempotency with permuted order + scalar-vs-list conflict
+        rt = self.store.create(self.a, 'local', 'omp', '/rpl-idem', 'inspect', False)
+        self.store.update(rt['id'], state='waiting_reply')
+        self.store.event(rt['id'], '1:q:1', 'question', 'Q1 A?', turn=1)
+        self.store.event(rt['id'], '1:q:2', 'question', 'Q2 B?', turn=1)
+        self.store.event(rt['id'], '1:q:3', 'question', 'Q3 C?', turn=1)
+        r1 = self.store.reply(rt['id'], self.a, prompt='ans12', question_ids=['1:q:2', '1:q:1'],
+                              expected_turn=1, command_id='rc1')
+        self.assertEqual(r1, self.store.reply(rt['id'], self.a, prompt='ans12', question_ids=['1:q:1', '1:q:2'],
+                                               expected_turn=1, command_id='rc1'))
+        self.assertEqual(r1['answers'], {'1:q:2': 'ans12', '1:q:1': 'ans12'})
+        for conflict in (dict(question_id='1:q:1'), dict(question_ids=['1:q:1']), dict(question_ids=['1:q:1', '1:q:3'])):
+            with self.assertRaises(ValueError):
+                self.store.reply(rt['id'], self.a, prompt='ans12', expected_turn=1, command_id='rc1', **conflict)
+
+    def test_reply_question_ids_d4_subset_merge_clear_timeout_and_cli_surface(self):
+        import contextlib, io
+        from collab import Collaboration, main as collab_main
+
+        # Subset + clear_timeout=True waits until final answer and merges k: v lines
+        t = self.store.create(self.a, 'local', 'omp', '/rpl-sub', 'inspect', False)
+        self.store.update(t['id'], state='waiting_reply', timeout=420)
+        self.store.event(t['id'], '1:q:1', 'question', 'Q1 A?', turn=1)
+        self.store.event(t['id'], '1:q:2', 'question', 'Q2 B?', turn=1)
+        self.store.event(t['id'], '1:q:3', 'question', 'Q3 C?', turn=1)
+        partial = self.store.reply(t['id'], self.a, prompt='first two', question_ids=['1:q:1', '1:q:2'], clear_timeout=True)
+        self.assertEqual((partial['state'], partial['turn'], partial['timeout']), ('waiting_reply', 1, 420))
+        self.assertEqual((partial['questions'], partial['question_id']), (['1:q:3'], '1:q:3'))
+        final = self.store.reply(t['id'], self.a, '1:q:3', 'third')
+        self.assertEqual((final['state'], final['turn'], final['timeout']), ('queued', 2, None))
+        self.assertEqual(final['prompt'], '1:q:1: first two\n1:q:2: first two\n1:q:3: third')
+
+        # Single question via question_ids=['1:q:1'] merges as answers[0][1]
+        t_single = self.store.create(self.a, 'local', 'omp', '/rpl-one', 'inspect', False)
+        self.store.update(t_single['id'], state='waiting_reply')
+        self.store.event(t_single['id'], '1:q:1', 'question', 'Q1 Only?', turn=1)
+        done_single = self.store.reply(t_single['id'], self.a, prompt='JSON only', question_ids=['1:q:1'])
+        self.assertEqual((done_single['state'], done_single['turn'], done_single['prompt']), ( 'queued', 2, 'JSON only'))
+
+        # Multiple questions via one question_ids call merges as '\n'.join(k: v)
+        t_all = self.store.create(self.a, 'local', 'omp', '/rpl-all', 'inspect', False)
+        self.store.update(t_all['id'], state='waiting_reply', timeout=300)
+        self.store.event(t_all['id'], '1:q:1', 'question', 'Q1 A?', turn=1)
+        self.store.event(t_all['id'], '1:q:2', 'question', 'Q2 B?', turn=1)
+        done_all = self.store.reply(t_all['id'], self.a, prompt='yes both', question_ids=['1:q:1', '1:q:2'], clear_timeout=True)
+        self.assertEqual((done_all['state'], done_all['turn'], done_all['timeout']), ('queued', 2, None))
+        self.assertEqual(done_all['prompt'], '1:q:1: yes both\n1:q:2: yes both')
+
+        # collab.main CLI (--question-id optional, --question-ids nargs='+' action='extend' on reply & dialogue)
+        db_path = Path(self.tmp.name) / 'cli.sqlite3'
+        launches = []
+        c = Collaboration(db_path, launch=launches.append)
+        client = c.connect('omp')['client_id']
+        t_cli = c.start(client, prompt='inspect', cwd='/cli-rpl')
+        c.store.update(t_cli['id'], state='waiting_reply')
+        c.store.event(t_cli['id'], '1:q:1', 'question', 'Q1?', turn=1)
+        c.store.event(t_cli['id'], '1:q:2', 'question', 'Q2?', turn=1)
+        from unittest.mock import patch
+        with patch('collab.Collaboration', return_value=c), contextlib.redirect_stdout(io.StringIO()) as out:
+            rc_bad = collab_main(['--db', str(db_path), '--client', client, 'reply', '--task', t_cli['id'], '--prompt', 'missing'])
+        self.assertEqual(rc_bad, 1, out.getvalue())
+        with patch('collab.Collaboration', return_value=c), contextlib.redirect_stdout(io.StringIO()) as out:
+            rc_rpl = collab_main(['--db', str(db_path), '--client', client, 'reply', '--task', t_cli['id'],
+                                  '--question-ids', '1:q:1', '1:q:2', '--prompt', 'cli both'])
+        self.assertEqual(rc_rpl, 0, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())['prompt'], '1:q:1: cli both\n1:q:2: cli both')
+
+        t_dlg_cli = c.start(client, prompt='inspect', cwd='/cli-dlg', agent='agy', model='ocs')
+        c.store.update(t_dlg_cli['id'], state='running', agy_swarm='native', launch_id='l-cli', runner_pid=456)
+        c.store.native_input_open(t_dlg_cli['id'], 1, 'l-cli', 1)
+        c.store.event(t_dlg_cli['id'], '1:q:1', 'question', 'Q1?', turn=1, interaction_seq=0)
+        c.store.event(t_dlg_cli['id'], '1:q:2', 'question', 'Q2?', turn=1, interaction_seq=0)
+        with patch('collab.Collaboration', return_value=c), contextlib.redirect_stdout(io.StringIO()) as out:
+            rc_dlg = collab_main(['--db', str(db_path), '--client', client, 'dialogue', '--task', t_dlg_cli['id'],
+                                  '--expected-turn', '1', '--command-id', 'd-cli',
+                                  '--question-ids', '1:q:1', '--question-ids', '1:q:2', '--prompt', 'dlg both'])
+        self.assertEqual(rc_dlg, 0, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())['commands']['d-cli']['question_ids'], ['1:q:1', '1:q:2'])
+
+    def test_dialogue_blocker_interaction_seq_validation_idempotency_and_occupancy(self):
+        t = self.store.create(self.a, 'local', 'agy', '/blk', 'inspect', False)
+        self.store.update(t['id'], state='running', agy_swarm='native', launch_id='launch', runner_pid=123)
+        self.store.native_input_open(t['id'], 1, 'launch', 1)
+        self.store.event(t['id'], '1:q:1', 'question', 'Q1?', turn=1, interaction_seq=0)
+
+        # Rejects missing/degraded blockers and invalid types (including bool True/False even when [0, 1] active)
+        with self.assertRaisesRegex(ValueError, 'incomplete_question'):
+            self.store.dialogue(t['id'], self.a, 'no blocker yet', expected_turn=1, command_id='b-none',
+                                blocker_interaction_seq=0)
+
+        self.store.update(t['id'], native_observation=dict(
+            turn=1, input_available=True, question_ids=['1:q:1'],
+            question_blockers=[
+                dict(interaction_seq=0, reason='incomplete_question', available_actions=['observe', 'dialogue', 'cancel'], blocks_completion=True),
+                dict(interaction_seq=1, reason='incomplete_question', available_actions=['observe', 'dialogue', 'cancel'], blocks_completion=True),
+                dict(interaction_seq=2, reason='history_ambiguous', available_actions=['inspect_origin', 'reconcile_hold'], blocks_completion=True),
+                dict(interaction_seq=3, reason='unresolved_question', available_actions=['inspect_origin', 'reconcile_hold'], blocks_completion=True),
+            ],
+        ))
+        before = self.store.get(t['id'])
+
+        for bad in (False, True, -1, 1.5, '0', [0], {}):
+            with self.subTest(bad_blocker=bad):
+                with self.assertRaises(ValueError):
+                    self.store.dialogue(t['id'], self.a, 'bad type', expected_turn=1, command_id='b-type',
+                                        blocker_interaction_seq=bad)
+                self.assertEqual(self.store.get(t['id']), before)
+
+        for mix in (
+            dict(question_id='1:q:1', blocker_interaction_seq=0),
+            dict(question_id='', blocker_interaction_seq=0),
+            dict(question_ids=['1:q:1'], blocker_interaction_seq=0),
+            dict(question_ids=[], blocker_interaction_seq=0),
+        ):
+            with self.subTest(mix=mix):
+                with self.assertRaises(ValueError):
+                    self.store.dialogue(t['id'], self.a, 'mix', expected_turn=1, command_id='b-mix', **mix)
+                self.assertEqual(self.store.get(t['id']), before)
+
+        for bad_seq in (2, 3, 99):
+            with self.subTest(bad_seq=bad_seq):
+                with self.assertRaisesRegex(ValueError, 'incomplete_question'):
+                    self.store.dialogue(t['id'], self.a, 'wrong blocker', expected_turn=1, command_id='b-wrong',
+                                        blocker_interaction_seq=bad_seq)
+                self.assertEqual(self.store.get(t['id']), before)
+
+        with self.assertRaises(TypeError):
+            self.store.reply(t['id'], self.a, prompt='bad', expected_turn=1, command_id='r-blk', blocker_interaction_seq=0)
+
+        # Unbound ordinary dialogue omits blocker_interaction_seq from intent and command record
+        unbound = self.store.dialogue(t['id'], self.a, 'ordinary note', expected_turn=1, command_id='u1')
+        self.assertNotIn('blocker_interaction_seq', unbound['commands']['u1'])
+        self.assertNotIn('blocker_interaction_seq', unbound['commands']['u1']['intent'])
+
+        # blocker_interaction_seq=0 is preserved (is not None), single-occupancy enforced, withdraw/supersede releases
+        d0 = self.store.dialogue(t['id'], self.a, 'review 0', expected_turn=1, command_id='b0',
+                                 blocker_interaction_seq=0)
+        self.assertEqual(d0['commands']['b0']['blocker_interaction_seq'], 0)
+        self.assertEqual(d0['commands']['b0']['intent']['blocker_interaction_seq'], 0)
+        self.assertEqual(self.store.dialogue(t['id'], self.a, 'review 0', expected_turn=1, command_id='b0',
+                                             blocker_interaction_seq=0), d0)
+
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t['id'], self.a, 'dup 0', expected_turn=1, command_id='b0-dup',
+                                blocker_interaction_seq=0)
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t['id'], self.a, expected_turn=1, command_id='w-bad',
+                                target_command_id='b0', withdraw=True, blocker_interaction_seq=0)
+
+        # Blocker 1 remains independently bindable
+        d1 = self.store.dialogue(t['id'], self.a, 'review 1', expected_turn=1, command_id='b1',
+                                 blocker_interaction_seq=1)
+        self.assertEqual(d1['commands']['b1']['blocker_interaction_seq'], 1)
+
+        # Supersede and withdraw release blocker 0 occupancy cleanly
+        d0_sup = self.store.dialogue(t['id'], self.a, 'review 0 v2', expected_turn=1, command_id='b0-v2',
+                                     target_command_id='b0', blocker_interaction_seq=0)
+        self.assertEqual(d0_sup['commands']['b0']['status'], 'superseded')
+        self.store.dialogue(t['id'], self.a, expected_turn=1, command_id='w-b0',
+                            target_command_id='b0-v2', withdraw=True)
+        d0_re = self.store.dialogue(t['id'], self.a, 'review 0 v3', expected_turn=1, command_id='b0-v3',
+                                    blocker_interaction_seq=0)
+        self.assertEqual(d0_re['commands']['b0-v3']['blocker_interaction_seq'], 0)
+
+        # Claim -> send_started -> returned keeps questions/answers untouched, keeps occupancy, and stays idempotent post-settlement
+        # Advance u1 and b1 first, or claim sequentially
+        for _ in range(3):
+            claimed = self.store.native_dialogue_claim(t['id'], 1, 'launch', 1)
+            self.assertIsNotNone(claimed)
+            cid = claimed['command_id']
+            if cid == 'b0-v3':
+                with self.assertRaises(ValueError):
+                    self.store.dialogue(t['id'], self.a, 'during claimed', expected_turn=1, command_id='b0-during',
+                                        blocker_interaction_seq=0)
+            self.store.native_dialogue_state(t['id'], 1, 'launch', 1, cid, 'send_started')
+            if cid == 'b0-v3':
+                with self.assertRaises(ValueError):
+                    self.store.dialogue(t['id'], self.a, 'during send_started', expected_turn=1, command_id='b0-during2',
+                                        blocker_interaction_seq=0)
+            self.store.native_dialogue_state(t['id'], 1, 'launch', 1, cid, 'returned')
+
+        after_ret = self.store.get(t['id'])
+        self.assertEqual(after_ret['questions'], ['1:q:1'])
+        self.assertEqual(after_ret.get('answers', {}), {})
+        with self.assertRaises(ValueError):
+            self.store.dialogue(t['id'], self.a, 'after returned', expected_turn=1, command_id='b0-after',
+                                blocker_interaction_seq=0)
+
+        # Even after blocker is cleared and task settled/completed, retrying settled command_id remains idempotent
+        self.store.update(t['id'], state='completed', questions=[], question_id='',
+                          native_input=dict(accepting=False, settling=True, turn=1, launch_id='launch', epoch=1),
+                          native_observation=dict(turn=1, input_available=False, question_ids=[], question_blockers=[]))
+        settled = self.store.get(t['id'])
+        self.assertEqual(
+            self.store.dialogue(t['id'], self.a, 'review 0 v3', expected_turn=1, command_id='b0-v3',
+                                blocker_interaction_seq=0),
+            settled,
+        )
+        for mismatch in (dict(blocker_interaction_seq=1), dict(blocker_interaction_seq=None), dict()):
+            with self.subTest(mismatch=mismatch):
+                with self.assertRaisesRegex(ValueError, 'command_id already used with different parameters'):
+                    self.store.dialogue(t['id'], self.a, 'review 0 v3', expected_turn=1, command_id='b0-v3', **mismatch)
 
 class ProtocolTests(unittest.TestCase):
     def test_host_context_captures_topic_and_session_not_model_input(self):

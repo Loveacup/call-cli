@@ -1218,6 +1218,132 @@ class NativeOwnerTests(unittest.TestCase):
                     evidence='native-add-kill-completed-and-session-unload'))
             self.assertEqual(c.close(client,task['id'])['state'],'unknown')
 
+    def test_legacy_completed_add_kill_cleanup_closes_for_same_principal_only(self):
+        """Legacy completed task-JSON cleanup closes for same principal only, never ended owners."""
+        from bridge import Origin
+        from release import close_task
+        from test_native_ended_owner import EndedOwnerTests
+
+        expected_hold = {
+            'state': 'unknown',
+            'phase': 'hold',
+            'stage': 'native-proof',
+            'reason_code': 'native_workers_unproven',
+            'external_close_attempted': False,
+        }
+
+        def legacy_cleanup(**overrides):
+            cleanup = {
+                'session_unloaded': True,
+                'turn': 1,
+                'workers': ['worker-1'],
+                'evidence': 'native-add-kill-completed-and-session-unload',
+            }
+            cleanup.update(overrides)
+            return cleanup
+
+        def setup_legacy_task(directory, **task_overrides):
+            c = Collaboration(Path(directory) / 'tasks.db', launch=lambda task: None)
+            client = c.connect('omp')['client_id']
+            task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+            fields = dict(
+                state='completed',
+                agy_swarm='native',
+                runner_pid=0,
+                session_creation_attempted=True,
+                native_session_id='legacy-session',
+                native_result={'turn': 1, 'result': 'legacy ok'},
+                native_cleanup=legacy_cleanup(),
+            )
+            fields.update(task_overrides)
+            c.store.update(task['id'], **fields)
+            with c.store.connect() as db:
+                self.assertIsNone(c.store.native_cleanup_verified(db, c.store.get(task['id'])))
+            return c, client, task
+
+        for with_successor in (False, True):
+            with self.subTest(with_successor=with_successor), tempfile.TemporaryDirectory() as directory:
+                c, client, task = setup_legacy_task(directory)
+                expected_receipt = {
+                    'state': 'released',
+                    'phase': 'verified',
+                    'operation': 'close',
+                    'task': task['id'],
+                    'source': 'native-single-owner-cleanup',
+                    'external_close_attempted': False,
+                }
+                expected_public_receipt = {
+                    'state': 'released',
+                    'phase': 'verified',
+                    'operation': 'close',
+                    'external_close_attempted': False,
+                }
+                if with_successor:
+                    successor = c.start(client, agent='omp', cwd=directory, prompt='successor', write=True)
+                    successor_before = c.store.get(successor['id'])
+                    receipt = close_task(c.store, Origin(**task['origin']), task['id'])
+                    self.assertEqual(receipt, expected_receipt)
+                    after = c.status(client, task['id'])
+                    self.assertEqual(after['state'], 'closed')
+                    self.assertNotEqual(after.get('resource_state'), 'superseded')
+                    self.assertNotIn('resource_state', c.store.get(task['id']))
+                    self.assertEqual(c.store.get(successor['id']), successor_before)
+                    closed = c.close(client, task['id'])
+                else:
+                    closed = c.close(client, task['id'])
+                    self.assertEqual(closed['state'], 'closed')
+                    self.assertEqual(closed['close_receipt'], expected_public_receipt)
+                    self.assertEqual(close_task(c.store, Origin(**task['origin']), task['id']), expected_receipt)
+                self.assertEqual(closed['state'], 'closed')
+                self.assertEqual(closed['close_receipt'], expected_public_receipt)
+                self.assertEqual(c.status(client, task['id'])['state'], 'closed')
+
+        negative_cases = [
+            ('workers_empty', {'native_cleanup': legacy_cleanup(workers=[])}),
+            ('workers_not_list', {'native_cleanup': legacy_cleanup(workers='not-a-list')}),
+            ('session_unloaded_false', {'native_cleanup': legacy_cleanup(session_unloaded=False)}),
+            ('cleanup_wrong_turn', {'native_cleanup': legacy_cleanup(turn=2)}),
+            ('native_result_wrong_turn', {'native_result': {'turn': 2}}),
+            ('native_result_empty', {'native_result': {}}),
+            ('forged_new_mode_evidence', {'native_cleanup': legacy_cleanup(evidence='public-response-and-session-unload')}),
+            ('state_cancelled', {'state': 'cancelled'}),
+            ('state_unknown', {'state': 'unknown'}),
+        ]
+        for case_name, overrides in negative_cases:
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as directory:
+                c, client, task = setup_legacy_task(directory, **overrides)
+                closed = c.close(client, task['id'])
+                self.assertEqual(closed['close_receipt'], expected_hold)
+                self.assertEqual(closed['state'], 'unknown')
+                self.assertEqual(c.status(client, task['id'])['state'], 'unknown')
+                self.assertEqual(close_task(c.store, Origin(**task['origin']), task['id']), expected_hold)
+
+        harness = EndedOwnerTests('test_close_requires_execution_reconciliation_not_just_ended_owner')
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        task = harness.c.handle(dict(
+            action='start', agent='agy', cwd=str(harness.root), prompt='synthetic task', write=True,
+        ))['task']
+        harness.store.update(
+            task['id'],
+            state='completed',
+            agy_swarm='native',
+            runner_pid=0,
+            session_creation_attempted=True,
+            native_session_id='legacy-session',
+            native_result={'turn': 1, 'result': 'legacy ok'},
+            native_cleanup=legacy_cleanup(),
+        )
+        with harness.store.connect() as db:
+            self.assertIsNone(harness.store.native_cleanup_verified(db, harness.store.get(task['id'])))
+        before = harness.store.get(task['id'])
+        harness.row('old', 'cli_close', 1, 'cli')
+        harness.row('current')
+        harness.env['HERMES_SESSION_ID'] = 'current'
+        with self.assertRaisesRegex(ValueError, 'Ended-owner close requires a bound owner cleanup receipt'):
+            harness.action('close', task, expected_turn=1)
+        self.assertEqual(harness.store.get(task['id']), before)
+
 
     def test_foreground_and_background_cancel_settle_via_session_unload_without_claiming_descendants_stopped(self):
         for foreground in (True, False):
@@ -1499,8 +1625,8 @@ for line in sys.stdin:
                         time.sleep(0.01)
                     st = c.status(client, task['id'])
                     self.assertEqual(st.get('state'), 'running', st.get('settlement_note'))
-                    c.dialogue(client, task['id'], 'draft 1', expected_turn=1, command_id='d1')
-                    c.dialogue(client, task['id'], 'proceed with A', expected_turn=1, command_id='d2', target_command_id='d1')
+                    c.dialogue(client, task['id'], 'draft 1', expected_turn=1, command_id='d1', blocker_interaction_seq=0)
+                    c.dialogue(client, task['id'], 'proceed with A', expected_turn=1, command_id='d2', target_command_id='d1', blocker_interaction_seq=0)
                     (state_dir / 'proceed_load').touch()
                     thread.join(5)
                     self.assertFalse(thread.is_alive(), 'Deferred seq-gap task failed to settle')
@@ -1508,11 +1634,38 @@ for line in sys.stdin:
                     self.assertEqual(result['state'], 'completed', result.get('settlement_note'))
                     self.assertEqual(result['commands']['d1']['status'], 'superseded')
                     self.assertEqual(result['commands']['d2']['status'], 'returned')
+                    self.assertEqual(result['commands']['d2']['blocker_interaction_seq'], 0)
                     self.assertEqual(result['native_observation']['question_blockers'], [])
                     supersede_stages = [e for e in c.events(client, task['id'])
                                         if e.get('kind') == 'stage' and 'Incomplete question superseded by returned dialogue d2' in e.get('text', '')]
                     self.assertEqual(len(supersede_stages), 1)
                     self.assertEqual(supersede_stages[0]['interaction_seq'], 0)
+                    from agy_native import dialogue_body, history_sections
+                    unbound_hdr, _ = json.JSONDecoder().raw_decode(
+                        dialogue_body(result, dict(interaction_seq=1, command_id='plain', prompt='hi'))[len('CALLCLI_DIALOGUE '):]
+                    )
+                    self.assertNotIn('blocker_interaction_seq', unbound_hdr)
+                    single_hdr, _ = json.JSONDecoder().raw_decode(
+                        dialogue_body(result, dict(interaction_seq=1, command_id='s1', question_id='1:q', question=dict(id='1:q'), prompt='hi'))[len('CALLCLI_DIALOGUE '):]
+                    )
+                    self.assertEqual(list(single_hdr.keys()), ['task', 'turn', 'interaction_seq', 'command_id', 'question_id', 'question'])
+                    multi_hdr, _ = json.JSONDecoder().raw_decode(
+                        dialogue_body(result, dict(interaction_seq=1, command_id='m1', question_ids=['1:q'], questions=[dict(id='1:q')], prompt='hi'))[len('CALLCLI_DIALOGUE '):]
+                    )
+                    self.assertNotIn('blocker_interaction_seq', multi_hdr)
+                    blk_body = dialogue_body(result, result['commands']['d2'])
+                    blk_hdr, _ = json.JSONDecoder().raw_decode(blk_body[len('CALLCLI_DIALOGUE '):])
+                    self.assertEqual(blk_hdr['blocker_interaction_seq'], 0)
+                    sec_map = history_sections(
+                        [
+                            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Foreground ack.\nCALLCLI_QUESTION Q1 Pick A or B')),
+                            dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=blk_body)),
+                            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Final answer after A.\n')),
+                        ],
+                        result,
+                        result['commands'],
+                    )
+                    self.assertEqual(sorted(sec_map.keys()), [0, 2])
                 finally:
                     if thread.is_alive():
                         c.cancel(client, task['id'])
@@ -2193,4 +2346,478 @@ for line in sys.stdin:
                     c.start(client, agent='omp', cwd=str(root), prompt='conflicting writer', write=True)
                 self.assertEqual(c.close(client, task['id'])['state'], 'unknown')
 
+    def test_dialogue_question_ids_single_prompt_states_and_clean_replay(self):
+        from agy_native import dialogue_body, history_sections
+        from bridge import Store
 
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            claimed_snapshots = []
+            orig_state = Store.native_dialogue_state
+
+            def spy_state(store_self, task_id, turn, launch_id, epoch, command_id, status):
+                if status == 'send_started':
+                    snap = store_self.get(task_id)
+                    claimed_snapshots.append((
+                        snap['commands'][command_id]['status'],
+                        list(snap.get('questions', [])),
+                        dict(snap.get('answers', {})),
+                    ))
+                return orig_state(store_self, task_id, turn, launch_id, epoch, command_id, status)
+
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=str(root), AGY_NATIVE_DIALOGUE='1', AGY_NATIVE_DIALOGUE_GATE='1'), \
+                    patch.object(Store, 'native_dialogue_state', spy_state), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                (root / 'task-id').write_text(task['id'])
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and thread.is_alive():
+                        st = c.status(client, task['id'])
+                        if len(st.get('questions', [])) == 2:
+                            break
+                        time.sleep(.02)
+                    questions = list(st['questions'])
+                    self.assertEqual(len(questions), 2)
+                    deadline = time.monotonic() + 5
+                    while not (root / 'dialogue-load-outstanding').exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue((root / 'dialogue-load-outstanding').exists())
+
+                    accepted_st = c.dialogue(client, task['id'], 'both answers', expected_turn=1,
+                                             command_id='ans-all', question_ids=questions)
+                    self.assertEqual(accepted_st['commands']['ans-all']['status'], 'accepted')
+                    self.assertEqual(accepted_st['questions'], questions)
+                    self.assertEqual(accepted_st.get('answers', {}), {})
+
+                    (root / 'dialogue-load-continue').touch()
+                    deadline = time.monotonic() + 5
+                    while not (root / 'dialogue-prompt-outstanding').exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue((root / 'dialogue-prompt-outstanding').exists())
+                    sent_st = c.status(client, task['id'])
+                    self.assertEqual(sent_st['commands']['ans-all']['status'], 'send_started')
+                    self.assertEqual(sent_st['questions'], questions)
+                    self.assertEqual(sent_st.get('answers', {}), {})
+                    self.assertEqual(claimed_snapshots, [('claimed', questions, {})])
+
+                    (root / 'dialogue-continue').touch()
+                    thread.join(10)
+                    self.assertFalse(thread.is_alive())
+                    result = c.status(client, task['id'])
+                    self.assertEqual(result['state'], 'completed', result.get('settlement_note'))
+                    self.assertEqual((result['turn'], result['interaction_seq'], result['questions']), (1, 1, []))
+                    self.assertEqual(result['answers'], {questions[0]: 'both answers', questions[1]: 'both answers'})
+                    self.assertEqual(result['native_result']['interaction_seq'], 1)
+                    self.assertFalse(result.get('native_observation', {}).get('history_degraded'))
+                    self.assertIsNone(result.get('native_observation', {}).get('history_diagnostic'))
+                    requests = [json.loads(line) for line in (root / 'requests.jsonl').read_text().splitlines()]
+                    prompts = [r for r in requests if r.get('method') == 'session/prompt']
+                    self.assertEqual(len(prompts), 2)
+                    self.assertEqual([item['label'] for item in json.loads((root / 'answer-map.json').read_text())], ['Q1', 'Q2'])
+                    self.assertEqual((root / 'revision.txt').read_text(), 'both answers')
+
+                    # Verify dialogue_body legacy JSON key preservation and history_sections clean replay
+                    legacy_entry = dict(interaction_seq=1, command_id='legacy', question_id='1:q',
+                                        question=dict(id='1:q'), prompt='hi')
+                    legacy_body = dialogue_body(result, legacy_entry)
+                    legacy_hdr, _ = json.JSONDecoder().raw_decode(legacy_body[len('CALLCLI_DIALOGUE '):])
+                    self.assertEqual(list(legacy_hdr.keys()), ['task', 'turn', 'interaction_seq', 'command_id', 'question_id', 'question'])
+                    bound_body = dialogue_body(result, result['commands']['ans-all'])
+                    sections = history_sections(
+                        [
+                            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q1 Format?\nCALLCLI_QUESTION Q2 Destination?\n')),
+                            dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=bound_body)),
+                            dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='done\n')),
+                        ],
+                        result,
+                        result['commands'],
+                    )
+                    self.assertEqual(sorted(sections.keys()), [0, 1])
+                finally:
+                    (root / 'dialogue-continue').touch()
+                    (root / 'dialogue-load-continue').touch()
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(8)
+
+    def test_dialogue_question_ids_non_return_outcomes_never_clear_questions(self):
+        # (a) withdrawn + superseded while accepted
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=str(root), AGY_NATIVE_DIALOGUE='1', AGY_NATIVE_DIALOGUE_GATE='1'), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                (root / 'task-id').write_text(task['id'])
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and not (root / 'dialogue-load-outstanding').exists():
+                        time.sleep(.01)
+                    questions = list(c.status(client, task['id'])['questions'])
+                    self.assertEqual(len(questions), 2)
+                    c.dialogue(client, task['id'], 'draft', expected_turn=1, command_id='d1', question_ids=questions)
+                    wd = c.dialogue(client, task['id'], expected_turn=1, command_id='w1', target_command_id='d1', withdraw=True)
+                    self.assertEqual(wd['commands']['d1']['status'], 'withdrawn')
+                    self.assertEqual((wd['questions'], wd.get('answers', {})), (questions, {}))
+
+                    c.dialogue(client, task['id'], 'draft2', expected_turn=1, command_id='d2', question_ids=questions)
+                    sup = c.dialogue(client, task['id'], 'final both', expected_turn=1, command_id='d3',
+                                     target_command_id='d2', question_ids=list(reversed(questions)))
+                    self.assertEqual(sup['commands']['d2']['status'], 'superseded')
+                    self.assertEqual((sup['questions'], sup.get('answers', {})), (questions, {}))
+                    (root / 'dialogue-load-continue').touch()
+                    (root / 'dialogue-continue').touch()
+                    thread.join(8)
+                    done = c.status(client, task['id'])
+                    self.assertEqual(done['state'], 'completed', done.get('settlement_note'))
+                    self.assertEqual(done['questions'], [])
+                finally:
+                    (root / 'dialogue-continue').touch()
+                    (root / 'dialogue-load-continue').touch()
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(8)
+
+        # (b) not_sent (cancel before claim)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=str(root), AGY_NATIVE_DIALOGUE='1', AGY_NATIVE_DIALOGUE_GATE='1'), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                (root / 'task-id').write_text(task['id'])
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and not (root / 'dialogue-load-outstanding').exists():
+                        time.sleep(.01)
+                    questions = list(c.status(client, task['id'])['questions'])
+                    c.dialogue(client, task['id'], 'both', expected_turn=1, command_id='ns1', question_ids=questions)
+                    c.cancel(client, task['id'])
+                    (root / 'dialogue-load-continue').touch()
+                    thread.join(8)
+                    res = c.status(client, task['id'])
+                    self.assertEqual(res['state'], 'cancelled')
+                    self.assertEqual(res['commands']['ns1']['status'], 'not_sent')
+                    self.assertEqual((res['questions'], res.get('answers', {})), (questions, {}))
+                finally:
+                    (root / 'dialogue-load-continue').touch()
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(8)
+
+        # (c) cancelled (cancel during send_started)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=str(root), AGY_NATIVE_DIALOGUE='1', AGY_NATIVE_DIALOGUE_CANCEL='1'), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                (root / 'task-id').write_text(task['id'])
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and len(c.status(client, task['id']).get('questions', [])) < 2:
+                        time.sleep(.01)
+                    questions = list(c.status(client, task['id'])['questions'])
+                    c.dialogue(client, task['id'], 'both', expected_turn=1, command_id='can1', question_ids=questions)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline and not (root / 'dialogue-cancel-ready').exists():
+                        time.sleep(.01)
+                    self.assertTrue((root / 'dialogue-cancel-ready').exists())
+                    c.cancel(client, task['id'])
+                    thread.join(8)
+                    res = c.status(client, task['id'])
+                    self.assertEqual(res['state'], 'cancelled')
+                    self.assertEqual(res['commands']['can1']['status'], 'cancelled')
+                    self.assertEqual((res['questions'], res.get('answers', {})), (questions, {}))
+                finally:
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(8)
+
+        # (d) unknown (AGY_NATIVE_DIALOGUE_EOF during send_started)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'agy'
+            executable.write_text('#!' + sys.executable + '\n' + (Path(__file__).parent / 'fixtures/agy_native_agent.py').read_text())
+            executable.chmod(0o700)
+            with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                            AGY_NATIVE_FIXTURE=str(root), AGY_NATIVE_DIALOGUE='1', AGY_NATIVE_DIALOGUE_EOF='1'), \
+                    patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                    patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                client = c.connect('hermes')['client_id']
+                task = c.start(client, agent='agy', cwd=directory, prompt='owned', write=True)
+                (root / 'task-id').write_text(task['id'])
+                thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1))
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 6
+                    while time.monotonic() < deadline and len(c.status(client, task['id']).get('questions', [])) < 2:
+                        time.sleep(.01)
+                    questions = list(c.status(client, task['id'])['questions'])
+                    c.dialogue(client, task['id'], 'both', expected_turn=1, command_id='eof1', question_ids=questions)
+                    thread.join(8)
+                    res = c.status(client, task['id'])
+                    self.assertEqual(res['state'], 'unknown')
+                    self.assertEqual(res['commands']['eof1']['status'], 'unknown')
+                    self.assertEqual((res['questions'], res.get('answers', {})), (questions, {}))
+                finally:
+                    if thread.is_alive():
+                        c.cancel(client, task['id'])
+                        thread.join(8)
+
+    def test_multiple_fragments_selective_clear_prefix_growth_precedence_and_non_return_gates(self):
+        fake_agy = '''import json, os, sys, time
+from pathlib import Path
+state = Path(os.environ['FAKE_AGY_STATE'])
+mode = os.environ['FAKE_AGY_MODE']
+prompt_count = 0
+rev1_bg_added = False
+closed = False
+history = [dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='Foreground ack.\\nCALLCLI_QUESTION Q1 First?'))]
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\\n')
+    sys.stdout.flush()
+def notify(u):
+    send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': 'sess-multi', 'update': u}})
+def meta():
+    return {
+        'sessionId': 'sess-multi',
+        'models': {'currentModelId': 'gemini-4-carbon-low', 'availableModels': [{'modelId': 'gemini-4-carbon-low'}]},
+        'configOptions': [
+            {'id': 'model', 'currentValue': 'gemini-4-carbon', 'options': [{'value': 'gemini-4-carbon'}]},
+            {'id': 'thought_level', 'currentValue': 'low', 'options': [{'value': 'low'}]},
+        ],
+    }
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    rid, method, params = req.get('id'), req.get('method'), req.get('params', {})
+    if method == 'initialize':
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {'protocolVersion': 1, 'agentCapabilities': {'loadSession': True, 'sessionCapabilities': {'close': {}}}}})
+    elif method == 'session/new':
+        notify({'sessionUpdate': 'available_commands_update', 'availableCommands': [{'name': 'swarm'}]})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+    elif method == 'session/set_config_option':
+        if closed:
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32602, 'message': 'Session not found'}})
+        else:
+            send({'jsonrpc': '2.0', 'id': rid, 'result': {'configOptions': meta()['configOptions']}})
+    elif method == 'session/prompt':
+        prompt_count += 1
+        text = ''.join(p.get('text', '') for p in params.get('prompt', []))
+        if prompt_count == 1:
+            notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Foreground ack.\\n'}})
+        else:
+            if mode == 'cancel' and prompt_count == 2:
+                (state / 'prompt_in_flight').touch()
+                for pending_line in sys.stdin:
+                    pending = json.loads(pending_line)
+                    if pending.get('method') == 'session/cancel':
+                        (state / 'cancelled').touch()
+                        break
+                send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'cancelled'}})
+                continue
+            if mode == 'eof' and prompt_count == 2:
+                raise SystemExit(7)
+            if mode == 'missing_replay' and prompt_count == 2:
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'Final without replay.\\n'}})
+                send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+                continue
+            history.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=text)))
+            if text.startswith('CALLCLI_DIALOGUE '):
+                hdr, _ = json.JSONDecoder().raw_decode(text[len('CALLCLI_DIALOGUE '):])
+                cmd_id = hdr.get('command_id')
+            else:
+                cmd_id = ''
+            if cmd_id == 'rev-1':
+                chunk = 'ACK1\\n'
+                history.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=chunk)))
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': chunk}})
+            elif cmd_id == 'sup-0':
+                chunk = 'Cleared 0 only.\\n'
+                history.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=chunk)))
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': chunk}})
+            elif cmd_id == 'sup-1' and mode == 'prefix_growth':
+                history[3]['content']['text'] = 'CALLCLI_QUESTION Q2 Second?\\n'
+                chunk = 'Grew Q2 while sup-1 ran.\\n'
+                history.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=chunk)))
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': chunk}})
+            elif cmd_id in {'sup-1', 'ans-q2'}:
+                chunk = 'Final all settled.\\n'
+                history.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=chunk)))
+                notify({'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': chunk}})
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {'stopReason': 'end_turn'}})
+    elif method == 'session/load':
+        if prompt_count >= 1:
+            if not rev1_bg_added and any(e.get('sessionUpdate') == 'user_message_chunk' and 'rev-1' in e.get('content', {}).get('text', '') for e in history):
+                rev1_bg_added = True
+                history.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text='CALLCLI_QUESTION Q2 Second?')))
+            notify({'sessionUpdate': 'user_message_chunk', 'content': {'type': 'text', 'text': '/swarm\\ninitial prompt'}})
+            for entry in history:
+                notify(entry)
+        send({'jsonrpc': '2.0', 'id': rid, 'result': meta()})
+    elif method == 'session/close':
+        closed = True
+        send({'jsonrpc': '2.0', 'id': rid, 'result': {}})
+    elif method == 'session/cancel':
+        (state / 'cancelled').touch()
+'''
+
+        def run_case(mode):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state_dir = root / 'state'
+                state_dir.mkdir()
+                executable = root / 'agy'
+                executable.write_text('#!' + sys.executable + '\n' + fake_agy)
+                executable.chmod(0o700)
+                with patch.dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                                FAKE_AGY_STATE=str(state_dir), FAKE_AGY_MODE=mode), \
+                        patch('updates.DEFAULT_LOCK_ROOT', root / 'locks'), \
+                        patch('updates.ensure_current', return_value={'decision': 'fixture'}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    c = Collaboration(root / 'tasks.db', launch=lambda task: None)
+                    client = c.connect('hermes')['client_id']
+                    task = c.start(client, agent='agy', model='4cs', cwd=directory, prompt='initial prompt', write=False)
+                    thread = threading.Thread(target=lambda: run_task(c.store.path, task['id'], turn=1, launch_id=task['launch_id'], epoch=1), daemon=True)
+                    thread.start()
+                    def wait_for(pred):
+                        deadline = time.monotonic() + 6
+                        while time.monotonic() < deadline:
+                            st = c.status(client, task['id'])
+                            if pred(st):
+                                return st
+                            if not thread.is_alive():
+                                break
+                            time.sleep(0.01)
+                        self.fail(f'Condition timed out in mode={mode}: {c.status(client, task["id"])}')
+                    try:
+                        wait_for(lambda s: [b['interaction_seq'] for b in s.get('native_observation', {}).get('question_blockers', [])] == [0])
+                        if mode in {'prefix_growth', 'explicit_seq1'}:
+                            # Unbound rev-1 introduces fragment 1; blocker 0 remains.
+                            c.dialogue(client, task['id'], 'unrelated work', expected_turn=1, command_id='rev-1')
+                            wait_for(lambda s: s['commands']['rev-1']['status'] == 'returned'
+                                     and [b['interaction_seq'] for b in s.get('native_observation', {}).get('question_blockers', [])] == [0, 1])
+                            # Explicit blocker_interaction_seq=0 clears ONLY 0; 1 stays blocking!
+                            c.dialogue(client, task['id'], 'supersede zero', expected_turn=1, command_id='sup-0', blocker_interaction_seq=0)
+                            st_mid = wait_for(lambda s: s['commands']['sup-0']['status'] == 'returned'
+                                              and [b['interaction_seq'] for b in s.get('native_observation', {}).get('question_blockers', [])] == [1])
+                            self.assertEqual(st_mid['state'], 'running')
+                            self.assertNotIn('native_cleanup', st_mid)
+                            with self.assertRaises(ValueError):
+                                c.close(client, task['id'])
+                            # Subsequent explicit supersede for 1
+                            c.dialogue(client, task['id'], 'supersede one', expected_turn=1, command_id='sup-1', blocker_interaction_seq=1)
+                            if mode == 'prefix_growth':
+                                st_q2 = wait_for(lambda s: s['commands']['sup-1']['status'] == 'returned' and len(s.get('questions', [])) == 1)
+                                self.assertEqual(st_q2['state'], 'running')
+                                self.assertEqual(st_q2['native_observation']['question_blockers'], [])
+                                q2_tok = st_q2['questions'][0]
+                                q2_evs = [e for e in c.events(client, task['id']) if e['kind'] == 'question' and e['token'] == q2_tok]
+                                self.assertEqual((q2_evs[0]['interaction_seq'], q2_evs[0]['text']), (1, 'Q2 Second?'))
+                                c.dialogue(client, task['id'], 'formal answer q2', expected_turn=1, command_id='ans-q2', question_id=q2_tok)
+                                thread.join(6)
+                                self.assertFalse(thread.is_alive())
+                                done = c.status(client, task['id'])
+                                self.assertEqual(done['state'], 'completed', done.get('settlement_note'))
+                                self.assertEqual(done['answers'], {q2_tok: 'formal answer q2'})
+                                self.assertEqual(done['native_observation']['question_blockers'], [])
+                                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+                            else:
+                                thread.join(6)
+                                self.assertFalse(thread.is_alive())
+                                done = c.status(client, task['id'])
+                                self.assertEqual(done['state'], 'completed', done.get('settlement_note'))
+                                self.assertEqual(done.get('answers', {}), {})
+                                self.assertEqual(done['native_observation']['question_blockers'], [])
+                                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+                                self.assertEqual(c.close(client, task['id'])['state'], 'closed')
+                        elif mode == 'cancel':
+                            c.dialogue(client, task['id'], 'will withdraw', expected_turn=1, command_id='d-w', blocker_interaction_seq=0)
+                            c.dialogue(client, task['id'], expected_turn=1, command_id='w-1', target_command_id='d-w', withdraw=True)
+                            self.assertEqual(c.status(client, task['id'])['commands']['d-w']['status'], 'withdrawn')
+                            c.dialogue(client, task['id'], 'hold in flight', expected_turn=1, command_id='d-hold', blocker_interaction_seq=0)
+                            deadline = time.monotonic() + 5
+                            while not (state_dir / 'prompt_in_flight').exists() and time.monotonic() < deadline:
+                                time.sleep(0.01)
+                            self.assertTrue((state_dir / 'prompt_in_flight').exists())
+                            in_flight = c.status(client, task['id'])
+                            self.assertEqual(in_flight['commands']['d-hold']['status'], 'send_started')
+                            self.assertEqual([b['interaction_seq'] for b in in_flight['native_observation']['question_blockers']], [0])
+                            c.cancel(client, task['id'])
+                            thread.join(6)
+                            self.assertFalse(thread.is_alive())
+                            cancelled = c.status(client, task['id'])
+                            self.assertEqual(cancelled['state'], 'cancelled')
+                            self.assertEqual(cancelled['commands']['d-hold']['status'], 'cancelled')
+                            self.assertFalse(any('Incomplete question superseded' in e.get('text', '') for e in c.events(client, task['id'])))
+                        elif mode == 'eof':
+                            c.dialogue(client, task['id'], 'try supersede', expected_turn=1, command_id='d-fail', blocker_interaction_seq=0)
+                            thread.join(6)
+                            self.assertFalse(thread.is_alive())
+                            unk = c.status(client, task['id'])
+                            self.assertEqual(unk['state'], 'unknown')
+                            self.assertEqual(unk['commands']['d-fail']['status'], 'unknown')
+                            self.assertEqual([b['interaction_seq'] for b in unk['native_observation']['question_blockers']], [0])
+                            self.assertFalse(any('Incomplete question superseded' in e.get('text', '') for e in c.events(client, task['id'])))
+                        elif mode == 'missing_replay':
+                            c.dialogue(client, task['id'], 'try supersede', expected_turn=1, command_id='d-fail', blocker_interaction_seq=0)
+                            wait_for(lambda s: s['commands']['d-fail']['status'] == 'returned')
+                            time.sleep(0.4)
+                            held = c.status(client, task['id'])
+                            self.assertEqual(held['state'], 'running')
+                            self.assertEqual([b['interaction_seq'] for b in held['native_observation']['question_blockers']], [0])
+                            self.assertFalse(any('Incomplete question superseded' in e.get('text', '') for e in c.events(client, task['id'])))
+                            c.cancel(client, task['id'])
+                            thread.join(6)
+                            self.assertFalse(thread.is_alive())
+                            self.assertFalse(any('Incomplete question superseded' in e.get('text', '') for e in c.events(client, task['id'])))
+                    finally:
+                        if thread.is_alive():
+                            c.cancel(client, task['id'])
+                            thread.join(5)
+
+        for m in ('prefix_growth', 'explicit_seq1', 'cancel', 'eof', 'missing_replay'):
+            with self.subTest(mode=m):
+                run_case(m)

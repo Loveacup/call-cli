@@ -12,7 +12,7 @@ POSIX 用 `command -v acpx omp codex pi agy`，Windows 用 `Get-Command`。Call-
 
 以下为独立手动 `acpx` 短测／诊断或遗留非 skip 任务参考（未知 agent 名不代表内置支持；AGY 精确模型／effort 与历史查询见[模型参考](agy-models.md)）：
 
-G4C 默认 native、G4A 默认 off，可按任务显式覆盖。native 由 agy_native.py 唯一 owner 控制，下面 ACPX 命令只用于其他 CLI、off／旧 AGY。首 end_turn 不结束任务；正常以本轮结果、对应 add/kill completed 和 session unload 结算释放，不宣称任意后代全死。异常/取消不明保 unknown/HOLD；不另开控制 writer。见[AGY 参考](agy-models.md)。
+新 AGY 默认 `ocs` 且不强绑默认 worker 型号，简称/模式路由见[AGY 参考](agy-models.md)。native 由 `agy_native.py` 唯一 owner 控制，下面 ACPX 命令只用于其他 CLI、显式 `off`／旧 AGY。首 `end_turn` 不结束任务；正常依公开响应与精确 `session unload` 结算释放（不要求逐员 `add/kill`，记 `all_descendants_proven_stopped=false`；旧同源 `completed` `add/kill` 回执仅保留同 principal 兼容）。异常/取消不明保 unknown/HOLD；不另开控制 writer。
 
 - 无工具问答：`--deny-all --no-fs --no-terminal`。
 - 读文件：`--approve-reads --non-interactive-permissions deny`。
@@ -52,7 +52,7 @@ Hermes 正常派工通过 `call_cli` 复用原生 `terminal(background=true, not
 
 - 把取消的状态读取、判定和更新放入同一事务；runner 若已认领，必须进入取消中而不是提前释放写目录，否则第二个 writer 可与旧轮重叠。
 - 取消期间只记录问题，不转为可续轮状态；由 runner 确认退出后结算。所有结束写回检查认领的 turn 和允许的 state，防止迟到的旧轮覆盖新轮。
-- 在事务内认领 closing 后再调用远端关闭，closing 继续保留写占用；回复不得与关闭并发续轮。关闭结果不确定时保留占用，不先写 closed。
+- 在事务内认领 closing 后再调用远端关闭，closing 继续保留写占用；回复不得与关闭并发续轮。关闭结果不确定时保留占用，不先写 closed（**本版本源码**对冲突后继的 `superseded` 互斥规则见[恢复合同](core-requirements.md#写占用恢复合同)）。
 - 让每一轮执行（包括问题回复和关闭）与 ACPX 升级共用安装级锁；执行持共享锁、升级持排他锁。把锁放在同一协调主机各 Store／profile 可共用的位置，不能只锁版本检查函数，因为回复可能在 busy 检查后启动。
 - 在同一协调主机规范化 SSH user/hostname/port 作为设备键；仍用显式 resource 对齐不同地址、同步目录或未规范化的远端路径，不宣称跨协调主机已有分布式互斥。
 - 单独记录原生会话是否成功创建；首次执行尚未创建就取消、后续修改任务时，不能仅因 turn 增加而跳过创建。对未知状态先对账，不用该标记推断远端已经停止。

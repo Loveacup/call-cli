@@ -1,8 +1,9 @@
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 
-const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only']);
-const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'group', 'question_id', 'command_id', 'target_command_id', 'withdraw', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
+const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'close', 'release_only', 'recovery_status']);
+const readOnlyActions = new Set(['list', 'status', 'events', 'recovery_status']);
+const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'group', 'question_id', 'question_ids', 'blocker_interaction_seq', 'command_id', 'target_command_id', 'withdraw', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
 const visible = new Set(['stage', 'question', 'permission', 'diagnostic', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
 
@@ -32,7 +33,14 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
   const bindings = new Map();
   const pendingBindings = new Map();
   let generation = 0;
-  const identity = ctx => ({session_id: ctx.sessionManager.getSessionId(), agent_id: ctx.agent.id});
+  const identity = ctx => {
+    const session_id = ctx?.sessionManager?.getSessionId?.();
+    const agent_id = ctx?.agent?.id;
+    if (typeof session_id !== 'string' || !session_id || typeof agent_id !== 'string' || !agent_id) {
+      throw new Error('Host session and agent identity required');
+    }
+    return {session_id, agent_id};
+  };
   const key = ctx => JSON.stringify(identity(ctx));
   const hostContext = ctx => {
     const name = typeof ctx?.sessionManager?.getSessionName === 'function' ? ctx.sessionManager.getSessionName() : '';
@@ -121,10 +129,55 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       if (Object.hasOwn(args, 'withdraw') && args.withdraw !== undefined && (args.action !== 'dialogue' || typeof args.withdraw !== 'boolean')) throw new Error('withdraw requires dialogue and a boolean');
       if (args.action === 'release_only' && (!Number.isInteger(args.expected_turn) || args.expected_turn < 1)) throw new Error('release_only requires observed expected_turn');
       if (Object.hasOwn(args, 'abandon') && (args.action !== 'release_only' || typeof args.abandon !== 'boolean')) throw new Error('abandon requires release_only and a boolean');
+      const hasQuestionId = Object.hasOwn(args, 'question_id') && args.question_id !== undefined;
+      const hasQuestionIds = Object.hasOwn(args, 'question_ids') && args.question_ids !== undefined;
+      if (hasQuestionId && typeof args.question_id !== 'string') throw new Error('question_id must be a string');
+      if (hasQuestionIds) {
+        if (!['reply', 'dialogue'].includes(args.action)) throw new Error('question_ids requires reply or dialogue');
+        if (hasQuestionId) throw new Error('question_id and question_ids are mutually exclusive');
+        if (!Array.isArray(args.question_ids) || args.question_ids.length === 0
+            || args.question_ids.some(id => typeof id !== 'string' || id.length === 0)) {
+          throw new Error('question_ids must be a nonempty list of nonempty strings');
+        }
+        if (new Set(args.question_ids).size !== args.question_ids.length) {
+          throw new Error('question_ids must not contain duplicates');
+        }
+      }
+      if (args.withdraw === true && (hasQuestionId || hasQuestionIds)) {
+        throw new Error('withdraw does not accept question_id or question_ids');
+      }
+      const hasBlockerSeq = Object.hasOwn(args, 'blocker_interaction_seq') && args.blocker_interaction_seq !== undefined;
+      if (hasBlockerSeq) {
+        if (args.action !== 'dialogue') throw new Error('blocker_interaction_seq requires dialogue');
+        if (!Number.isInteger(args.blocker_interaction_seq) || args.blocker_interaction_seq < 0) {
+          throw new Error('blocker_interaction_seq must be a non-negative integer');
+        }
+        if (hasQuestionId || hasQuestionIds) {
+          throw new Error('blocker_interaction_seq is mutually exclusive with question_id and question_ids');
+        }
+        if (args.withdraw === true) {
+          throw new Error('withdraw does not accept question_id, question_ids, or blocker_interaction_seq');
+        }
+      }
+      if (args.action === 'recovery_status') {
+        if (Object.keys(args).some(name => name !== 'action' && name !== 'task_id')
+            || typeof args.task_id !== 'string' || !args.task_id.trim()) {
+          throw new Error('recovery_status accepts only nonempty task_id');
+        }
+      }
       const bindingKey = key(ctx);
       let binding = bindings.get(bindingKey);
       if (!binding) {
-        if (!['start', 'list', 'release_only'].includes(args.action)) throw new Error('Current host session is not bound');
+        if (['list', 'recovery_status'].includes(args.action)) {
+          const expectedGeneration = generation;
+          const host = identity(ctx);
+          const observed = await request({db, action: 'observe', host, args});
+          if (expectedGeneration !== generation || key(ctx) !== bindingKey) {
+            throw new Error('Host session changed; action outcome must be reconciled, not replayed');
+          }
+          return observed;
+        }
+        if (!['start', 'release_only'].includes(args.action)) throw new Error('Current host session is not bound');
         let pending = pendingBindings.get(bindingKey);
         if (!pending) {
           const expectedGeneration = generation;
@@ -143,27 +196,26 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
       }
       const result = await call(binding, args, args.action === 'start' ? {host_context: hostContext(ctx)} : {});
       if (!live(binding, ctx)) throw new Error('Host session changed; action outcome must be reconciled, not replayed');
-      if (result.task) {
-        const id = result.task.id;
-        if (args.action === 'close' || args.action === 'release_only') {
-          binding.tasks.delete(id);
-          if (binding.timer && ![...binding.tasks.values()].some(track => track.active)) {
-            binding.ctx.clearTimer(binding.timer);
-            binding.timer = undefined;
+      if (!readOnlyActions.has(args.action)) {
+        if (result.task) {
+          const id = result.task.id;
+          if (args.action === 'close' || args.action === 'release_only') {
+            binding.tasks.delete(id);
+            if (binding.timer && ![...binding.tasks.values()].some(track => track.active)) {
+              binding.ctx.clearTimer(binding.timer);
+              binding.timer = undefined;
+            }
+          }
+          else if (['start', 'reply', 'dialogue', 'permission', 'intervene', 'cancel'].includes(args.action)
+              && result.task.owned_by_bound_host !== false) {
+            const track = binding.tasks.get(id) || {cursor: 0, active: false, answers: [], revision: 0, attentionTurns: new Set()};
+            track.revision++;
+            track.active = true;
+            binding.tasks.set(id, track);
           }
         }
-        else if (['start', 'reply', 'dialogue', 'permission', 'intervene', 'cancel', 'status'].includes(args.action)) {
-          const track = binding.tasks.get(id) || {cursor: 0, active: false, answers: [], revision: 0, attentionTurns: new Set()};
-          track.revision++;
-          track.active = true;
-          binding.tasks.set(id, track);
-        }
+        schedule(binding, ctx);
       }
-      if (args.action === 'events' && binding.tasks.has(args.task_id)) {
-        const track = binding.tasks.get(args.task_id);
-        if ((args.after || 0) === track.cursor && result.events.length) track.cursor = result.events.at(-1).seq;
-      }
-      schedule(binding, ctx);
       return result;
     },
     detach() {
@@ -192,7 +244,10 @@ export default function register(pi) {
       permission_id: z.string().optional(), script_sha256: z.string().optional(), decision: z.enum(['allow_once', 'reject_once']).optional(),
       skills: z.array(z.object({path: z.string(), mode: z.enum(['required', 'optional', 'reference']), location: z.enum(['origin', 'target']).optional()})).optional(),
       group: z.string().optional().describe('Optional lightweight task group label; filters list within this bound host session only'),
-      question_id: z.string().optional(), command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'),
+      question_id: z.string().optional(),
+      question_ids: z.array(z.string().min(1)).min(1).optional().describe('Exact pending question event IDs for multi-question reply or dialogue; mutually exclusive with question_id, raw bytes, no CSV'),
+      blocker_interaction_seq: z.number().int().min(0).optional().describe('Optional dialogue-only active incomplete_question blocker interaction_seq (>=0) to explicitly supersede after review; mutually exclusive with question_id, question_ids and withdraw'),
+      command_id: z.string().optional().describe('Stable intent ID; required for dialogue, reuse on retry'),
       target_command_id: z.string().optional().describe('Optional dialogue-only target command_id to withdraw or supersede while still accepted'),
       withdraw: z.boolean().optional().describe('Optional dialogue-only flag to withdraw target_command_id without sending a new prompt'),
       expected_turn: z.number().int().positive().optional().describe('Observed turn; required for dialogue and release_only'), after: z.number().optional()}).strict(),

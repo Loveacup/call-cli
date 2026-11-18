@@ -18,8 +18,13 @@ class RecoveryStatusTests(unittest.TestCase):
         with self.assertRaises(PermissionError): self.action('status', task)
         before = self.store.path.read_bytes()
         result = self.action('recovery_status', task)
-        self.assertEqual(result, {'resource_recovery': {'task_id':task['id'], 'turn':7,
-            'business_state':'unknown', 'resource_state':'unknown', 'write':True, 'receipt':None}})
+        self.assertEqual(result['resource_recovery'], {'task_id':task['id'], 'turn':7,
+            'business_state':'unknown', 'resource_state':'unknown', 'write':True, 'receipt':None})
+        self.assertEqual(result['diagnostic'], {
+            'agent': 'omp', 'agy_mode': None, 'native_phase': None,
+            'stop_reason': None, 'exit_code': None, 'pending_question_count': 0,
+            'intervention_status': 'pending', 'native_diagnostic': None,
+        })
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertEqual(len(self.ctx.calls), 1)
         self.assertNotIn('PRIVATE', json.dumps(result))
@@ -83,5 +88,146 @@ class RecoveryStatusTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.action('release_only', task, expected_turn=observed, abandon=True)
         self.assertEqual(self.action('recovery_status', task)['resource_recovery']['resource_state'], 'unknown')
+
+    def test_cross_route_diagnostic_projection_is_closed_set_and_readonly(self):
+        task = self.start(write=True)
+        self.store.update(
+            task['id'],
+            agent='agy',
+            agy_mode='swarm',
+            native_phase='unknown',
+            stop_reason='untrusted_free_text_reason',
+            exit_code=True,
+            state='unknown',
+            runner_pid=0,
+            prompt='CANARY_PROMPT',
+            settlement_note='CANARY_NOTE',
+            error='CANARY_ERROR',
+            questions=['1:2'],
+            answers={'1:1': 'CANARY_ANS'},
+            native_observation={
+                'turn': 1,
+                'history_degraded': True,
+                'input_available': False,
+                'response_pending_reason': 'board_navigation_only',
+                'pending_tools': [
+                    {'id': 'CANARY_TID', 'name': 'CANARY_TOOL', 'kind': 'read', 'status': 'in_progress'},
+                ],
+                'question_blockers': [
+                    {
+                        'interaction_seq': 2,
+                        'reason': 'incomplete_question',
+                        'available_actions': ['observe', 'dialogue', 'cancel', 'CANARY_ACTION'],
+                        'blocks_completion': True,
+                    },
+                ],
+                'history_diagnostic': {
+                    'reason_code': 'dialogue_missing',
+                    'call_site': 'section',
+                    'interaction_seq': 2,
+                    'previous_len': 62,
+                    'current_len': 25,
+                    'background_growth': True,
+                    'extra_secret': 'CANARY_EXTRA',
+                },
+            },
+        )
+        self.store.event(task['id'], 's1', 'stage', 'CANARY_STAGE')
+        self.env.update(HERMES_SESSION_ID='current', HERMES_SESSION_KEY='other-route',
+                        HERMES_SESSION_PLATFORM='cli', HERMES_SESSION_CHAT_ID='', HERMES_SESSION_THREAD_ID='')
+        before = self.store.path.read_bytes()
+        result = self.action('recovery_status', task)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        diag = result['diagnostic']
+        self.assertEqual(diag['agent'], 'agy')
+        self.assertEqual(diag['agy_mode'], 'swarm')
+        self.assertEqual(diag['native_phase'], 'unknown')
+        self.assertEqual(diag['stop_reason'], 'other')
+        self.assertIsNone(diag['exit_code'])
+        self.assertEqual(diag['pending_question_count'], 1)
+        self.assertEqual(diag['intervention_status'], 'none')
+        nd = diag['native_diagnostic']
+        self.assertIs(nd['history_degraded'], True)
+        self.assertIs(nd['input_available'], False)
+        self.assertEqual(nd['response_pending_reason'], 'board_navigation_only')
+        self.assertEqual(nd['pending_tool_count'], 1)
+        self.assertEqual(nd['pending_tool_kinds'], ['read'])
+        self.assertEqual(nd['question_blockers'], [{
+            'interaction_seq': 2,
+            'reason': 'incomplete_question',
+            'available_actions': ['observe', 'dialogue', 'cancel'],
+            'blocks_completion': True,
+        }])
+        self.assertEqual(nd['history_diagnostic'], {
+            'reason_code': 'dialogue_missing',
+            'call_site': 'section',
+            'interaction_seq': 2,
+            'previous_len': 62,
+            'current_len': 25,
+            'background_growth': True,
+        })
+        dumped = json.dumps(result)
+        for secret in ('CANARY_', str(self.root), 'other-route', 'old', 'telegram'):
+            self.assertNotIn(secret, dumped)
+
+    def test_resource_recovery_sanitizes_malicious_nested_values_and_preserves_literal_task_id(self):
+        task = self.start(write=True)
+        tid = task['id']
+        canary = 'CANARY_NESTED_SECRET_/private/recovery'
+        self.store.update(
+            tid,
+            state={'nested_state': canary},
+            resource_state={'nested_secret': canary},
+            turn=True,
+            intervention={'status': {'nested_iv': canary}},
+        )
+        with self.store.connect() as db:
+            raw = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (tid,)).fetchone()[0])
+            raw['id'] = {'nested_id': canary}
+            db.execute('UPDATE tasks SET data=? WHERE id=?', (json.dumps(raw), tid))
+            db.execute('CREATE TABLE IF NOT EXISTS release_fences (task TEXT PRIMARY KEY, receipt TEXT)')
+            db.execute(
+                'INSERT OR REPLACE INTO release_fences (task, receipt) VALUES (?, ?)',
+                (tid, json.dumps({
+                    'state': 'released',
+                    'operation': {'nested_op': canary},
+                    'business_state': canary,
+                    'external_close_attempted': [canary],
+                    'extra': canary,
+                })),
+            )
+        self.env.update(HERMES_SESSION_ID='current', HERMES_SESSION_KEY='other-route')
+        before = self.store.path.read_bytes()
+        result = self.action('recovery_status', task)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertNotIn(canary, json.dumps(result))
+        self.assertEqual(result['resource_recovery'], {
+            'task_id': tid,
+            'turn': None,
+            'business_state': 'unknown',
+            'resource_state': 'released',
+            'write': True,
+            'receipt': {
+                'state': 'released',
+                'operation': 'unknown',
+                'business_state': 'unknown',
+                'external_close_attempted': None,
+            },
+        })
+        self.assertEqual(result['diagnostic']['intervention_status'], 'unknown')
+
+        raw_id = '  raw-LITERAL_id-1  '
+        row = self.store.get(tid)
+        row['id'] = raw_id
+        row['state'] = 'unknown'
+        row['resource_state'] = 'superseded'
+        row['turn'] = 3
+        with self.store.connect() as db:
+            db.execute('INSERT INTO tasks VALUES (?, ?, ?)', (raw_id, json.dumps(row['origin']), json.dumps(row)))
+        lit = self.action('recovery_status', {'id': raw_id})
+        self.assertEqual(lit['resource_recovery']['task_id'], raw_id)
+        self.assertEqual(lit['resource_recovery']['resource_state'], 'superseded')
+        with self.assertRaises(KeyError):
+            self.action('recovery_status', {'id': raw_id.strip()})
 
 if __name__ == '__main__': unittest.main()

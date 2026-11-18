@@ -1212,9 +1212,15 @@ def _reconcile_drained(drained, history, fresh, recovered, *, retry_state=None, 
 
 
 def dialogue_body(task, entry):
-    header = 'CALLCLI_DIALOGUE '+json.dumps(dict(task=task['id'], turn=task['turn'],
+    payload = dict(task=task['id'], turn=task['turn'],
         interaction_seq=entry['interaction_seq'], command_id=entry['command_id'],
-        question_id=entry.get('question_id'), question=entry.get('question')))
+        question_id=entry.get('question_id'), question=entry.get('question'))
+    if entry.get('question_ids') is not None:
+        payload['question_ids'] = entry['question_ids']
+        payload['questions'] = entry.get('questions')
+    if entry.get('blocker_interaction_seq') is not None:
+        payload['blocker_interaction_seq'] = entry['blocker_interaction_seq']
+    header = 'CALLCLI_DIALOGUE '+json.dumps(payload)
     return header+' Continue the same native session; answer the request and remaining questions.\n\n'+entry['prompt']
 
 
@@ -1529,35 +1535,62 @@ def _extract_post_dialogue_entries(entries, pre_history):
         if e.get('sessionUpdate') == 'agent_message_chunk' and _entry_text(e)
     ]
     pre_part = []
+    pending_users = []
     idx = 0
     agent_cursor = 0
     while idx < len(entries):
         entry = entries[idx]
         kind = entry.get('sessionUpdate')
-        if idx == 0 and kind == 'user_message_chunk':
-            pre_part.append(entry)
+        if kind == 'user_message_chunk':
+            if idx == 0 and not pre_part and not pending_users:
+                pre_part.append(entry)
+            else:
+                pending_users.append(entry)
             idx += 1
             continue
         if kind == 'tool_call' and entry.get('toolCallId') in pre_tools:
+            if pending_users:
+                pre_part.extend(pending_users)
+                pending_users.clear()
             pre_part.append(entry)
             idx += 1
             continue
         if kind == 'agent_message_chunk' and agent_cursor < len(pre_agent_texts):
-            etext = _entry_text(entry) or ''
-            ptext = pre_agent_texts[agent_cursor]
-            if etext == ptext:
-                pre_part.append(entry)
-                agent_cursor += 1
-                idx += 1
-                continue
-            if etext.startswith(ptext):
-                pre_part.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=ptext)))
-                rem = etext[len(ptext):]
-                post_part = ([dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=rem))] if rem else [])
+            rem = _entry_text(entry) or ''
+            cur = agent_cursor
+            matched_chunks = []
+            while rem and cur < len(pre_agent_texts):
+                exact_j = next((j for j in range(cur, len(pre_agent_texts)) if rem == pre_agent_texts[j]), None)
+                if exact_j is not None:
+                    matched_chunks.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=rem)))
+                    cur = exact_j + 1
+                    rem = ''
+                    break
+                prefix_j = next((j for j in range(cur, len(pre_agent_texts)) if rem.startswith(pre_agent_texts[j])), None)
+                if prefix_j is None:
+                    break
+                ptext = pre_agent_texts[prefix_j]
+                matched_chunks.append(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=ptext)))
+                rem = rem[len(ptext):]
+                cur = prefix_j + 1
+            if matched_chunks:
+                if pending_users:
+                    pre_part.extend(pending_users)
+                    pending_users.clear()
+                if not rem:
+                    if len(matched_chunks) == 1:
+                        pre_part.append(entry)
+                    else:
+                        pre_part.extend(matched_chunks)
+                    agent_cursor = cur
+                    idx += 1
+                    continue
+                pre_part.extend(matched_chunks)
+                post_part = [dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=rem))]
                 post_part.extend(entries[idx + 1:])
                 return pre_part, post_part
         break
-    return pre_part, list(entries[idx:])
+    return pre_part, list(pending_users) + list(entries[idx:])
 
 
 def _slice_after_prompt_boundary(history, prompt_text):
@@ -1784,6 +1817,7 @@ def run_native(store, task, emit, policy):
             public_emit = emit
             emitted_events_by_seq = {}
             emitted_tool_summaries_by_seq = {}
+            emitted_tool_summary_by_id = {}
             emitted_questions_turn = set()
             interruption_notified_seqs = set()
             def _is_usable_answer_line(line_text):
@@ -1797,16 +1831,23 @@ def run_native(store, task, emit, policy):
                 interaction = extra.pop('interaction_seq', current_interaction)
                 dedupe_only = extra.pop('_degraded_dedupe', False)
                 suppress_resurrected_q = extra.pop('_suppress_prior_question', False)
+                historical_prior_seq = extra.pop('_historical_prior_seq', False)
                 if kind == 'tool':
                     tid = text.split(' ', 1)[0] if text else ''
+                    if tid and emitted_tool_summary_by_id.get(tid) == text:
+                        return
                     seen_tools = emitted_tool_summaries_by_seq.setdefault(interaction, {})
                     if dedupe_only and tid and seen_tools.get(tid) == text:
                         return
                     if tid:
                         seen_tools[tid] = text
+                        emitted_tool_summary_by_id[tid] = text
                 elif kind in {'stage', 'question', 'skill', 'answer'}:
-                    if kind == 'question' and suppress_resurrected_q and text in emitted_questions_turn:
+                    if kind == 'question' and (suppress_resurrected_q or historical_prior_seq) and text in emitted_questions_turn:
                         return
+                    if historical_prior_seq and kind in {'stage', 'skill', 'answer'}:
+                        if any((kind, text) in emitted_events_by_seq.get(p_seq, ()) for p_seq in range(current_interaction)):
+                            return
                     seen_ev = emitted_events_by_seq.setdefault(interaction, set())
                     if dedupe_only and (kind, text) in seen_ev:
                         return
@@ -2021,7 +2062,7 @@ def run_native(store, task, emit, policy):
                         if not old_sections.keys() <= new_sections.keys():
                             raise ProtocolError('Native dialogue history missing; reconciliation required',
                                 history_diagnostic=_history_diagnostic('dialogue_missing', comparison, history,
-                                    call_site='section', interaction_seq=current_interaction))
+                                    background_growth=True, call_site='section', interaction_seq=current_interaction))
                         fresh_sections = {seq: additions(old_sections.get(seq, []), section, background_growth=True,
                             call_site='section', interaction_seq=seq)
                             for seq, section in new_sections.items()}
@@ -2064,14 +2105,20 @@ def run_native(store, task, emit, policy):
                     for seq, section in fresh_sections.items():
                         # A completed older response must not enter the current decoder.
                         target = decoder if seq == current_interaction else EventDecoder()
+                        hist_dedupe = getattr(owner, 'history_degraded', False) and seq < current_interaction
                         for entry in section:
                             is_appended = entry in appended
                             for kind, text in target.feed(dict(params=dict(update=entry)), text_boundary=is_appended):
                                 if kind == 'answer':
-                                    already_seen = ('answer', text) in emitted_events_by_seq.get(seq, set())
+                                    already_seen = (
+                                        ('answer', text) in emitted_events_by_seq.get(seq, set())
+                                        or (hist_dedupe and any(('answer', text) in emitted_events_by_seq.get(p_seq, ()) for p_seq in range(current_interaction)))
+                                    )
                                     _record_live_wire_answer(seq, text, deduped_already_seen=already_seen)
-                                    _note_usable_answer(seq, text)
-                                emit(kind, text, interaction_seq=seq)
+                                    if not (hist_dedupe and already_seen):
+                                        _note_usable_answer(seq, text)
+                                emit(kind, text, interaction_seq=seq, _degraded_dedupe=hist_dedupe,
+                                     _historical_prior_seq=hist_dedupe)
                             if entry.get('sessionUpdate') == 'tool_call':
                                 if is_appended:
                                     live_wire_answers_by_seq[seq] = []
@@ -2079,10 +2126,15 @@ def run_native(store, task, emit, policy):
                         if seq != current_interaction:
                             for kind, text in target.finish():
                                 if kind == 'answer':
-                                    already_seen = ('answer', text) in emitted_events_by_seq.get(seq, set())
+                                    already_seen = (
+                                        ('answer', text) in emitted_events_by_seq.get(seq, set())
+                                        or (hist_dedupe and any(('answer', text) in emitted_events_by_seq.get(p_seq, ()) for p_seq in range(current_interaction)))
+                                    )
                                     _record_live_wire_answer(seq, text, deduped_already_seen=already_seen)
-                                    _note_usable_answer(seq, text)
-                                emit(kind, text, interaction_seq=seq)
+                                    if not (hist_dedupe and already_seen):
+                                        _note_usable_answer(seq, text)
+                                emit(kind, text, interaction_seq=seq, _degraded_dedupe=hist_dedupe,
+                                     _historical_prior_seq=hist_dedupe)
                 except ProtocolError as hist_exc:
                     h_diag = getattr(hist_exc, 'history_diagnostic', None)
                     reason = h_diag.get('reason_code') if isinstance(h_diag, dict) else None
@@ -2150,8 +2202,13 @@ def run_native(store, task, emit, policy):
                             if s_entry.get('sessionUpdate') == 'tool_call' and (s_live or s_seq == current_interaction):
                                 _note_tool_status(s_entry.get('toolCallId'), _safe_tool_status(s_entry), s_seq)
                         for sig_kind, sig_text in _salvage_wire_signals(s_stream):
-                            already_emitted = (sig_kind, sig_text) in emitted_events_by_seq.get(s_seq, set())
-                            emit(sig_kind, sig_text, interaction_seq=s_seq, _degraded_dedupe=True)
+                            prior_salvage_seen = (not s_live and s_seq < current_interaction)
+                            already_emitted = (
+                                (sig_kind, sig_text) in emitted_events_by_seq.get(s_seq, set())
+                                or (prior_salvage_seen and any((sig_kind, sig_text) in emitted_events_by_seq.get(p_seq, ()) for p_seq in range(current_interaction)))
+                            )
+                            emit(sig_kind, sig_text, interaction_seq=s_seq, _degraded_dedupe=True,
+                                 _historical_prior_seq=prior_salvage_seen)
                             if sig_kind == 'answer' and not already_emitted:
                                 _record_live_wire_answer(s_seq, sig_text)
                                 _note_usable_answer(s_seq, sig_text)
@@ -2228,7 +2285,8 @@ def run_native(store, task, emit, policy):
                                 if kind == 'answer':
                                     _note_deg_answer(seq, text, idx > last_failed_idx)
                                 emit(kind, text, interaction_seq=seq, _degraded_dedupe=True,
-                                     _suppress_prior_question=suppress_q)
+                                     _suppress_prior_question=suppress_q,
+                                     _historical_prior_seq=(seq < current_interaction))
                             if entry.get('sessionUpdate') == 'tool_call':
                                 _note_tool_status(entry.get('toolCallId'), _safe_tool_status(entry), seq,
                                                   usable_count_override=sec_usable_idx)
@@ -2248,7 +2306,8 @@ def run_native(store, task, emit, policy):
                             for kind, text in sec_dec.finish():
                                 if kind == 'answer':
                                     _note_deg_answer(seq, text, len(sec) > last_failed_idx)
-                                emit(kind, text, interaction_seq=seq, _degraded_dedupe=True)
+                                emit(kind, text, interaction_seq=seq, _degraded_dedupe=True,
+                                     _historical_prior_seq=(seq < current_interaction))
                     dialogue_public = None
                     owner.pending_drained.clear()
                     owner.pending_retry_state = None
@@ -2334,9 +2393,18 @@ def run_native(store, task, emit, policy):
                             _note_tool_status(update.get('toolCallId'), _safe_tool_status(update), current_interaction)
                     emit('stage', 'Dialogue '+entry['command_id']+' claimed; not yet sent.')
                     interaction_body = dialogue_body(task, entry)
-                    if deferred_questions and deferred_questions[-1]['interaction_seq'] == prev_interaction:
-                        deferred_questions[-1].update(replacement_command=entry['command_id'],
-                            replacement_body=interaction_body)
+                    target_blocker_seq = entry.get('blocker_interaction_seq')
+                    if (type(target_blocker_seq) is int
+                            and entry.get('question_id') is None
+                            and not entry.get('question_ids')):
+                        for deferred in deferred_questions:
+                            if deferred['interaction_seq'] == target_blocker_seq:
+                                deferred.update(
+                                    replacement_command=entry['command_id'],
+                                    replacement_body=interaction_body,
+                                    replacement_slot_text=deferred['text'],
+                                )
+                                break
                     store.native_dialogue_state(*binding, entry['command_id'], 'send_started')
                     decoder.final_answer = ''
                     response, _ = owner.request('session/prompt', dict(sessionId=owner.session_id,
@@ -2462,20 +2530,39 @@ def run_native(store, task, emit, policy):
                         owner.drain_pending(check_cancel=check_cancel)
                         time.sleep(.1)
                         continue
-                    # A reviewed, unbound input can replace an incomplete interview,
-                    # but only its exact replay boundary plus a final response proves
-                    # reception. Queuing/return alone must not discard a question.
+                    # Only an explicitly targeted blocker_interaction_seq dialogue can replace
+                    # a non-growing incomplete fragment, and only after return, unchanged
+                    # slot text, exact replay boundary, empty formal questions, and a final
+                    # usable public response.
+                    deferred_cleared = False
                     for deferred in list(deferred_questions):
                         command = current.get('commands', {}).get(deferred.get('replacement_command'), {})
-                        index = deferred['index']+1
+                        d_index = deferred['index']
                         if (command.get('status') == 'returned' and command.get('question_id') is None
-                                and index < len(history) and history[index]['sessionUpdate'] == 'user_message_chunk'
-                                and history[index]['content']['text'] == deferred.get('replacement_body')):
+                                and not command.get('question_ids')
+                                and type(command.get('blocker_interaction_seq')) is int
+                                and command.get('blocker_interaction_seq') == deferred['interaction_seq']
+                                and d_index < len(history)
+                                and history[d_index].get('sessionUpdate') == 'agent_message_chunk'
+                                and history[d_index]['content']['text'] == deferred['text']
+                                and deferred.get('replacement_slot_text') == deferred['text']
+                                and any(e.get('sessionUpdate') == 'user_message_chunk'
+                                        and e.get('content', {}).get('text') == deferred.get('replacement_body')
+                                        for e in history[d_index+1:])):
                             deferred_questions.remove(deferred)
+                            deferred_cleared = True
                             emit('stage', 'Incomplete question superseded by returned dialogue '+command['command_id']+
                                 ' and its final public response; not a token answer.',
                                 interaction_seq=deferred['interaction_seq'])
                     if deferred_questions:
+                        if deferred_cleared:
+                            observation = dict(current.get('native_observation') or {})
+                            observation['question_blockers'] = [
+                                dict(interaction_seq=d['interaction_seq'], reason='incomplete_question',
+                                     available_actions=['observe', 'dialogue', 'cancel'], blocks_completion=True)
+                                for d in deferred_questions
+                            ]
+                            store.update(task['id'], native_observation=observation)
                         review()
                         owner.drain_pending(check_cancel=check_cancel)
                         time.sleep(.1)

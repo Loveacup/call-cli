@@ -122,6 +122,13 @@ raise SystemExit(int(os.environ.get('ACPX_FAKE_EXIT','0')))
 ''')
         fake.chmod(0o700)
         node=self.root/'node';node.write_bytes(fake.read_bytes());node.chmod(0o700)
+        # Close checks npm availability even when the synthetic node handles the backend.
+        npm=self.root/'npm'
+        npm.write_text('#!'+sys.executable+'\n'+
+            'import pathlib, sys\n'
+            'if sys.argv[1:] != ["root", "-g"]: raise SystemExit("Unexpected fixture npm command")\n'
+            'print(pathlib.Path(__file__).parent / "node_modules")\n')
+        npm.chmod(0o700)
         self.env=patch.dict(os.environ,{'PATH':str(self.root)+os.pathsep+os.environ['PATH'],'ACPX_FAKE_ROOT':str(self.root)})
         self.env.start()
         self.update=patch('updates.ensure_current',return_value={'decision':'current'})

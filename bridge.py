@@ -9,7 +9,7 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,8 +118,13 @@ def build_runtime_links(task):
 
 
 class Store:
-    def __init__(self, path):
+    read_only = False
+
+    def __init__(self, path, *, read_only=False):
         self.path = Path(path)
+        self.read_only = bool(read_only)
+        if self.read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, owner TEXT, data TEXT)')
@@ -127,7 +132,19 @@ class Store:
         os.chmod(self.path, 0o600)
 
     @contextmanager
+    def ro_connect(self):
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + '?mode=ro',
+                                     uri=True, timeout=15)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA query_only=ON')
+            yield db
+
+    @contextmanager
     def connect(self):
+        if self.read_only:
+            with self.ro_connect() as db:
+                yield db
+            return
         db = sqlite3.connect(self.path, timeout=15)
         db.row_factory = sqlite3.Row
         try:
@@ -176,7 +193,7 @@ class Store:
                          and bool(other.get('native_session_id'))
                          and not other.get('native_cleanup', {}).get('session_unloaded')))
             )
-            if (not other['write'] or other.get('resource_state') == 'released'
+            if (not other['write'] or other.get('resource_state') in {'released', 'superseded'}
                     or (other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}
                         and not active_cancel_resume)):
                 continue
@@ -185,6 +202,17 @@ class Store:
             overlaps = task.get('device_key',task['device']) == other.get('device_key',other['device']) and (left == right or left.startswith(right+'/') or right.startswith(left+'/'))
             if shared or overlaps:
                 raise ValueError('Workspace is already owned by task '+other['id'])
+
+    def _has_conflicting_writer(self, db, task):
+        if not task.get('write'):
+            return False
+        probe = dict(task, state='unknown')
+        probe.pop('resource_state', None)
+        try:
+            self._check_writers(db, probe)
+            return False
+        except ValueError:
+            return True
 
     @staticmethod
     def _target_commands(task, status):
@@ -310,12 +338,64 @@ class Store:
     def _native_binding(task):
         return dict(turn=task['turn'], launch_id=task.get('launch_id'), epoch=task.get('control_epoch', 1))
 
+    @staticmethod
+    def _validate_question_binding(question_id, question_ids, *, allow_empty_scalar=False):
+        if question_id is not None and question_ids is not None:
+            raise ValueError('question_id and question_ids are mutually exclusive')
+        if question_id is not None:
+            if not isinstance(question_id, str):
+                raise ValueError('question_id must be a string')
+            if not allow_empty_scalar and question_id == '':
+                raise ValueError('question_id must be nonempty')
+            return [question_id] if question_id != '' else []
+        if question_ids is not None:
+            if not isinstance(question_ids, list) or not question_ids:
+                raise ValueError('question_ids must be a nonempty list of strings')
+            for qid in question_ids:
+                if not isinstance(qid, str) or qid == '':
+                    raise ValueError('question_ids elements must be nonempty strings')
+            if len(set(question_ids)) != len(question_ids):
+                raise ValueError('question_ids must not contain duplicates')
+            return list(question_ids)
+        return []
+
+    @staticmethod
+    def _load_question_events(db, task, bound_ids):
+        pending = task.get('questions', [])
+        metas = []
+        for qid in bound_ids:
+            if qid not in pending:
+                raise ValueError('Requires an unanswered question_id matching exact raw bytes')
+            row = db.execute('SELECT data FROM events WHERE task=? AND token=?', (task['id'], qid)).fetchone()
+            event = json.loads(row[0]) if row else {}
+            if event.get('kind') != 'question' or event.get('turn', task['turn']) != task['turn']:
+                raise ValueError('Original question event unavailable; do not guess answer binding')
+            metas.append(dict(
+                id=qid,
+                label=event.get('question_label'),
+                interaction_seq=event.get('interaction_seq', 0),
+                text=event['text'],
+                sha256=event.get('question_sha256'),
+                length=event.get('question_length'),
+            ))
+        return metas
+
+    @staticmethod
+    def _command_bound_question_ids(entry):
+        if entry.get('question_ids') is not None:
+            return set(entry['question_ids'])
+        if entry.get('question_id') is not None:
+            return {entry['question_id']}
+        return set()
+
     def dialogue(self, task_id, origin, prompt='', *, expected_turn, command_id, question_id=None,
-                 target_command_id=None, withdraw=False):
+                 question_ids=None, blocker_interaction_seq=None, target_command_id=None, withdraw=False):
         if type(expected_turn) is not int or expected_turn < 1 or not isinstance(command_id, str) or not command_id.strip():
             raise ValueError('dialogue requires expected_turn and stable command_id')
         if type(withdraw) is not bool:
             raise ValueError('withdraw must be boolean')
+        if blocker_interaction_seq is not None and (type(blocker_interaction_seq) is not int or blocker_interaction_seq < 0):
+            raise ValueError('blocker_interaction_seq must be a non-negative integer')
         if target_command_id is not None:
             if not isinstance(target_command_id, str) or not target_command_id.strip():
                 raise ValueError('target_command_id must be nonempty')
@@ -326,10 +406,15 @@ class Store:
                 raise ValueError('withdraw requires target_command_id')
             if (isinstance(prompt, str) and prompt.strip()) or (not isinstance(prompt, str) and prompt is not None):
                 raise ValueError('withdraw does not accept prompt')
-            if question_id is not None:
-                raise ValueError('withdraw does not accept question_id')
-        elif not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError('dialogue requires nonempty prompt')
+            if question_id is not None or question_ids is not None or blocker_interaction_seq is not None:
+                raise ValueError('withdraw does not accept question_id, question_ids, or blocker_interaction_seq')
+            bound_ids = []
+        else:
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError('dialogue requires nonempty prompt')
+            if blocker_interaction_seq is not None and (question_id is not None or question_ids is not None):
+                raise ValueError('blocker_interaction_seq is mutually exclusive with question_id and question_ids')
+            bound_ids = self._validate_question_binding(question_id, question_ids, allow_empty_scalar=False)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = self._owned(db, task_id, origin)
@@ -342,6 +427,10 @@ class Store:
                 intent = dict(withdraw=True, target_command_id=target_command_id, expected_turn=expected_turn)
             else:
                 intent = dict(prompt=prompt, expected_turn=expected_turn, question_id=question_id)
+                if question_ids is not None:
+                    intent['question_ids'] = sorted(question_ids)
+                if blocker_interaction_seq is not None:
+                    intent['blocker_interaction_seq'] = blocker_interaction_seq
                 if target_command_id is not None:
                     intent['target_command_id'] = target_command_id
             expected_kind = 'dialogue_withdraw' if withdraw else 'dialogue'
@@ -375,27 +464,43 @@ class Store:
                     target_command_id=target_command_id, status='returned', **binding)
                 self._save(db, task)
                 return task
-            question = None
-            if question_id is not None:
-                if question_id not in task.get('questions', []):
-                    raise ValueError('dialogue requires an unanswered question_id')
-                row = db.execute('SELECT data FROM events WHERE task=? AND token=?', (task_id, question_id)).fetchone()
-                event = json.loads(row[0]) if row else {}
-                if event.get('kind') != 'question' or event.get('turn', task['turn']) != task['turn']:
-                    raise ValueError('Original question event unavailable; do not guess answer binding')
-                question = dict(id=question_id, label=event.get('question_label'),
-                    interaction_seq=event.get('interaction_seq', 0), text=event['text'],
-                    sha256=event.get('question_sha256'), length=event.get('question_length'))
+            bound_metas = self._load_question_events(db, task, bound_ids) if bound_ids else []
+            if bound_ids:
+                bound_set = set(bound_ids)
                 if any(c.get('kind') == 'dialogue' and c.get('command_id') != target_command_id
-                       and c.get('question_id') == question_id
-                       and c.get('status') in {'accepted', 'claimed', 'send_started', 'returned'} for c in commands.values()):
+                       and (self._command_bound_question_ids(c) & bound_set)
+                       and c.get('status') in {'accepted', 'claimed', 'send_started', 'returned'}
+                       for c in commands.values()):
                     raise ValueError('Question already has an admitted answer')
+            if blocker_interaction_seq is not None:
+                blockers = task.get('native_observation', {}).get('question_blockers') or []
+                if not any(isinstance(b, dict) and b.get('interaction_seq') == blocker_interaction_seq
+                           and b.get('reason') == 'incomplete_question' for b in blockers):
+                    raise ValueError('Requires an active incomplete_question blocker matching blocker_interaction_seq')
+                if any(c.get('kind') == 'dialogue' and c.get('command_id') != target_command_id
+                       and type(c.get('blocker_interaction_seq')) is int
+                       and c.get('blocker_interaction_seq') == blocker_interaction_seq
+                       and all(c.get(k) == v for k, v in binding.items())
+                       and c.get('status') in {'accepted', 'claimed', 'send_started', 'returned'}
+                       for c in commands.values()):
+                    raise ValueError('Blocker already has an admitted supersede dialogue')
             if target is not None:
                 target['status'] = 'superseded'
             seq = task.get('native_interaction_next', task.get('interaction_seq', 0))+1
             task['native_interaction_next'] = seq
-            commands[command_id] = dict(kind='dialogue', command_id=command_id, intent=intent,
-                prompt=prompt, question_id=question_id, question=question, status='accepted', interaction_seq=seq, **binding)
+            if question_ids is not None:
+                record = dict(kind='dialogue', command_id=command_id, intent=intent,
+                    prompt=prompt, question_id=None, question=None,
+                    question_ids=list(question_ids), questions=bound_metas,
+                    status='accepted', interaction_seq=seq, **binding)
+            else:
+                question = bound_metas[0] if bound_metas else None
+                record = dict(kind='dialogue', command_id=command_id, intent=intent,
+                    prompt=prompt, question_id=question_id, question=question,
+                    status='accepted', interaction_seq=seq, **binding)
+            if blocker_interaction_seq is not None:
+                record['blocker_interaction_seq'] = blocker_interaction_seq
+            commands[command_id] = record
             self._save(db, task)
         return task
 
@@ -494,22 +599,6 @@ class Store:
                     entry['status']='not_sent'
             self._save(db, task)
         return task
-
-    def native_cancel_cleanup_state(self, task_id, turn, launch_id, epoch, cancel_id, status, workers):
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            task=self._native_owned(db,task_id,turn,launch_id,epoch)
-            if task['state']!='cancelling' or task.get('native_cancel_id')!=cancel_id:
-                raise ValueError('Native cleanup cancellation identity changed')
-            previous=task.get('native_cancel_cleanup')
-            if status=='send_started':
-                if previous: raise ValueError('Native cancellation cleanup already attempted; no replay')
-            elif (status not in {'returned','unknown'} or not previous or previous['status']!='send_started'
-                    or previous['cancel_id']!=cancel_id or previous['workers']!=workers):
-                raise ValueError('Native cleanup send transition invalid')
-            task['native_cancel_cleanup']=dict(task=task_id,session_id=task.get('native_session_id'),
-                turn=turn,launch_id=launch_id,epoch=epoch,cancel_id=cancel_id,status=status,workers=workers)
-            self._save(db,task)
 
     def native_cleanup_commit(self, task_id, turn, launch_id, epoch, token, receipt):
         with self.connect() as db:
@@ -631,11 +720,19 @@ class Store:
                     or any(entry.get(k) != v for k,v in self._native_binding(task).items())):
                 raise ValueError('Native dialogue transition is stale')
             entry['status'] = status
-            if status == 'returned' and entry.get('question_id') in task.get('questions', []):
-                question = entry['question_id']
-                task.setdefault('answers', {})[question] = entry['prompt']
-                task['questions'].remove(question)
-                task['question_id'] = task['questions'][0] if task['questions'] else ''
+            if status == 'returned':
+                bound = entry.get('question_ids')
+                if bound is None:
+                    bound = [entry['question_id']] if entry.get('question_id') is not None else []
+                pending = task.get('questions', [])
+                changed = False
+                for qid in bound:
+                    if qid in pending:
+                        task.setdefault('answers', {})[qid] = entry['prompt']
+                        pending.remove(qid)
+                        changed = True
+                if changed:
+                    task['question_id'] = pending[0] if pending else ''
             self._save(db, task)
 
     def native_input_seal(self, task_id, turn, launch_id, epoch, interaction_seq):
@@ -673,16 +770,19 @@ class Store:
                         entry['status'] = 'not_sent'
             self._save(db, task)
 
-    def reply(self, task_id, origin, question_id, prompt, *, clear_timeout=False, require_question=False,
-              expected_turn=None, command_id=None):
+    def reply(self, task_id, origin, question_id=None, prompt='', *, question_ids=None,
+              clear_timeout=False, require_question=False, expected_turn=None, command_id=None):
         if type(clear_timeout) is not bool:
             raise ValueError('clear_timeout must be boolean')
+        bound_ids = self._validate_question_binding(question_id, question_ids, allow_empty_scalar=True)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = self._owned(db, task_id, origin)
             replay = task.get('reply_commands', {}).get(command_id) if command_id else None
             intent = dict(prompt=prompt, question_id=question_id, expected_turn=expected_turn,
                           clear_timeout=clear_timeout)
+            if question_ids is not None:
+                intent['question_ids'] = sorted(question_ids)
             if replay is not None:
                 if replay != intent:
                     raise ValueError('command_id already used with different parameters')
@@ -697,15 +797,20 @@ class Store:
             questions = task.get('questions', [])
             if not questions and (task.get('control_epoch', 1) > 1 or task.get('continuation_version', 1) >= 2) and (expected_turn is None or not command_id):
                 raise ValueError('Versioned continuation requires expected_turn and command_id')
-            if require_question and (not question_id or question_id not in questions or not prompt.strip()):
+            if require_question and (not bound_ids or not isinstance(prompt, str) or not prompt.strip()):
                 raise ValueError('Reply requires an unanswered question_id in a settled turn')
-            if questions and question_id not in questions:
+            if questions and not bound_ids:
                 raise ValueError('Reply must name the pending question_id')
+            if not questions and bound_ids:
+                raise ValueError('Reply must name a pending question_id')
+            if bound_ids:
+                self._load_question_events(db, task, bound_ids)
             if clear_timeout:
                 task['clear_timeout_pending'] = True
             if questions:
-                task.setdefault('answers', {})[question_id] = prompt
-                questions.remove(question_id)
+                for qid in bound_ids:
+                    task.setdefault('answers', {})[qid] = prompt
+                    questions.remove(qid)
                 if questions:
                     task['question_id'] = questions[0]
                     self._save(db, task)
@@ -722,6 +827,15 @@ class Store:
 
     def _allows(self, owner, origin):
         return owner == origin.key()
+
+    def _same_principal(self, owner, origin):
+        return self._allows(owner, origin)
+
+    def _release_authorized(self, task, origin):
+        if (origin.profile not in {'standalone', 'omp-extension'}
+                and not self._same_principal(Origin(**task['origin']).key(), origin)):
+            raise PermissionError('Task belongs to another Hermes session/topic')
+        return task
 
     @staticmethod
     def _check_intent(task, expected_turn):
@@ -777,6 +891,16 @@ class Store:
                         commands[command_id].get('clear_timeout', False) != clear_timeout
                         or commands[command_id].get('expected_turn') != expected_turn):
                     raise ValueError('command_id already used with different parameters')
+                if (self._same_principal(Origin(**task.get('controller', task['origin'])).key(), origin)
+                        and not task.get('release_epoch')
+                        and task.get('intervention', {}).get('command_id') == command_id
+                        and task['intervention'].get('status') == 'pending'
+                        and commands[command_id].get('status') == 'pending'
+                        and task['intervention'].get('source_turn') == task['turn']
+                        and task['state'] in {'cancelled', 'completed', 'waiting_reply'}):
+                    self._resume_intervention(db, task, task['intervention'])
+                    self._save(db, task)
+                    return task, True
                 return task, False
             if task.get('agy_swarm')=='native' and task['state']=='running' and task.get('native_input',{}).get('settling'):
                 raise ValueError('Native owner is settling; inspect final outcome before intervention')
@@ -881,8 +1005,9 @@ class Store:
             task.pop('native_resume_session_id', None)
             task.pop('clear_timeout_pending', None)
             self._target_commands(task, 'target_unknown')
+            if task['state'] in {'completed','cancelled'} and self._has_conflicting_writer(db,task):
+                task['resource_state']='superseded'
             task['state']='closing'
-            self._check_writers(db,task)
             self._save(db,task)
         return task
 
@@ -892,6 +1017,8 @@ class Store:
             task=json.loads(db.execute('SELECT data FROM tasks WHERE id=?',(task_id,)).fetchone()[0])
             if task['turn']!=turn or task['state']!='closing':return False
             task.update(state='closed' if success else 'unknown',prompt='')
+            if success:
+                task.pop('resource_state', None)
             self._save(db,task)
         return True
 
@@ -933,7 +1060,7 @@ class Store:
             from recovery import recovery_card
         event['recovery'] = recovery_card(task, self.path)
         if task.get('intervention', {}).get('status') == 'pending':
-            event['next_action'] = 'Call status/events (Hermes) or wait (CLI) to resume the authorized intervention'
+            event['next_action'] = 'Retry intervene with the same command_id (Hermes/OMP/CLI) or call wait (CLI/OMP) to resume the authorized intervention'
         if state == 'unknown' and task['agent'] in {'agy','omp'}:
             event.update(attention_required=True, notification_scope='originating-session',
                          next_action=task['agent'].upper()+' outcome unknown. Do not replay automatically. '+event['recovery']['next_action'],
@@ -952,23 +1079,47 @@ class Store:
 
     def events(self, task_id, origin, after=0):
         self.get(task_id, origin)
-        with self.connect() as db:
+        with self.ro_connect() as db:
             return [dict(seq=r['rowid'], **json.loads(r['data'])) for r in db.execute(
                 'SELECT rowid,data FROM events WHERE task=? AND rowid>? ORDER BY rowid', (task_id, after))]
 
     def list(self, origin, group=None):
         target = normalize_group(group)
-        with self.connect() as db:
+        if self.read_only and not self.path.exists():
+            return []
+        with self.ro_connect() as db:
             tasks = [json.loads(r['data']) for r in db.execute('SELECT data FROM tasks WHERE owner=?', (origin.key(),))]
         if target is not None:
             return [t for t in tasks if t.get('group') == target]
         return tasks
 
+    def recovery_snapshot(self, task_id, origin=None):
+        if self.read_only and not self.path.exists():
+            raise KeyError('Unknown call-cli task')
+        with self.ro_connect() as db:
+            db.execute('BEGIN')
+            row = db.execute('SELECT data FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                raise KeyError('Unknown call-cli task')
+            raw_task = json.loads(row[0])
+            task = dict(raw_task) if isinstance(raw_task, dict) else {}
+            if origin is not None:
+                task = self._release_authorized(task, origin)
+            task['id'] = task_id
+            receipt = None
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_fences'").fetchone():
+                fence = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
+                if fence:
+                    receipt = json.loads(fence[0])
+            return task, receipt
+
     def release_target(self, task_id, origin):
         return self.get(task_id, origin)
 
     def get(self, task_id, origin=None):
-        with self.connect() as db:
+        if self.read_only and not self.path.exists():
+            raise KeyError('Unknown call-cli task')
+        with self.ro_connect() as db:
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
         if not row:
             raise KeyError('Unknown call-cli task')

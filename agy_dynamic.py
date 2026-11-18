@@ -52,6 +52,19 @@ def _dynamic_sections(turn_replay, dialogue_boundaries):
     return sections
 
 
+def _dynamic_dialogue_body(task, entry):
+    """Build Dynamic CALLCLI_DIALOGUE wire text; reject blocker_interaction_seq."""
+    if entry.get('blocker_interaction_seq') is not None:
+        raise ProtocolError('Dynamic dialogue does not support blocker_interaction_seq; retain HOLD')
+    payload = dict(task=task['id'], turn=task['turn'],
+        interaction_seq=entry['interaction_seq'], command_id=entry['command_id'],
+        question=entry.get('question'))
+    if entry.get('question_ids') is not None:
+        payload['question_ids'] = entry['question_ids']
+        payload['questions'] = entry.get('questions')
+    return 'CALLCLI_DIALOGUE '+json.dumps(payload)+'\n\n'+entry['prompt']
+
+
 def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unload, check_cancel,
                 *, cancel_cleanup=None, resumed=False):
     if baseline and not resumed:
@@ -565,12 +578,11 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             continue
         entry = store.native_dialogue_claim(*binding)
         if entry is not None:
+            body = _dynamic_dialogue_body(task, entry)
             pre_dialogue_history = list(turn_replay)
             interaction = entry['interaction_seq']
             command = entry['command_id']
             store.native_dialogue_state(*binding, command, 'send_started')
-            body = 'CALLCLI_DIALOGUE '+json.dumps(dict(task=task['id'], turn=task['turn'],
-                interaction_seq=interaction, command_id=command, question=entry.get('question')))+'\n\n'+entry['prompt']
             decoder = EventDecoder()
             continue
         if not active and workflow and not current.get('questions'):

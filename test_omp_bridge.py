@@ -403,5 +403,345 @@ class GroupAndOriginContextPrivacyTests(unittest.TestCase):
                 self.assertNotIn(secret, list_proc.stdout)
 
 
+class QuestionIdsSeamTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.launches = []
+        self.bridge = HostBridge(Path(self.tmp.name) / 'tasks.db', launch=lambda t: self.launches.append(t))
+        self.host = dict(session_id='native-qids', agent_id='main-qids')
+        self.cap = self.bridge.bind(self.host)
+
+    def call(self, action, **args):
+        return self.bridge.handle(self.host, self.cap, dict(action=action, **args))
+
+    def test_dialogue_question_ids_raw_bytes_idempotency_supersede_and_withdraw(self):
+        task = self.call('start', agent='agy', prompt='owned', cwd=self.tmp.name)['task']
+        tid = task['id']
+        self.bridge.store.update(tid, state='running', runner_pid=123)
+        self.bridge.store.native_input_open(tid, 1, task['launch_id'], 1)
+        self.bridge.store.event(tid, ' 1:raw ', 'question', 'Q1 raw?', turn=1)
+        self.bridge.store.event(tid, '1:2', 'question', 'Q2 second?', turn=1)
+        self.bridge.store.event(tid, '1:3', 'question', 'Q3 third?', turn=1)
+
+        with self.assertRaisesRegex(ValueError, 'exact raw bytes'):
+            self.call('dialogue', task_id=tid, prompt='trimmed', command_id='bad-trim',
+                      expected_turn=1, question_ids=['1:raw'])
+
+        res = self.call('dialogue', task_id=tid, prompt='multi answer', command_id='dq1',
+                        expected_turn=1, question_ids=[' 1:raw ', '1:2'])['task']
+        cmd = res['commands']['dq1']
+        self.assertEqual(cmd['status'], 'accepted')
+        self.assertEqual(cmd['question_ids'], [' 1:raw ', '1:2'])
+        self.assertIsNone(cmd['question_id'])
+        self.assertEqual([q['id'] for q in cmd['questions']], [' 1:raw ', '1:2'])
+        self.assertEqual(res['questions'], [' 1:raw ', '1:2', '1:3'])
+        self.assertEqual(len(self.launches), 1)
+
+        # Idempotent replay with reordered question_ids succeeds cleanly.
+        replayed = self.call('dialogue', task_id=tid, prompt='multi answer', command_id='dq1',
+                             expected_turn=1, question_ids=['1:2', ' 1:raw '])['task']
+        self.assertEqual(replayed, res)
+
+        # Reusing command_id with a different question_ids set fails.
+        with self.assertRaises(ValueError):
+            self.call('dialogue', task_id=tid, prompt='multi answer', command_id='dq1',
+                      expected_turn=1, question_ids=['1:2'])
+
+        # Duplicate binding against an already-accepted dialogue is rejected.
+        with self.assertRaisesRegex(ValueError, 'admitted answer'):
+            self.call('dialogue', task_id=tid, prompt='overlap', command_id='dq-overlap',
+                      expected_turn=1, question_ids=['1:2', '1:3'])
+
+        # Supersede releases all previously bound IDs (' 1:raw ' and '1:2').
+        sup = self.call('dialogue', task_id=tid, prompt='answer q3', command_id='dq2',
+                        expected_turn=1, target_command_id='dq1', question_ids=['1:3'])['task']
+        self.assertEqual((sup['commands']['dq1']['status'], sup['commands']['dq2']['status']),
+                         ('superseded', 'accepted'))
+
+        rebound = self.call('dialogue', task_id=tid, prompt='rebound', command_id='dq3',
+                            expected_turn=1, question_ids=[' 1:raw ', '1:2'])['task']
+        self.assertEqual(rebound['commands']['dq3']['status'], 'accepted')
+
+        # Withdraw releases all bound IDs for subsequent re-answering.
+        wd = self.call('dialogue', task_id=tid, command_id='wq3', expected_turn=1,
+                       target_command_id='dq3', withdraw=True)['task']
+        self.assertEqual(wd['commands']['dq3']['status'], 'withdrawn')
+
+        rebound_after_wd = self.call('dialogue', task_id=tid, prompt='after withdraw', command_id='dq4',
+                                     expected_turn=1, question_ids=['1:2', ' 1:raw '])['task']
+        self.assertEqual(rebound_after_wd['commands']['dq4']['status'], 'accepted')
+        self.assertEqual(rebound_after_wd['commands']['dq4']['question_ids'], ['1:2', ' 1:raw '])
+
+    def test_reply_question_ids_subset_d4_merge_single_count_clear_timeout_and_idempotency(self):
+        task = self.call('start', agent='codex', prompt='inspect', cwd=self.tmp.name)['task']
+        tid = task['id']
+        self.bridge.store.update(tid, state='waiting_reply', timeout=300)
+        self.bridge.store.event(tid, 'q1', 'question', 'Q1 first?', turn=1)
+        self.bridge.store.event(tid, 'q2', 'question', 'Q2 second?', turn=1)
+        self.bridge.store.event(tid, 'q3', 'question', 'Q3 third?', turn=1)
+
+        subset = self.call('reply', task_id=tid, question_ids=['q1', 'q2'], prompt='shared',
+                           expected_turn=1, command_id='r1', clear_timeout=True)['task']
+        self.assertEqual((subset['state'], subset['turn']), ('waiting_reply', 1))
+        self.assertEqual(subset['questions'], ['q3'])
+        self.assertEqual(subset['question_id'], 'q3')
+        self.assertEqual(subset['answers'], {'q1': 'shared', 'q2': 'shared'})
+        self.assertTrue(subset['clear_timeout_pending'])
+        self.assertEqual(subset['timeout'], 300)
+        self.assertEqual(len(self.launches), 1)
+
+        # Reordered question_ids with same command_id is idempotent.
+        self.assertEqual(
+            self.call('reply', task_id=tid, question_ids=['q2', 'q1'], prompt='shared',
+                      expected_turn=1, command_id='r1', clear_timeout=True)['task'],
+            subset,
+        )
+        with self.assertRaises(ValueError):
+            self.call('reply', task_id=tid, question_ids=['q1'], prompt='shared',
+                      expected_turn=1, command_id='r1', clear_timeout=True)
+
+        final = self.call('reply', task_id=tid, question_ids=['q3'], prompt='last',
+                          expected_turn=1, command_id='r2')['task']
+        self.assertEqual((final['state'], final['turn']), ('queued', 2))
+        self.assertIsNone(final['timeout'])
+        self.assertEqual(final['questions'], [])
+        self.assertEqual(final['answers'], {})
+        self.assertEqual(len(self.launches), 2)
+        self.assertEqual(self.launches[-1]['prompt'], 'q1: shared\nq2: shared\nq3: last')
+
+        # Single-question reply via question_ids uses unprefixed prompt and preserves raw bytes.
+        single = self.call('start', agent='codex', prompt='single', cwd=self.tmp.name)['task']
+        sid = single['id']
+        self.bridge.store.update(sid, state='waiting_reply')
+        self.bridge.store.event(sid, ' 1:raw ', 'question', 'Q1 raw?', turn=1)
+        with self.assertRaisesRegex(ValueError, 'exact raw bytes'):
+            self.call('reply', task_id=sid, question_ids=['1:raw'], prompt='only', expected_turn=1, command_id='rs-bad')
+        replied_single = self.call('reply', task_id=sid, question_ids=[' 1:raw '], prompt='only',
+                                   expected_turn=1, command_id='rs1')['task']
+        self.assertEqual((replied_single['state'], replied_single['turn']), ('queued', 2))
+        self.assertEqual(self.launches[-1]['prompt'], 'only')
+
+    def test_question_ids_validation_and_rejection_across_actions(self):
+        dlg = self.call('start', agent='agy', prompt='owned', cwd=self.tmp.name)['task']
+        self.bridge.store.update(dlg['id'], state='running', runner_pid=123)
+        self.bridge.store.native_input_open(dlg['id'], 1, dlg['launch_id'], 1)
+        self.bridge.store.event(dlg['id'], '1:2', 'question', 'Q1?', turn=1)
+        self.bridge.store.event(dlg['id'], '1:3', 'question', 'Q2?', turn=1)
+
+        rep = self.call('start', agent='codex', prompt='reply-host', cwd=self.tmp.name)['task']
+        self.bridge.store.update(rep['id'], state='waiting_reply')
+        self.bridge.store.event(rep['id'], '1:2', 'question', 'Q1?', turn=1)
+        self.bridge.store.event(rep['id'], '1:3', 'question', 'Q2?', turn=1)
+        launches_before = len(self.launches)
+
+        invalid_values = [None, [], '1:2,1:3', [''], [1], ['1:2', '1:2'], ['1:2,1:3']]
+        for bad_qids in invalid_values:
+            with self.subTest(action='dialogue', bad_qids=bad_qids), self.assertRaises(ValueError):
+                self.call('dialogue', task_id=dlg['id'], prompt='bad', command_id='d-bad',
+                          expected_turn=1, question_ids=bad_qids)
+            with self.subTest(action='reply', bad_qids=bad_qids), self.assertRaises(ValueError):
+                self.call('reply', task_id=rep['id'], prompt='bad', expected_turn=1,
+                          command_id='r-bad', question_ids=bad_qids)
+
+        # Mutual exclusion including empty scalar question_id=''
+        for qid in ('1:2', ''):
+            with self.assertRaises(ValueError):
+                self.call('dialogue', task_id=dlg['id'], prompt='bad', command_id='d-mix',
+                          expected_turn=1, question_id=qid, question_ids=['1:3'])
+            with self.assertRaises(ValueError):
+                self.call('reply', task_id=rep['id'], prompt='bad', expected_turn=1,
+                          command_id='r-mix', question_id=qid, question_ids=['1:3'])
+
+        # Non-string question_id and withdraw combined with question_ids/question_id
+        with self.assertRaises(ValueError):
+            self.call('dialogue', task_id=dlg['id'], prompt='bad', command_id='d-int', expected_turn=1, question_id=123)
+        with self.assertRaises(ValueError):
+            self.call('reply', task_id=rep['id'], prompt='bad', expected_turn=1, question_id=123)
+
+        self.call('dialogue', task_id=dlg['id'], prompt='ok', command_id='d-ok', expected_turn=1, question_ids=['1:2'])
+        with self.assertRaises(ValueError):
+            self.call('dialogue', task_id=dlg['id'], command_id='w-bad', expected_turn=1,
+                      target_command_id='d-ok', withdraw=True, question_ids=['1:2'])
+
+        # Unsupported actions reject question_ids
+        for other_action, extra in (
+            ('status', dict(task_id=dlg['id'])),
+            ('intervene', dict(task_id=dlg['id'], prompt='rev', command_id='int-bad')),
+            ('list', dict()),
+            ('cancel', dict(task_id=dlg['id'])),
+            ('close', dict(task_id=dlg['id'])),
+        ):
+            with self.subTest(other_action=other_action), self.assertRaises(ValueError):
+                self.call(other_action, question_ids=['1:2'], **extra)
+
+        self.assertEqual(len(self.launches), launches_before)
+        self.assertEqual(self.call('status', task_id=rep['id'])['task']['questions'], ['1:2', '1:3'])
+
+    def test_blocker_interaction_seq_forwarding_validation_and_idempotency(self):
+        dlg = self.call('start', agent='agy', prompt='owned', cwd=self.tmp.name)['task']
+        self.bridge.store.update(dlg['id'], state='running', runner_pid=123)
+        self.bridge.store.native_input_open(dlg['id'], 1, dlg['launch_id'], 1)
+        self.bridge.store.update(dlg['id'], native_observation=dict(
+            turn=1, input_available=True, question_ids=[],
+            question_blockers=[
+                dict(interaction_seq=0, reason='incomplete_question', available_actions=['observe', 'dialogue', 'cancel'], blocks_completion=True),
+                dict(interaction_seq=2, reason='unresolved_question', available_actions=['inspect_origin', 'reconcile_hold'], blocks_completion=True),
+            ],
+        ))
+        self.bridge.store.event(dlg['id'], '1:2', 'question', 'Q1?', turn=1)
+
+        rep = self.call('start', agent='codex', prompt='reply-host', cwd=self.tmp.name)['task']
+        self.bridge.store.update(rep['id'], state='waiting_reply')
+        self.bridge.store.event(rep['id'], '1:2', 'question', 'Q1?', turn=1)
+
+        for action, extra in (
+            ('reply', dict(task_id=rep['id'], prompt='ans', question_id='1:2', expected_turn=1, command_id='r-blk')),
+            ('status', dict(task_id=dlg['id'])),
+            ('intervene', dict(task_id=dlg['id'], prompt='rev', command_id='i-blk')),
+            ('list', dict()),
+            ('cancel', dict(task_id=dlg['id'])),
+            ('close', dict(task_id=dlg['id'])),
+        ):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.call(action, blocker_interaction_seq=0, **extra)
+
+        for bad_val in (False, True, None, -1, 1.5, '0', [0]):
+            with self.subTest(bad_val=bad_val), self.assertRaises(ValueError):
+                self.call('dialogue', task_id=dlg['id'], prompt='bad', command_id='d-bad',
+                          expected_turn=1, blocker_interaction_seq=bad_val)
+
+        for mix in (
+            dict(question_id='1:2', blocker_interaction_seq=0),
+            dict(question_id='', blocker_interaction_seq=0),
+            dict(question_ids=['1:2'], blocker_interaction_seq=0),
+        ):
+            with self.subTest(mix=mix), self.assertRaises(ValueError):
+                self.call('dialogue', task_id=dlg['id'], prompt='mix', command_id='d-mix',
+                          expected_turn=1, **mix)
+
+        for bad_seq in (1, 2):
+            with self.assertRaisesRegex(ValueError, 'incomplete_question'):
+                self.call('dialogue', task_id=dlg['id'], prompt='miss', command_id=f'd-miss-{bad_seq}',
+                          expected_turn=1, blocker_interaction_seq=bad_seq)
+
+        res0 = self.call('dialogue', task_id=dlg['id'], prompt='review 0', command_id='d0',
+                         expected_turn=1, blocker_interaction_seq=0)['task']
+        self.assertEqual(res0['commands']['d0']['blocker_interaction_seq'], 0)
+        with self.assertRaises(ValueError):
+            self.call('dialogue', task_id=dlg['id'], command_id='w-bad', expected_turn=1,
+                      target_command_id='d0', withdraw=True, blocker_interaction_seq=0)
+        self.call('dialogue', task_id=dlg['id'], command_id='w0', expected_turn=1,
+                  target_command_id='d0', withdraw=True)
+        res1 = self.call('dialogue', task_id=dlg['id'], prompt='review 0 v2', command_id='d1',
+                         expected_turn=1, blocker_interaction_seq=0)['task']
+        self.assertEqual(res1['commands']['d1']['blocker_interaction_seq'], 0)
+
+        self.bridge.store.native_dialogue_claim(dlg['id'], 1, dlg['launch_id'], 1)
+        self.bridge.store.native_dialogue_state(dlg['id'], 1, dlg['launch_id'], 1, 'd1', 'send_started')
+        self.bridge.store.native_dialogue_state(dlg['id'], 1, dlg['launch_id'], 1, 'd1', 'returned')
+        self.bridge.store.update(dlg['id'], state='completed', questions=[], question_id='',
+                                 native_input=dict(accepting=False, settling=True, turn=1, launch_id=dlg['launch_id'], epoch=1),
+                                 native_observation=dict(turn=1, input_available=False, question_ids=[], question_blockers=[]))
+        retried = self.call('dialogue', task_id=dlg['id'], prompt='review 0 v2', command_id='d1',
+                            expected_turn=1, blocker_interaction_seq=0)['task']
+        self.assertEqual(retried['state'], 'completed')
+        self.assertEqual(retried['commands']['d1']['blocker_interaction_seq'], 0)
+
+
+class OmpReadOnlyAndRecoveryStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / 'tasks.db'
+        self.bridge = HostBridge(self.db, launch=lambda t: None)
+        self.a = dict(session_id='omp-a', agent_id='agent-a')
+        self.b = dict(session_id='omp-b', agent_id='agent-b')
+        self.ka = self.bridge.bind(self.a)
+        self.kb = self.bridge.bind(self.b)
+
+    def test_recovery_status_audited_diagnostic_readonly_and_owned_flag(self):
+        task = self.bridge.handle(
+            self.a, self.ka, dict(action='start', agent='agy', cwd=self.tmp.name, prompt='CANARY_PROMPT')
+        )['task']
+        tid = task['id']
+        self.assertIs(task['owned_by_bound_host'], True)
+        self.bridge.store.update(
+            tid, state='unknown', runner_pid=0, settlement_note='CANARY_NOTE', error='CANARY_ERR',
+            questions=['1:2'], answers={'1:1': 'CANARY_ANS'},
+            native_observation={
+                'turn': 1, 'history_degraded': True, 'response_pending_reason': 'board_navigation_only',
+                'pending_tools': [{'id': 'CANARY_TID', 'name': 'CANARY_TOOL', 'kind': 'edit', 'status': 'in_progress'}],
+                'history_diagnostic': {'reason_code': 'dialogue_missing', 'call_site': 'section',
+                                       'previous_len': 62, 'current_len': 25, 'extra_secret': 'CANARY_EXTRA'},
+            },
+        )
+        before = self.db.read_bytes()
+        res = self.bridge.handle(self.b, self.kb, dict(action='recovery_status', task_id=tid))
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(res['resource_recovery']['task_id'], tid)
+        self.assertEqual(res['diagnostic']['agent'], 'agy')
+        self.assertEqual(res['diagnostic']['pending_question_count'], 1)
+        self.assertEqual(res['diagnostic']['native_diagnostic']['pending_tool_kinds'], ['edit'])
+        self.assertEqual(res['diagnostic']['native_diagnostic']['history_diagnostic'], {
+            'reason_code': 'dialogue_missing', 'call_site': 'section', 'previous_len': 62, 'current_len': 25,
+        })
+        dumped = json.dumps(res)
+        for secret in ('CANARY_', 'omp-a', 'omp-b', self.ka, self.kb, self.tmp.name):
+            self.assertNotIn(secret, dumped)
+        for bad in (dict(action='recovery_status', task_id=''), dict(action='recovery_status', task_id=tid, group='g')):
+            with self.assertRaises(ValueError):
+                self.bridge.handle(self.b, self.kb, bad)
+
+    def test_readonly_bridge_and_main_do_not_initialize_missing_db(self):
+        missing = Path(self.tmp.name) / 'missing' / 'tasks.db'
+        ro = HostBridge(missing, read_only=True, launch=lambda t: None)
+        self.assertFalse(missing.parent.exists())
+        with self.assertRaises(PermissionError):
+            ro.handle(self.a, self.ka, dict(action='list'))
+        self.assertEqual(ro.observe(self.a, dict(action='list')), {'tasks': []})
+        with self.assertRaises(KeyError):
+            ro.observe(self.a, dict(action='recovery_status', task_id='t1'))
+        self.assertFalse(missing.parent.exists())
+        for action in ('list', 'status', 'events', 'recovery_status'):
+            args = dict(action=action) if action == 'list' else dict(action=action, task_id='t1')
+            proc = subprocess.run(
+                [sys.executable, '-B', str(Path(__file__).with_name('omp_bridge.py'))],
+                input=json.dumps(dict(db=str(missing), host=self.a, capability=self.ka, args=args)),
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertFalse(missing.parent.exists())
+        for args, expected_rc in ((dict(action='list'), 0), (dict(action='recovery_status', task_id='t1'), 1)):
+            proc = subprocess.run(
+                [sys.executable, '-B', str(Path(__file__).with_name('omp_bridge.py'))],
+                input=json.dumps(dict(db=str(missing), action='observe', host=self.a, args=args)),
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(proc.returncode, expected_rc)
+            self.assertFalse(missing.parent.exists())
+
+    def test_observe_subprocess_requires_valid_host_and_never_writes_existing_db(self):
+        task = self.bridge.handle(
+            self.a, self.ka, dict(action='start', agent='agy', cwd=self.tmp.name, prompt='CANARY_OBS')
+        )['task']
+        tid = task['id']
+        before = self.db.read_bytes()
+        for host, args, rc in (
+            (self.b, dict(action='list'), 0),
+            (self.b, dict(action='recovery_status', task_id=tid), 0),
+            (self.b, dict(action='status', task_id=tid), 1),
+            ({}, dict(action='list'), 1),
+        ):
+            proc = subprocess.run(
+                [sys.executable, '-B', str(Path(__file__).with_name('omp_bridge.py'))],
+                input=json.dumps(dict(db=str(self.db), action='observe', host=host, args=args)),
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(proc.returncode, rc, proc.stdout + proc.stderr)
+            self.assertEqual(self.db.read_bytes(), before)
+            self.assertNotIn('CANARY_OBS', proc.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

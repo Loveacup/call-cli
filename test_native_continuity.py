@@ -86,10 +86,12 @@ class NativeContinuityTests(unittest.TestCase):
         self.env['HERMES_SESSION_ID'] = 'after'
         self.action('intervene', task, command_id='one', prompt='revision')
         store.finish_turn(task['id'], 1, 'cancelled', 0, 'cancelled')
-        self.assertEqual(self.action('status', task)['task']['turn'], 2)
+        self.assertEqual(self.action('status', task)['task']['turn'], 1)
         launches = len(self.ctx.calls)
+        self.assertEqual(self.action('intervene', task, command_id='one', prompt='revision')['task']['turn'], 2)
+        self.assertEqual(len(self.ctx.calls), launches + 1)
         self.action('status', task)
-        self.assertEqual(len(self.ctx.calls), launches)
+        self.assertEqual(len(self.ctx.calls), launches + 1)
         store.update(task['id'], state='unknown')
         with self.assertRaises(ValueError):
             self.action('intervene', task, command_id='two', prompt='no replay')
@@ -265,7 +267,7 @@ class NativeContinuityTests(unittest.TestCase):
         connect = sqlite3.connect
         def audited(*args, **kwargs):
             db = connect(*args, **kwargs)
-            if kwargs.get('uri'):
+            if kwargs.get('uri') and 'state.db' in str(args[0]):
                 def allow(action, table, column, database, trigger):
                     if action == sqlite3.SQLITE_READ:
                         reads.add((table, column))
@@ -318,7 +320,7 @@ class NativeContinuityTests(unittest.TestCase):
         self.env['HERMES_SESSION_ID'] = 'after'
         connect = sqlite3.connect
         def no_metadata_open(*args, **kwargs):
-            if kwargs.get('uri'):
+            if kwargs.get('uri') and ('state.db' in str(args[0]) or 'other-profile.db' in str(args[0])):
                 raise AssertionError('symlink database opened')
             return connect(*args, **kwargs)
         with patch('callcli_plugin.native_continuity.sqlite3.connect', side_effect=no_metadata_open):
