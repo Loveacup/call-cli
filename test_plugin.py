@@ -814,5 +814,153 @@ class PluginTests(unittest.TestCase):
                     c.handle({'action': action, 'task_id': 'nonexistent'})
                 self.assertFalse(db_dir.exists())
 
+    def test_registered_hermes_start_handler_canonicalizes_ons_g4hs_before_launch(self):
+        from contextlib import closing
+        import shlex
+        import sqlite3
+        import sys
+        import types
+        from unittest.mock import patch
+
+        mod = load_plugin()
+        expected_runner = Path(mod.__file__).with_name('runner.py').resolve()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            hermes_home = root / 'hermes-home'
+            work = root / 'work'
+            hermes_home.mkdir()
+            work.mkdir()
+            expected_db = root / 'plugin-data' / 'call-cli' / 'tasks.sqlite3'
+            env = {'HERMES_SESSION_ID': 's1', 'HERMES_SESSION_KEY': 'key'}
+
+            def read_db_rows():
+                if not expected_db.exists():
+                    return {}
+                with closing(sqlite3.connect(expected_db.as_uri() + '?mode=ro', uri=True)) as db:
+                    return {row[0]: json.loads(row[1])
+                            for row in db.execute('SELECT id, data FROM tasks').fetchall()}
+
+            test_case = self
+
+            class RecordingCtx(Ctx):
+                def __init__(self):
+                    self.calls = []
+                    self.snapshots = []
+
+                def dispatch_tool(self, name, args, **kwargs):
+                    test_case.assertEqual(name, 'terminal')
+                    argv = shlex.split(args['command'])
+                    test_case.assertIn('--db', argv)
+                    test_case.assertIn('--task', argv)
+                    test_case.assertEqual(Path(argv[1]).resolve(), expected_runner)
+                    test_case.assertEqual(Path(argv[argv.index('--db') + 1]).resolve(), expected_db)
+                    task_id = argv[argv.index('--task') + 1]
+                    rows = read_db_rows()
+                    test_case.assertIn(task_id, rows)
+                    self.snapshots.append(rows[task_id])
+                    self.calls.append((name, args))
+                    return json.dumps({
+                        'session_id': f'proc-owned-{len(self.calls)}',
+                        'pid': 123,
+                        'notify_on_complete': True,
+                    })
+
+            constants = types.ModuleType('hermes_constants')
+            constants.get_hermes_home = lambda: hermes_home
+            constants.get_default_hermes_root = lambda **kw: root
+            profiles = types.ModuleType('hermes_cli.profiles')
+            profiles.get_active_profile_name = lambda: 'default'
+            session = types.ModuleType('gateway.session_context')
+            session.get_session_env = lambda k, d='': env.get(k, d)
+            modules = {
+                'hermes_constants': constants,
+                'hermes_cli.profiles': profiles,
+                'gateway.session_context': session,
+            }
+
+            ctx = RecordingCtx()
+            with patch.dict(sys.modules, modules):
+                mod.register(ctx)
+                props = ctx.registration['schema']['parameters']['properties']
+                self.assertIn('oc/oa/on/4c/4a/4h/4n/g4c/g4a/g4h/g4n', props['model']['description'])
+                handler = ctx.registration['handler']
+
+                for shorthand, expected_model in (
+                    ('ons', 'gemini-pro-orchestrator-neon'),
+                    ('g4hs', 'gemini-4-hydrogen'),
+                ):
+                    with self.subTest(shorthand=shorthand):
+                        res = json.loads(handler({
+                            'action': 'start',
+                            'agent': 'agy',
+                            'cwd': str(work),
+                            'prompt': 'synthetic',
+                            'model': shorthand,
+                        }))
+                        self.assertNotIn('error', res)
+                        task = res['task']
+                        self.assertEqual(
+                            (task['model'], task['agy_swarm'], task.get('agy_mode')),
+                            (expected_model, 'native', 'swarm'),
+                        )
+                        snap = ctx.snapshots[-1]
+                        self.assertEqual(snap['id'], task['id'])
+                        self.assertEqual(
+                            (snap['model'], snap['agy_swarm'], snap.get('agy_mode')),
+                            (expected_model, 'native', 'swarm'),
+                        )
+                        self.assertNotEqual(snap['model'], shorthand)
+
+                calls_before = len(ctx.calls)
+                rows_before = len(read_db_rows())
+                for bad_extra in (
+                    {'model': 'ons', 'agy_swarm': 'off'},
+                    {'model': 'g4hs', 'agy_mode': 'single'},
+                    {'model': 'g4hs', 'agy_mode': 'dynamic'},
+                ):
+                    with self.subTest(mismatch=bad_extra):
+                        res = json.loads(handler({
+                            'action': 'start',
+                            'agent': 'agy',
+                            'cwd': str(work),
+                            'prompt': 'synthetic',
+                            **bad_extra,
+                        }))
+                        self.assertEqual(res.get('error_type'), 'ModelSelectionError')
+                        self.assertEqual(len(ctx.calls), calls_before)
+                        self.assertEqual(len(read_db_rows()), rows_before)
+
+                for extra, expected in (
+                    ({'model': 'gemini-pro-orchestrator-neon', 'agy_swarm': 'off'},
+                     ('gemini-pro-orchestrator-neon', 'off', None)),
+                    ({'model': 'gemini-4-hydrogen'},
+                     ('gemini-4-hydrogen', 'native', 'swarm')),
+                    ({'model': 'gemini-4-argon'},
+                     ('gemini-4-argon', 'off', None)),
+                    ({'model': 'gemini-4-hydrogen', 'agy_mode': 'dynamic'},
+                     ('gemini-4-hydrogen', 'native', 'dynamic')),
+                ):
+                    with self.subTest(full_id=extra):
+                        res = json.loads(handler({
+                            'action': 'start',
+                            'agent': 'agy',
+                            'cwd': str(work),
+                            'prompt': 'synthetic',
+                            **extra,
+                        }))
+                        self.assertNotIn('error', res)
+                        task = res['task']
+                        self.assertEqual(
+                            (task['model'], task['agy_swarm'], task.get('agy_mode')),
+                            expected,
+                        )
+                        snap = ctx.snapshots[-1]
+                        self.assertEqual(snap['id'], task['id'])
+                        self.assertEqual(
+                            (snap['model'], snap['agy_swarm'], snap.get('agy_mode')),
+                            expected,
+                        )
+
 
 if __name__=='__main__':unittest.main()

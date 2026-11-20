@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from agy_native import NativeOwner, ProtocolError
-from backends import ModelSelectionError, prepare_start
+from backends import _AGY_ALIASES, ModelSelectionError, prepare_start
 import collab
 from collab import Collaboration
 from omp_bridge import HostBridge
@@ -554,6 +555,41 @@ class AgyAliasTests(unittest.TestCase):
                 self.assertEqual((res['model'], res['effort']), (expected_exact, effort))
                 self.assertEqual(state['model'], family)
                 self.assertTrue(res['native_selection']['readback_verified'])
+
+    def test_code_help_advertises_all_backend_aliases_with_surface_parity(self):
+        expected_aliases = set(_AGY_ALIASES)
+        advertised_order = 'oc/oa/on/4c/4a/4h/4n/g4c/g4a/g4h/g4n'
+
+        out = StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as exit_ctx:
+            collab.main(['start', '--help'])
+        self.assertEqual(exit_ctx.exception.code, 0)
+        cli_help = ' '.join(out.getvalue().split())
+        for snippet in (
+            advertised_order,
+            'bare=single, s=Swarm, t=Teamwork',
+            'omitted=ocs',
+            'OC/OA/ON',
+            'bare=off, s/t=native',
+        ):
+            self.assertIn(snippet, cli_help)
+        cli_match = re.search(r'AGY ([a-z0-9]+(?:/[a-z0-9]+)+):', cli_help)
+        self.assertIsNotNone(cli_match, cli_help)
+        cli_aliases = cli_match.group(1).split('/')
+        self.assertEqual(len(cli_aliases), len(set(cli_aliases)))
+        self.assertEqual(set(cli_aliases), expected_aliases)
+
+        props = load_plugin().SCHEMA['parameters']['properties']
+        model_desc = props['model']['description']
+        for snippet in (advertised_order, 'bare=single, s=Swarm, t=Teamwork', 'Omitted=ocs'):
+            self.assertIn(snippet, model_desc)
+        hermes_match = re.search(r'AGY ([a-z0-9]+(?:/[a-z0-9]+)+):', model_desc)
+        self.assertIsNotNone(hermes_match, model_desc)
+        hermes_aliases = hermes_match.group(1).split('/')
+        self.assertEqual(len(hermes_aliases), len(set(hermes_aliases)))
+        self.assertEqual(set(hermes_aliases), expected_aliases)
+        self.assertIn('OC/OA/ON', props['effort']['description'])
+        self.assertIn('bare=off, s/t=native', props['agy_swarm']['description'])
 
 
 if __name__ == '__main__':

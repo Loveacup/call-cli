@@ -286,11 +286,11 @@ def main(argv=None):
     start = sub.add_parser('start')
     start.add_argument('--device', default='local')
     start.add_argument('--agent', choices=list(BACKENDS), default='codex')
-    start.add_argument('--model', help='AGY oc/oa/4c/4a/4h: bare=single, s=Swarm, t=Teamwork; omitted=ocs. Advertised IDs supported; shorthand/mode conflicts reject')
-    start.add_argument('--effort', help='Exact advertised thought_level for AGY; standalone OC/OA have no effort option')
+    start.add_argument('--model', help='AGY oc/oa/on/4c/4a/4h/4n/g4c/g4a/g4h/g4n: bare=single, s=Swarm, t=Teamwork; omitted=ocs. Advertised IDs supported; shorthand/mode conflicts reject')
+    start.add_argument('--effort', help='Exact advertised thought_level for AGY; standalone OC/OA/ON have no effort option')
     start.add_argument('--agy-approval', choices=['skip-permissions', 'approve-all', 'approve-reads'],
                        help='AGY only: default native-skip uses skip-permissions; approve-all/approve-reads keep explicit non-skip gates')
-    start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY route override for advertised IDs; must match shorthand (bare=off, s=native)')
+    start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY route override for advertised IDs; must match shorthand (bare=off, s/t=native)')
     start.add_argument('--agy-mode', choices=['single', 'swarm', 'teamwork', 'dynamic'], help='Explicit AGY execution mode; native modes require their advertised command')
     start.add_argument('--agy-worker-model', help='Optional native worker-model preference forwarded to AGY; no per-member completion gate')
     start.add_argument('--backend', choices=['acpx', 'oar'], default=None,

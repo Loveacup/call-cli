@@ -1521,3 +1521,49 @@ test('cancelled with pending intervention delivers terminal verbatim and keeps p
   assert.equal(f.timers.length, 1, 'polling must remain active for pending intervention target');
   f.adapter.detach();
 });
+
+test('registered OMP tool Zod schema advertises all 11 AGY alias bases and agy_swarm s/t parity', () => {
+  const objectShapes = [];
+  const makeNode = (kind, args = []) => {
+    const ops = [{kind, args}];
+    const node = new Proxy({ops}, {
+      get(target, prop) {
+        if (prop === 'ops') return target.ops;
+        return (...methodArgs) => {
+          target.ops.push({kind: prop, args: methodArgs});
+          return node;
+        };
+      },
+    });
+    return node;
+  };
+  const z = new Proxy({}, {
+    get(_target, name) {
+      return (...args) => {
+        if (name === 'object') objectShapes.push(args[0]);
+        return makeNode(name, args);
+      };
+    },
+  });
+  let registered;
+  register({zod: z, registerTool: tool => {registered = tool;}, on: () => {}});
+  assert.equal(registered.name, 'call_cli_omp');
+  const shape = objectShapes.find(s => Object.hasOwn(s, 'action'));
+  assert.ok(shape);
+  assert.ok(Object.hasOwn(shape, 'model'));
+  assert.ok(Object.hasOwn(shape, 'agy_swarm'));
+
+  const modelDescribe = shape.model.ops.find(op => op.kind === 'describe');
+  assert.ok(modelDescribe);
+  const modelDesc = modelDescribe.args[0];
+  assert.ok(modelDesc.includes('oc/oa/on/4c/4a/4h/4n/g4c/g4a/g4h/g4n'));
+  assert.ok(modelDesc.includes('bare=single, s=Swarm, t=Teamwork'));
+  assert.ok(modelDesc.includes('omitted=ocs'));
+  const aliasMatch = modelDesc.match(/AGY\s+([a-z0-9/]+):/);
+  assert.ok(aliasMatch);
+  assert.deepEqual(aliasMatch[1].split('/'), ['oc', 'oa', 'on', '4c', '4a', '4h', '4n', 'g4c', 'g4a', 'g4h', 'g4n']);
+
+  const agySwarmDescribe = shape.agy_swarm.ops.find(op => op.kind === 'describe');
+  assert.ok(agySwarmDescribe);
+  assert.ok(agySwarmDescribe.args[0].includes('bare=off, s/t=native'));
+});
