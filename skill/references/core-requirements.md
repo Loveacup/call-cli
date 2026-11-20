@@ -5,11 +5,12 @@
 无论调用哪个 CLI，发起端都应持续掌握执行工作，将有价值的进展、问题、阻塞与最终结果送回真实的原会话；用户可随时在原会话补充或调整，由协调者传达到正确任务、确认实际生效并继续负责交付。用户不应切换终端搬运消息，或靠反复追问维持任务推进。这是本技能及配套实现优化、升级、修复的共同指向，不是某一 CLI 的特例，也不是当前所有链路已通过验收的声明。
 
 - OMP、Codex、Pi 与 Hermes 可作为发起端；AGY 仅作为执行端，用户已取消其发起端需求，不再列为入口缺口或待验目标。发起、事件回流及控制分别适配各自宿主，绑定真实来源与精确任务，不把 Hermes 或任何 CLI 固化为必经中转。声明 runtime 名称不能替代宿主会话身份；不得把无原会话回流的 standalone 路径静默当作等价替代，入口不可达时说明缺口，不伪造来源或任务所有权。
-- 区分事件产生、持久化、回注、协调者消费与用户实际收到；协调者转述有意义的阶段成果与待决策事项，不逐 token 汇报，也不只等最终结果。提问和介入结算后的必要续作由协调者承接。有长期责任方时，由该方直接创建并持有需跨轮的任务生命周期；短命代理需要发起时按实际宿主能力选择入口，事先明确持续协调与收尾路径，不假定父方自动继承所有权。暂不支持恢复不等于禁止该 CLI 发起。
+- 区分事件产生、持久化、回注、协调者消费与用户实际收到；SQLite 保留全量公开事件供 `events(after=seq)` 游标读回，常规生命周期 `diagnostic`（非 `attention_required` 的常规阶段诊断）、`skill`、中间 `answer` 与连续相同 `stage` 在实时投递层降噪不刷屏，终态/待决策/`attention_required`/实质变化才推送。协调者转述有意义的阶段成果与待决策事项，不逐 token 汇报，也不只等最终结果。提问和介入结算后的必要续作由协调者承接。有长期责任方时，由该方直接创建并持有需跨轮的任务生命周期；短命代理需要发起时按实际宿主能力选择入口，事先明确持续协调与收尾路径，不假定父方自动继承所有权。暂不支持恢复不等于禁止该 CLI 发起。
 - 用户可在原会话提出调整；发起 agent 也应根据执行期进展、偏差或阻塞，在已获授权范围内主动动态协调和调整，不依赖用户反复提醒。区分已提交、排队、被执行端接收及实际体现；按真实能力优先 steer，queue 与 cancel-and-resume 是不同语义，明确说明后备方式，不静默降级、不宣称无损。
-- Hermes 作为 Alex 的副手，应理解真实需求并主动承担协调、纠偏、验收与收尾；已授权范围内的普通步骤自行推进，不逐项重复请批。重大取舍或新增生产副作用仍须按真实权限处理；审查发现本身不扩大生产操作授权。
+- Hermes 作为 Alex 的副手，应理解真实需求并主动承担协调、纠偏、验收与收尾；已授权范围内的普通可逆工程选择自主推进与处理，不逐项重复请批；明显挤占主线或重大取舍必须带明确建议升级告知用户；新增生产副作用仍须按真实权限处理，审查发现本身不扩大生产操作授权。
 - 按 CLI 原生能力、适配器、传输入口、协调层和宿主回流逐层核验；交互界面支持不证明所用 API 支持，OMP 亦须按同一标准验证。公共协作核心、发起端适配、执行端适配及工具链／skill 传递保持清晰职责与小接口，复用已有机制，仅隔离真实差异，不为各 CLI 组合新造调度体系。
-- 新任务默认不设执行总截止；Hermes/OMP 模型工具不接收 timeout，保留 CLI/Python 显式硬 timeout 作为非常规兼容能力，不将其静默改为提醒。公共 runner 每 600s 至多请求一次发起方复核，持续活跃也不能无限推迟；静默与活跃检查点共享冷却，不自动取消、关闭或续跑。发起 agent 核查现状后选择继续等待、明确介入或取消，提醒不必逐条转给用户；入队不等于消费，CLI 依赖活跃 owner 轮询。已有硬预算在受支持续轮显式 clear_timeout 前仍生效；多问清除延迟到最后一答，中途介入替换答题序列时以介入自身 clear 选择为准，queued 拒绝清除。连接、启动与控制保持有界；unknown 保留资源占用并先对账，不自动重放。参数收口不是 shell 权限边界，时间限制不是费用保证。
+- 新任务默认不设执行总截止；Hermes/OMP 模型工具不接收 timeout，保留 CLI/Python 显式硬 timeout 作为非常规兼容能力，不将其静默改为提醒。公共 runner 每 600s 至多请求一次发起方复核，持续活跃也不能无限推迟；`ReviewTracker` 严格区分最后可见输出时间 `last_visible`、最后实质进展时间 `last_substantive_at`、最后阶段 `last_stage` 与仅工具空转 `tool_churn_only`（静默与持续工具刷屏同样触发复核，且静默与活跃检查点共享冷却，不自动取消、关闭或续跑）。发起 agent 核查现状后选择继续等待、明确介入或取消，提醒不必逐条转给用户；入队不等于消费，CLI 依赖活跃 owner 轮询。已有硬预算在受支持续轮显式 clear_timeout 前仍生效；多问清除延迟到最后一答，中途介入替换答题序列时以介入自身 clear 选择为准，queued 拒绝清除。连接、启动与控制保持有界；unknown 保留资源占用并先对账，不自动重放。参数收口不是 shell 权限边界，时间限制不是费用保证。
+- **停工未完成通报与协调者接续边界（未部署源码候选）**：共享 runner 与 OMP 适配只原样交付精确 task/turn 事实、降噪后的实质事件、600s 复核与注意事项（终态原样交回），不知道业务目标，也不依据可选 `group` 或已跟踪任务自动做项目级停工判定或生成伪小结。停工不是一种进程状态，进程退出（含 `completed`/exit 0）不等于业务完成；协调者在核实真实业务目标与接续事实后负责判断与行动——目标已独立验收则报验收完成、不误报停工，目标未验收且有授权下一步则在原权限内实际接续、不得因单轮退出停手。协调者须明确区分**单分支停**（某支已停但**同目标**仍有已确认活跃执行或已确认唤醒）、**等待有效执行**（仅指同目标存在已确认运行中的执行或已确认接续/唤醒）、**整体/全局停**与 **`unknown`**；**`unknown`、`queued`、空心跳、exit 0、未确认唤醒及同源无关活跃任务均不得作为接手续作证据**（含 `unknown` + `pending` 介入，须先对账精确 task/turn 与产物，禁止自动重放）。仅当协调者确认真实目标未验收、且无授权下一步接续也无同目标已确认活跃执行或唤醒时，才由协调者复用现有通知通道向原会话主动报**一次**『工作已停，未完成』简短小结，必含四要素：**已验**、**未完**、**停因**、**谁/什么条件能恢复**（含是否需用户动作）。不建常驻监工（no resident monitor daemon），不新增状态机、数据库或宿主 hook；仅在已有通道内尽力投递，不承诺进程或宿主异常终止后仍可送达。
 - 一次逻辑协作启动时，检查 call-cli 本身及本轮实际参与的 CLI 协作 skill 的维护源与安装现态；按需核查本轮所选传递 skill 的来源、版本、目标端可用性与实际采用。区分可用更新与已部署版本、查询失败与已是最新；不扫描所有 skill、不在状态查询或同任务续轮重复检查，不因发现更新而擅自覆盖本地适配、打断任务或更改配置。
 - 验收贯穿真实链路：执行中进度回原会话 → 用户在原会话补充 → 正确目标收到并按新要求继续 → 问题／失败／结果回到原会话 → 验收与收尾。模拟输入、离线测试、通用入口、宿主原生入口与真实用户投递分别记录，局部成功不代替全链通过。
 
@@ -27,6 +28,27 @@
 - **本版本源码；安装后需宿主重载 schema 与新 runner 后生效**：`dialogue` 与已结算 `reply` 新增显式 `question_ids: list[str]`，与标量 `question_id: str` 严格互斥（不得同时传入；`question_id=None` 与单值 `question_id` 保持兼容；拒绝空数组、空字符串、非字符串元素、重复 ID、CSV 逗号字符串与标量联合类型强转；禁止 trim 或修改 ID 字节；按原始字节精确匹配当前轮未答问题，且仅在 `command_id` 幂等意图比对时使用 `sorted(question_ids)` 规范化顺序；不引入事后零发送补结算子协议）。`dialogue` 另新增可选整数 `blocker_interaction_seq: int`（仅限 `dialogue` 动作，要求 `type(v) is int and v >= 0`，拒绝 `bool`、负数及非整数，`0` 按 `is not None` 处理），与 `question_id`、`question_ids` 及 `withdraw=True` 严格互斥；未传入时单题、多题与普通未绑 `CALLCLI_DIALOGUE` 头保持不变，零新账本。仅在首次受理时核验 `native_observation.question_blockers` 中存在匹配 `interaction_seq == blocker_interaction_seq` 且 `reason == 'incomplete_question'` 的活跃 blocker 及同轮单占互斥（`accepted` 阶段 `withdraw` 或 `target_command_id` 替换释放占用），同 `(command_id, intent)` 重试校验先于活跃 blocker 与 `running` 校验以保持已结算命令幂等；`reply` 不接受 `blocker_interaction_seq`。
 - 多题 `dialogue` 仅发送单次 `session/prompt`，且仅在 `returned` 时原子记录 `answers[qid]=prompt` 并移除全部绑定问题；`accepted`、`claimed`、`send_started`、`withdrawn`、`superseded`、`not_sent`、`cancelled` 与 `unknown` 均不清除问题，处于 `accepted` 时 `withdraw` 或 `target_command_id` 替换释放全部绑定 ID。
 - `reply` 共享同一 `question_id` XOR `question_ids` 校验、原始字节匹配与排序集合 `command_id` 幂等逻辑，同时保留既有合并正文行为（总回答数为 1 时取 `answers[0][1]`，多题时按 `'\n'.join(k + ': ' + v ...)` 拼接）。
+
+### 事件分流、实质进展汇报与 600s 复核（未部署源码候选）
+
+- **未部署源码候选边界**：本节为隔离候选仓的规则同步与需求镜像，不代表主仓已合入或现役 `current`/宿主插件已部署生效。
+- **事件与实质进展驱动汇报（禁止定时刷屏）**：面向用户的通知仅由真实事件与实质进展驱动（产物、已验证结论、阻塞、待答问题、需改向风险、带明确建议的重大取舍），绝不按固定时间间隔发进度消息。Slice A **本版本源码**在保持 `Store.events` SQLite 100% 原始落库的同时，通过 `events.classify_event_delivery`（含 `ROUTINE_DIAGNOSTIC_REASONS`）在 `runner.py:publish()` 实时 stdout 与 `omp-extension.mjs` 投递面过滤常规生命周期面包屑、中间流式 `answer` 行及连续重复非 `quiet_notice` `stage`（同时放行异常 `diagnostic`、`question`、`permission`、终态与 `quiet_notice`）。
+- **自主纠偏 vs 带建议升级**：已获授权范围内的常规可逆工程选择由协调者自主处理，不逐项打断用户；明显挤占主线、超出既定边界或涉及重大取舍的变更必须附明确推荐方案升级用户。
+- **600s `quiet_notice` 复核协议**：Slice A **本版本源码**以共享 `events.ReviewTracker`（冷却 `600s`，三端共用）生成 `quiet_notice=True` 复核帧与脱敏 `review_facts`（含 `progress_state`：`substantive_progress` / `tool_churn_only` / `quiet`，以及 `substantive_count_since_review`、`tool_count_since_review`、`failed_tool_count_since_review`、`substantive_idle_seconds`、`last_stage`）。到点唤醒后，协调者**必须**核查精确 `task/turn/seq`、`review_facts.progress_state`（显式识破工具很忙但零实质进展的 `tool_churn_only`）与实际磁盘产物，再明确作出“继续等待 / 自主可逆纠偏或介入 / 带建议升级用户”之一；严禁因超时提醒自动取消、关闭或续跑；Hermes 机器通知轮仅在确认事件已消费且无任何新增交付、待答、阻塞或协调义务后才精确回复 `[SILENT]`。
+
+## Hermes 透明 Git/worktree 管理（未部署源码候选）
+
+- **轻量、零守护进程、由协调者自然判断（未部署源码候选）**：纯标准库薄辅助 `git_worktree.py`（无 daemon、不写 SQLite、不修改 `bridge.py` 写锁语义及 `call_cli`/`call_cli_omp` 工具 Schema）仅封装重复且易错的 Git 动作，不在代码中另造“策略选择状态机”。是否使用 Git/worktree 由协调者（Hermes）依据任务自然选择，**不强制所有任务 Git 化、也不每次询问用户开关**，并保持正常成功链路最短：
+  1. **普通目录**：非 Git 目录的轻读写或单线任务直接推进并验收，不强行建仓；仅在确需隔离或回溯且位于授权任务目录（拒绝 `/`、`$HOME` 及宿主系统根目录）时按需 `init-repo`。
+  2. **单仓直接推进**：既有单仓内的单写者常规任务直接在该仓推进，保护用户既有未提交改动，不额外建 worktree。
+  3. **并行／写隔离 Worktree**：需并行写者或隔离实验时，由协调者在派工前准备**仓外同级** worktree，启动即明确收敛目标（`target_dir`/`target_branch`），并在授权范围内承担完整收束，不把合并甩给用户。
+- **仓外同级 Worktree 与 Fail-Closed 边界**：`bridge.py:_check_writers` 按规范化路径相等与父子前缀重叠做写锁互斥，仓内 `.agents/worktrees/*` 会与仓根互锁；隔离时统一使用**仓外同级目录**，保留 `relative_subdir` → 有效 `cwd`。worktree **只隔离已检出文件**，不是权限沙箱，也不继承主仓未提交脏文件或未跟踪文件。一旦请求隔离、建树、路径校验（如指向仓内／仓根／仓父目录或非法相对路径）或复用分支归属校验失败，**立即 fail-closed 停工报错**，严禁静默回退原工作区；返工或续作在确认前序停写后串行复用同一检出。
+- **透明告知与简洁汇报**：向用户与执行方简要透明写明 **“Git/worktree 由 Hermes 管理”**、分支／实际检出目录（`worktree_root` 与有效 `cwd`）、`device`、检出读回基线 `base_commit` 与收敛目标；不把逐项事实字段清单或全 worker 停机证明当正常成功链路的硬门槛。
+- **收束闭环（收获 → 保护用户改动 → 串行整合 → 目标复验 → 默认清理或明因保留）**：
+  - **收齐成果（`harvest`）**：先收集分支已提交及未提交／未跟踪交付（自动过滤 `__pycache__`/`.pytest_cache`/`.DS_Store`/`*.pyc`/`*.pyo` 等未跟踪噪声，按需校验 `allowed_paths`），禁止对主工作区执行 harvest。
+  - **保护目标用户改动与冲突现场**：串行 `git merge --no-ff` 前检查目标仓 `MERGE_HEAD`、暂存区（staged）改动及与传入文件重叠的未提交／未跟踪改动，存在即停手并保留工作树（`disposition='retained_with_reason'`）；**严禁自动 `git stash`、`git reset`、`git clean`、`git worktree remove --force`/`-f` 或 `git branch -D`**，无重叠的非冲突用户改动原样保留。**遇真合并冲突时保留完整冲突现场与 worktree，绝不先机械执行 `git merge --abort`**（dirty merge 无法保证安全回滚），而是列明冲突文件并带建议升级用户。
+  - **四态交付严格区分与默认清理**：交付核对仍区分**分支提交（`branch_commits`）／未提交改动（`uncommitted_files`）／已集成（`integrated`）／已验证（`verified`）**，不在目标目录独立复验前以 commit 或合入推定 `verified`。当且仅当已整合、已复验（`verified=True`）、无活跃 writer 且工作区干净时，默认执行非强删清理（`git worktree remove` + `git branch -d`，`disposition='cleaned'`）；其余情况保留并明确返回 `disposition='retained_with_reason'` 与非空 `retain_reasons`（替代默认长期留存）。主仓合入、现役 `current` 部署与对外 `push` 仍须独立授权。
+- **薄辅助 CLI（未部署源码候选）**：`git_worktree.py` 提供 `init-repo` / `prepare` / `inspect` / `harvest` / `converge` / `check-cleanup` / `cleanup` 单行 JSON 子命令。
 
 
 ## AGY 原生模式与薄桥边界

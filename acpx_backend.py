@@ -9,10 +9,10 @@ import subprocess
 import threading
 import time
 try:
-    from .events import EventDecoder
+    from .events import EventDecoder, ReviewTracker
     from .transport import command, protocol_prompt
 except ImportError:
-    from events import EventDecoder
+    from events import EventDecoder, ReviewTracker
     from transport import command, protocol_prompt
 try:
     from .skills import stage, guidance
@@ -373,11 +373,9 @@ class AcpxBackend:
             deadline = started_at+task['timeout']+90 if task.get('timeout') is not None else None
             startup_deadline = started_at+STARTUP_TIMEOUT if deadline is None else None
             startup_expired = False
-            last_visible = started_at
-            last_notice = started_at
-            last_summary = 'No stage or tool status observed.'
+            review_tracker = ReviewTracker(started_at, interval=QUIET_NOTICE_SECONDS)
             def consume(line):
-                nonlocal ended, last_visible, last_summary
+                nonlocal ended
                 if line is None:
                     ended = True
                     return
@@ -399,10 +397,11 @@ class AcpxBackend:
                              (public.get('type') == 'text_delta' and public.get('stream') == 'output'
                               and public.get('tag') == 'agent_message_chunk' and bool(public.get('text')))
                              or (public.get('type') == 'tool_call' and bool(decoded))))
+                event_now = time.monotonic() if activity else None
                 if activity:
-                    last_visible = time.monotonic()
+                    review_tracker.record_visible(event_now)
                 for kind,text in decoded:
-                    if kind in {'stage', 'tool'}:last_summary = text[:500]
+                    review_tracker.record_event(kind, text, event_now if event_now is not None else review_tracker.last_visible)
                     emit(kind,text)
             while not ended:
                 # Process already delivered frames before considering a deadline.
@@ -444,18 +443,13 @@ class AcpxBackend:
                     failure_stage, failure_reason = 'prompt_control', 'cancel_unsettled'
                     raise RuntimeError('Cancel accepted but prompt has not settled')
                 if (not cancelling and current['state'] == 'running'
-                        and now-last_notice >= QUIET_NOTICE_SECONDS):
+                        and review_tracker.is_due(now)):
                     with received_lock:
                         receive()
                         if not received_terminal and not reader_ended:
-                            notice_kind = 'quiet' if now-last_visible >= QUIET_NOTICE_SECONDS else 'checkpoint'
-                            emit('stage', 'Coordinator review requested ('+notice_kind+'); elapsed '
-                                 +str(int(now-started_at))+'s. Inspect this task and its events, then choose to '
-                                 'keep waiting, explicitly intervene, or cancel. Activity or silence alone does not '
-                                 'establish success or a hang. No cancellation or closure requested. '
-                                 'Last visible status: '+last_summary, quiet_notice=True,
-                                 notice_kind=notice_kind, elapsed=int(now-started_at))
-                            last_notice = now
+                            notice = review_tracker.build_notice(now)
+                            emit('stage', notice['text'], quiet_notice=True,
+                                 **notice['metadata'])
                 try:consume(output.get(timeout=.25))
                 except queue.Empty:continue
             if received_terminal and not decoder.shared_result_seen:

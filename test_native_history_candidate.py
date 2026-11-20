@@ -1531,7 +1531,11 @@ for line in sys.stdin:
             self.assertFalse(srv.is_alive())
             self.assertEqual((res, hist), ({}, []))
             self.assertIs(owner.request_cancel_sent, True)
-            self.assertGreaterEqual(len(owner.pending_drained), 2)
+            self.assertEqual(len(owner.pending_drained), 1)
+            self.assertEqual(owner.pending_drained[0].get('content', {}).get('text'), 'd2')
+            self.assertIsInstance(owner.pending_retry_state, dict)
+            self.assertEqual([e.get('toolCallId') for e in owner.pending_retry_state['attempt_updates']], ['t1'])
+            self.assertEqual([e.get('content', {}).get('text') for e in owner.pending_retry_state['d2_updates']], ['d2'])
             writer.close()
             owner.proc.stdin.close()
             rest = [json.loads(line) for line in reader.read().decode().splitlines() if line.strip()]

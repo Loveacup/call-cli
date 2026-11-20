@@ -11,6 +11,10 @@ try:
     from .backends import backend_for
 except ImportError:
     from backends import backend_for
+try:
+    from .events import classify_event_delivery
+except ImportError:
+    from events import classify_event_delivery
 
 
 
@@ -38,16 +42,18 @@ def run_task(db_path, task_id, *, turn=None, launch_id=None, epoch=None):
         from recovery import recovery_card
     counter = 0
     tool_notices = 0
+    last_stage = None
     answer_tail = ''
     def publish(kind, text, token, seq, **extra):
-        nonlocal tool_notices
-        # Native heartbeat batches these lines; cursor reads retain every event.
-        if kind in {'started', 'version', 'model', 'permissions'}:
+        nonlocal tool_notices, last_stage
+        # SQLite retains every event in full; stdout suppresses routine setup/diagnostic/skill/repeat noise.
+        decision = classify_event_delivery(
+            kind, text, extra=extra, last_stage=last_stage, tool_notices=tool_notices,
+        )
+        last_stage = decision['next_last_stage']
+        tool_notices = decision['next_tool_notices']
+        if not decision['deliver']:
             return
-        if kind == 'tool':
-            tool_notices += 1
-            if tool_notices > 12 and not text.endswith(' failed'):
-                return
         print(json.dumps(dict(task_id=task_id,event=kind,text=text[:4000],
                               event_id=token,seq=seq,**dict({'recovery':recovery_card(task,db_path,seq)},**extra)), ensure_ascii=False),flush=True)
     def emit(kind,text,**extra):

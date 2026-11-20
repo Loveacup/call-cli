@@ -6,6 +6,7 @@ import selectors
 import subprocess
 import time
 import hashlib
+import unicodedata
 
 try:
     from .events import EventDecoder, safe_tool_id, safe_tool_name, safe_tool_kind
@@ -17,6 +18,10 @@ except ImportError:
     from transport import command, protocol_prompt
     from skills import stage, guidance
     from updates import device_lock
+
+
+COMMAND_ADVERTISE_COLD_TIMEOUT = 2.0
+COMMAND_ADVERTISE_SETTLE_TIMEOUT = 0.5
 
 
 class ProtocolError(RuntimeError):
@@ -40,6 +45,7 @@ class NativeOwner:
         self.review = None
         self.review_blocked = False
         self.available_commands = set()
+        self.commands_advertised_count = 0
         self.permission_handler = None
         self.workflow_identity = {}
         self.approval_wait_seconds = 0.0
@@ -81,6 +87,8 @@ class NativeOwner:
 
     def request(self, method, params, *, timeout=60, check_cancel=None, on_update=None):
         drain_mode = (method is None and params is None)
+        stop_on_advertise = bool(params.get('stop_on_advertise')) if (method is None and isinstance(params, dict)) else False
+        initial_adv_count = params.get('initial_advertised_count', 0) if (method is None and isinstance(params, dict)) else 0
         self.last_rpc_phase = method or ('drain' if drain_mode else 'capability_observation')
         ident = None
         if method is not None:
@@ -98,6 +106,29 @@ class NativeOwner:
         line_pending = ''
         load_boundary = getattr(self, 'resumed_prompt_boundary', None) if method == 'session/load' else None
         load_after_boundary = (load_boundary is None)
+        load_fatal = False
+        load_user_buf = None
+        prev_review_blocked = getattr(self, 'review_blocked', False)
+        def _flush_load_user():
+            nonlocal load_user_buf, load_after_boundary, load_fatal, workflow_calls, public_text, line_pending, checked_updates
+            if load_boundary is None or load_user_buf is None:
+                return
+            utext = load_user_buf
+            load_user_buf = None
+            if utext == load_boundary or utext.endswith(load_boundary):
+                load_after_boundary = True
+                load_fatal = False
+                workflow_calls = set()
+                public_text = ''
+                line_pending = ''
+                checked_updates = []
+            elif utext and not utext.startswith('CALLCLI_DIALOGUE '):
+                load_after_boundary = False
+                load_fatal = False
+                workflow_calls = set()
+                public_text = ''
+                line_pending = ''
+                checked_updates = []
         def review():
             if not cancel_sent and not getattr(self, 'review_blocked', False) and self.review is not None:
                 self.review()
@@ -106,8 +137,11 @@ class NativeOwner:
         while True:
             if drain_mode and len(updates) >= 4096:
                 return {}, updates
-            if method is None and isinstance(params, dict) and params.get('command') in self.available_commands:
-                return {}, updates
+            if method is None and isinstance(params, dict):
+                if params.get('command') in self.available_commands:
+                    return {}, updates
+                if stop_on_advertise and getattr(self, 'commands_advertised_count', 0) > initial_adv_count:
+                    return {}, updates
             if check_cancel and check_cancel() and not cancel_sent:
                 self.notify_cancel()
                 cancel_sent = True
@@ -150,23 +184,30 @@ class NativeOwner:
                         and raw.get('sessionUpdate')!='available_commands_update'):
                     raise ProtocolError('Dynamic activity during unload; retain HOLD')
                 if raw.get('sessionUpdate') == 'available_commands_update':
+                    self.commands_advertised_count = getattr(self, 'commands_advertised_count', 0) + 1
                     self.available_commands = {entry['name'] for entry in raw.get('availableCommands', [])
                         if isinstance(entry, dict) and isinstance(entry.get('name'), str)}
-                if load_boundary is not None and raw.get('sessionUpdate') == 'user_message_chunk':
-                    raw_content = raw.get('content')
-                    utext = raw_content.get('text', '') if isinstance(raw_content, dict) else ''
-                    if isinstance(utext, str) and (utext == load_boundary or utext.endswith(load_boundary)):
-                        load_after_boundary = True
-                        workflow_calls = set()
-                        public_text = ''
-                        line_pending = ''
-                        checked_updates = []
+                raw_kind = raw.get('sessionUpdate')
+                if load_boundary is not None:
+                    if raw_kind == 'user_message_chunk':
+                        if load_user_buf is None:
+                            if load_after_boundary and line_pending.strip() == AGY_FATAL_LINE:
+                                self.review_blocked = True
+                                load_fatal = True
+                            line_pending = ''
+                            load_user_buf = ''
+                        raw_content = raw.get('content')
+                        utext = raw_content.get('text', '') if isinstance(raw_content, dict) else ''
+                        if isinstance(utext, str):
+                            load_user_buf += utext
+                    elif raw_kind in {'tool_call', 'tool_call_update', 'agent_message_chunk'}:
+                        _flush_load_user()
                 if self.task.get('agy_mode')=='dynamic' and load_after_boundary:
                     self.validate_workflow_update(raw, workflow_calls)
                 update = normalize(frame.get('params', {}).get('update', {}))
                 if update is not None:
                     updates.append(update)
-                    if load_after_boundary:
+                    if load_after_boundary and not (load_boundary is not None and update['sessionUpdate'] == 'user_message_chunk'):
                         checked_updates.append(update)
                         if update['sessionUpdate'] == 'agent_message_chunk':
                             chunk = update['content']['text']
@@ -178,13 +219,17 @@ class NativeOwner:
                             for seg in parts[:-1]:
                                 if seg.strip() == AGY_FATAL_LINE:
                                     self.review_blocked = True
-                                    if method in {'session/prompt', 'session/load'}:
+                                    if method == 'session/load' and load_boundary is not None:
+                                        load_fatal = True
+                                    elif method in {'session/prompt', 'session/load'}:
                                         self.fatal_observed = True
                             line_pending = parts[-1][-64000:]
                         elif update['sessionUpdate'] in {'tool_call', 'user_message_chunk'}:
                             if line_pending.strip() == AGY_FATAL_LINE:
                                 self.review_blocked = True
-                                if method in {'session/prompt', 'session/load'}:
+                                if method == 'session/load' and load_boundary is not None:
+                                    load_fatal = True
+                                elif method in {'session/prompt', 'session/load'}:
                                     self.fatal_observed = True
                             line_pending = ''
                     if on_update is not None:
@@ -205,8 +250,13 @@ class NativeOwner:
                         raise ProtocolError('Native ACP omitted structured result')
                     if method == 'session/prompt':
                         self.prompt_returned = True
-                    if method in {'session/prompt', 'session/load'} and load_after_boundary and (
-                        line_pending.strip() == AGY_FATAL_LINE
+                    if load_boundary is not None:
+                        _flush_load_user()
+                        # Keep resumed session/load fatal evidence provisional until shared chronology/ID attribution runs.
+                        self.review_blocked = prev_review_blocked or getattr(self, 'fatal_observed', False)
+                    elif method in {'session/prompt', 'session/load'} and load_after_boundary and (
+                        load_fatal
+                        or line_pending.strip() == AGY_FATAL_LINE
                         or fatal_error(public_text)
                         or _has_completed_fatal_line(checked_updates, require_terminated=False)
                     ):
@@ -245,6 +295,26 @@ class NativeOwner:
                 line_pending = ''
         self.drained_line_pending = line_pending
         return updates
+
+    def ensure_command_advertised(self, native_command, *, cold_timeout=None, settle_timeout=None):
+        if native_command in self.available_commands:
+            return True
+        cold = COMMAND_ADVERTISE_COLD_TIMEOUT if cold_timeout is None else cold_timeout
+        settle = COMMAND_ADVERTISE_SETTLE_TIMEOUT if settle_timeout is None else settle_timeout
+        if getattr(self, 'commands_advertised_count', 0) == 0:
+            if cold > 0:
+                self.request(
+                    None,
+                    dict(command=native_command, stop_on_advertise=True, initial_advertised_count=0),
+                    timeout=cold,
+                )
+            if native_command in self.available_commands:
+                return True
+        if getattr(self, 'commands_advertised_count', 0) > 0:
+            if settle > 0:
+                self.request(None, dict(command=native_command), timeout=settle)
+            return native_command in self.available_commands
+        return False
 
     def validate_workflow_update(self, raw, calls):
         if raw.get('sessionUpdate') not in {'tool_call','tool_call_update'}:
@@ -387,9 +457,6 @@ class NativeOwner:
         if orphan or dup:
             self.last_load_retried = True
             d1_updates = list(pre_drained) if prior_retry is not None else list(self.pending_drained)
-            for entry in updates:
-                if entry.get('sessionUpdate') == 'tool_call':
-                    self.pending_drained.append(dict(entry, _retry_create=(entry.get('tool_event') == 'tool_call')))
             d2_updates = self.drain_pending(check_cancel=check_cancel)
             self.last_load_drained += len(d2_updates)
             if prior_retry is not None:
@@ -598,6 +665,112 @@ class NativeOwner:
         return dict(kind=kind, returncode=self.proc.returncode)
 
 
+_TEAMWORK_HANDOFF_NAMES = frozenset({'invoke_subagent', 'send_message', 'ask_question'})
+_SWARM_COORDINATION_TOOLS = frozenset({'swarm', 'read_board', 'post_message', 'swarm_wait'})
+_SWARM_PENDING_WORKER_STATES = frozenset({'working', 'running', 'pending', 'in_progress'})
+_SWARM_TERMINAL_WORKER_STATES = frozenset({'completed', 'killed'})
+_SWARM_CHANNEL_NAME_RE = re.compile(r'^[a-z][a-z0-9-]{0,23}$')
+_SWARM_RESERVED_CHANNELS = frozenset({'main', 'all', 'here'})
+
+
+def _is_swarm_name_rune(ch):
+    if ch in {'_', '-'}:
+        return True
+    cat = unicodedata.category(ch)
+    return cat[0] == 'L' or cat == 'Nd'
+
+
+def _has_swarm_wake_mention(text):
+    """Match installed swarm_board/channels.mjs @name / @#channel wake addressing."""
+    if not isinstance(text, str) or '@' not in text:
+        return False
+    lower = text.lower()
+    n = len(lower)
+    idx = lower.find('@')
+    while idx >= 0:
+        if idx == 0 or not _is_swarm_name_rune(lower[idx - 1]):
+            if idx + 1 < n and lower[idx + 1] == '#':
+                j = idx + 2
+                while j < n and _is_swarm_name_rune(lower[j]):
+                    j += 1
+                channel = lower[idx + 2:j]
+                if _SWARM_CHANNEL_NAME_RE.fullmatch(channel) and channel not in _SWARM_RESERVED_CHANNELS:
+                    return True
+            else:
+                j = idx + 1
+                while j < n and _is_swarm_name_rune(lower[j]):
+                    j += 1
+                name = lower[idx + 1:j]
+                if name and name != 'coordinator' and any(ch not in {'_', '-'} for ch in name):
+                    return True
+        idx = lower.find('@', idx + 1)
+    return False
+
+
+def _classify_swarm_status_pending(output):
+    if not isinstance(output, dict) or not isinstance(output.get('workers'), list):
+        return None
+    workers = output['workers']
+    if not workers:
+        return None
+    states = [
+        row['status'] if isinstance(row, dict) and isinstance(row.get('status'), str) else None
+        for row in workers
+    ]
+    if any(state in _SWARM_PENDING_WORKER_STATES for state in states):
+        return True
+    if all(state in _SWARM_TERMINAL_WORKER_STATES for state in states):
+        return False
+    return None
+
+
+def _is_dispatch_handoff_tool(entry, mode, *, wake_post_tool_ids=()):
+    if not isinstance(entry, dict) or entry.get('sessionUpdate') != 'tool_call':
+        return False
+    title = entry.get('title')
+    if mode == 'teamwork':
+        return title in _TEAMWORK_HANDOFF_NAMES
+    if mode != 'swarm' or entry.get('status') != 'completed':
+        return False
+    if title == 'swarm':
+        swarm = entry.get('swarm') or {}
+        action = swarm.get('action')
+        if action == 'add':
+            return True
+        if action == 'model':
+            return swarm.get('name') not in (None, '', 'coordinator')
+        return False
+    if title == 'post_message':
+        return bool(entry.get('swarm_wake_handoff') or (entry.get('toolCallId') in wake_post_tool_ids))
+    return False
+
+
+def _is_handoff_tool(entry, mode, *, wake_post_tool_ids=()):
+    if _is_dispatch_handoff_tool(entry, mode, wake_post_tool_ids=wake_post_tool_ids):
+        return True
+    return (
+        isinstance(entry, dict)
+        and entry.get('sessionUpdate') == 'tool_call'
+        and mode == 'swarm'
+        and entry.get('status') == 'completed'
+        and entry.get('title') == 'swarm_wait'
+    )
+
+
+def _is_completed_swarm_status(entry):
+    return (
+        isinstance(entry, dict)
+        and entry.get('sessionUpdate') == 'tool_call'
+        and entry.get('status') == 'completed'
+        and entry.get('title') == 'swarm'
+        and (entry.get('swarm') or {}).get('action') == 'status'
+    )
+
+
+def _is_positive_terminal_swarm_status(entry):
+    return _is_completed_swarm_status(entry) and entry.get('native_work_pending') is False
+
+
 def normalize(update):
     kind = update.get('sessionUpdate')
     if kind in {'user_message_chunk', 'agent_message_chunk'}:
@@ -615,6 +788,7 @@ def normalize(update):
         if key in update:
             value[key] = update[key]
     args = update.get('args', update.get('rawInput', {}))
+    has_raw_output = 'rawOutput' in update
     if value.get('title') == 'run_workflow':
         for source in (update.get('args'), update.get('rawInput')):
             if isinstance(source, dict) and 'ScriptPath' not in source and isinstance(source.get('Script'), str):
@@ -624,23 +798,30 @@ def normalize(update):
                     break
     if value.get('title') == 'swarm' and isinstance(args, dict):
         value['swarm'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
-        output = update.get('rawOutput')
-        if args.get('action') == 'status' and isinstance(output,dict) and isinstance(output.get('workers'),list):
-            states = [row.get('status') for row in output['workers'] if isinstance(row,dict)]
-            value['native_work_pending'] = any(isinstance(state,str) and state in {'working','running','pending','in_progress'} for state in states)
-    elif kind == 'tool_call_update' and isinstance(args, dict):
-        value['swarm_update'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
-        output = update.get('rawOutput')
-        if isinstance(output, dict) and isinstance(output.get('workers'), list):
+        if has_raw_output:
+            pending = _classify_swarm_status_pending(update.get('rawOutput'))
+            if args.get('action') == 'status':
+                value['status_output_pending'] = pending
+                if pending is not None:
+                    value['native_work_pending'] = pending
+            elif kind == 'tool_call_update':
+                value['status_output_pending'] = pending
+    elif value.get('title') == 'post_message' and isinstance(args, dict) and isinstance(args.get('text'), str):
+        value['swarm_wake_handoff'] = _has_swarm_wake_mention(args['text'])
+    elif kind == 'tool_call_update':
+        if isinstance(args, dict):
+            value['swarm_update'] = {k: args[k] for k in ('action', 'name', 'model') if isinstance(args.get(k), str)}
+            if isinstance(args.get('text'), str):
+                value['post_message_wake_handoff'] = _has_swarm_wake_mention(args['text'])
+        if has_raw_output:
             # Resolve sparse output against this ID's metadata in snapshot, never guess a new ID.
-            states = [row.get('status') for row in output['workers'] if isinstance(row, dict)]
-            value['status_output_pending'] = any(isinstance(state, str) and
-                state in {'working','running','pending','in_progress'} for state in states)
+            value['status_output_pending'] = _classify_swarm_status_pending(update.get('rawOutput'))
     return value
 
 
 def snapshot(updates):
     result, tools = [], {}
+    skip_keys = {'tool_event', 'swarm_update', 'status_args_invalid', 'status_output_pending', 'post_message_wake_handoff', '_retry_create'}
     for value in updates:
         if value['sessionUpdate'] == 'tool_call':
             key = value['toolCallId']
@@ -655,12 +836,17 @@ def snapshot(updates):
                     raise ProtocolError('Native tool identity changed; reconciliation required')
                 if identity:
                     old['swarm']=dict(old.get('swarm',{}),**identity)
+                old.update({k:v for k,v in value.items() if k != 'swarm' and k not in skip_keys})
                 if ('status_output_pending' in value and old.get('title') == 'swarm'
                         and old.get('swarm', {}).get('action') == 'status'):
-                    old['native_work_pending'] = value['status_output_pending']
-                old.update({k:v for k,v in value.items() if k not in {'tool_event','swarm','swarm_update','status_args_invalid','status_output_pending'}})
+                    if value['status_output_pending'] is None:
+                        old.pop('native_work_pending', None)
+                    else:
+                        old['native_work_pending'] = value['status_output_pending']
+                if 'post_message_wake_handoff' in value and old.get('title') == 'post_message':
+                    old['swarm_wake_handoff'] = value['post_message_wake_handoff']
             else:
-                tools[key] = {k:v for k,v in value.items() if k not in {'tool_event','swarm_update','status_args_invalid','status_output_pending'}}
+                tools[key] = {k:v for k,v in value.items() if k not in skip_keys}
                 result.append(tools[key])
         elif result and result[-1]['sessionUpdate'] == value['sessionUpdate']:
             result[-1]['content']['text'] += value['content']['text']
@@ -671,7 +857,7 @@ def snapshot(updates):
 
 def snapshot_tolerant(updates):
     result, tools = [], {}
-    skip_keys = {'tool_event', 'swarm', 'swarm_update', 'status_args_invalid', 'status_output_pending'}
+    skip_keys = {'tool_event', 'swarm', 'swarm_update', 'status_args_invalid', 'status_output_pending', 'post_message_wake_handoff', '_retry_create'}
     for value in updates:
         if value['sessionUpdate'] == 'tool_call':
             key = value['toolCallId']
@@ -690,27 +876,41 @@ def snapshot_tolerant(updates):
                 new_s = _safe_tool_status(value)
                 if old_s in {'completed', 'failed'} and new_s in {'completed', 'failed'} and old_s != new_s:
                     raise ProtocolError('Native tool identity changed; reconciliation required')
+                status_regressed = old_s is not None and new_s is not None and _TOOL_STATUS_RANK[new_s] < _TOOL_STATUS_RANK[old_s]
                 for k, v in value.items():
                     if k in skip_keys:
                         continue
                     if k == 'status':
-                        if old_s is not None and new_s is not None and _TOOL_STATUS_RANK[new_s] < _TOOL_STATUS_RANK[old_s]:
+                        if status_regressed:
                             continue
                         old['status'] = v
+                    elif k == 'native_work_pending' and status_regressed:
+                        continue
                     elif k in {'title', 'kind'} and not v and old.get(k):
                         continue
                     else:
                         old[k] = v
-                if ('status_output_pending' in value and old.get('title') == 'swarm'
+                if (not status_regressed and 'status_output_pending' in value
+                        and old.get('title') == 'swarm'
                         and old.get('swarm', {}).get('action') == 'status'):
-                    old['native_work_pending'] = value['status_output_pending']
+                    if value['status_output_pending'] is None:
+                        old.pop('native_work_pending', None)
+                    else:
+                        old['native_work_pending'] = value['status_output_pending']
+                if 'post_message_wake_handoff' in value and old.get('title') == 'post_message':
+                    old['swarm_wake_handoff'] = value['post_message_wake_handoff']
             else:
-                entry = {k: v for k, v in value.items() if k not in {'tool_event', 'swarm_update', 'status_args_invalid', 'status_output_pending'}}
+                entry = {k: v for k, v in value.items() if k not in {'tool_event', 'swarm_update', 'status_args_invalid', 'status_output_pending', 'post_message_wake_handoff', '_retry_create'}}
                 if 'swarm' not in entry and value.get('swarm_update') and entry.get('title') == 'swarm':
                     entry['swarm'] = dict(value['swarm_update'])
                 if ('status_output_pending' in value and entry.get('title') == 'swarm'
                         and entry.get('swarm', {}).get('action') == 'status'):
-                    entry['native_work_pending'] = value['status_output_pending']
+                    if value['status_output_pending'] is None:
+                        entry.pop('native_work_pending', None)
+                    else:
+                        entry['native_work_pending'] = value['status_output_pending']
+                if 'post_message_wake_handoff' in value and entry.get('title') == 'post_message':
+                    entry['swarm_wake_handoff'] = value['post_message_wake_handoff']
                 tools[key] = entry
                 result.append(entry)
         elif result and result[-1]['sessionUpdate'] == value['sessionUpdate']:
@@ -962,6 +1162,203 @@ def _coalesce_message_slots(updates):
     return slots
 
 
+def _prior_turn_tool_ids(store, task, *, baseline=None, predecessor_history=None):
+    """Collect established prior-turn toolCallIds from baseline, predecessor replay, and read-only store events."""
+    ids = set()
+    for src in (baseline, predecessor_history):
+        for entry in (src or ()):
+            if entry.get('sessionUpdate') == 'tool_call' and entry.get('toolCallId'):
+                ids.add(entry['toolCallId'])
+    turn = task.get('turn', 1) if isinstance(task, dict) else 1
+    task_id = task.get('id') if isinstance(task, dict) else None
+    if turn > 1 and task_id and callable(getattr(store, 'events', None)):
+        try:
+            events = store.events(task_id, None)
+        except (KeyError, TypeError, ValueError):
+            events = ()
+        for ev in (events or ()):
+            if ev.get('turn', 0) < turn and ev.get('kind') == 'tool':
+                tid = safe_tool_id((ev.get('text') or '').split(' ', 1)[0])
+                if tid:
+                    ids.add(tid)
+    return ids
+
+
+def _retry_pipe_tool_ids(retry_state, pending_drained=()):
+    """Collect toolCallIds observed on physically pipe-drained d1/d2 streams."""
+    ids = {
+        e['toolCallId'] for e in (pending_drained or ())
+        if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId')
+    }
+    def _walk(state):
+        if not isinstance(state, dict):
+            return
+        if state.get('prior') is not None:
+            _walk(state['prior'])
+        for key in ('d1_updates', 'd2_updates'):
+            for entry in (state.get(key) or ()):
+                if entry.get('sessionUpdate') == 'tool_call' and entry.get('toolCallId'):
+                    ids.add(entry['toolCallId'])
+    _walk(retry_state)
+    return ids
+
+
+def _coalesce_user_chunks(updates):
+    """Coalesce adjacent user_message_chunk frames while preserving wire order of all other frames."""
+    result = []
+    for entry in (updates or ()):
+        if entry.get('sessionUpdate') == 'user_message_chunk':
+            text = _entry_text(entry) or ''
+            if result and result[-1].get('sessionUpdate') == 'user_message_chunk':
+                result[-1]['content']['text'] += text
+            else:
+                result.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=text)))
+        else:
+            result.append(entry)
+    return result
+
+
+def _attribute_attempt_updates(attempt_updates, *, resumed=False, baseline=None, prompt_text=None,
+                               known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                               boundary_confirmed=None):
+    """Attribute Attempt #1 session/load entries using current IDs, predecessor IDs, and clean corroboration."""
+    items = _coalesce_user_chunks(attempt_updates)
+    if not items:
+        return dict(inflight_current=[], turn_replay=[], ambiguous_tools=[], validation_tools=[])
+    if not (resumed or baseline):
+        def _is_initial_user(entry):
+            if entry.get('sessionUpdate') != 'user_message_chunk':
+                return False
+            utext = _entry_text(entry) or ''
+            if not utext:
+                return False
+            if dialogue_texts is not None:
+                if utext in dialogue_texts:
+                    return False
+            elif utext.startswith('CALLCLI_DIALOGUE '):
+                return False
+            return True
+        first_user = next((i for i, e in enumerate(items) if _is_initial_user(e)), None)
+        if first_user is None:
+            inflight = []
+            turn_replay = items
+        else:
+            inflight = items[:first_user]
+            turn_replay = items[first_user:]
+        validation_tools = [e for e in items if e.get('sessionUpdate') == 'tool_call']
+        return dict(inflight_current=inflight, turn_replay=turn_replay, ambiguous_tools=[], validation_tools=validation_tools)
+
+    current_ids = {tid for tid in (known_current_ids or ()) if tid}
+    predecessor_ids = {tid for tid in (known_predecessor_ids or ()) if tid} - current_ids
+    turn_replay = []
+    prefix_end = len(items)
+    first_user = next((i for i, e in enumerate(items) if e.get('sessionUpdate') == 'user_message_chunk'), None)
+    saved_part = items[first_user:] if first_user is not None else []
+    if saved_part and prompt_text and boundary_confirmed is not False:
+        sliced = _slice_after_prompt_boundary(
+            saved_part, prompt_text,
+            dialogue_texts=dialogue_texts, predecessor_ids=predecessor_ids, current_ids=current_ids,
+        )
+        if sliced is not None:
+            turn_replay = sliced[1]
+            prefix_end = len(items) - len(turn_replay)
+
+    prefix_items = items[:prefix_end]
+    turn_user_indices = []
+    for idx, entry in enumerate(prefix_items):
+        if entry.get('sessionUpdate') != 'user_message_chunk':
+            continue
+        utext = _entry_text(entry) or ''
+        if not utext:
+            continue
+        if dialogue_texts is not None:
+            if utext in dialogue_texts:
+                continue
+        elif utext.startswith('CALLCLI_DIALOGUE '):
+            continue
+        turn_user_indices.append(idx)
+
+    if turn_replay and turn_user_indices:
+        prior_user_start, prior_user_end = turn_user_indices[0], len(prefix_items)
+    elif len(turn_user_indices) >= 2:
+        prior_user_start, prior_user_end = turn_user_indices[0], turn_user_indices[-1]
+    else:
+        prior_user_start = prior_user_end = None
+
+    inflight_current = []
+    ambiguous_tools = []
+    validation_tools = []
+    for idx, entry in enumerate(prefix_items):
+        if entry.get('sessionUpdate') != 'tool_call':
+            continue
+        tid = entry.get('toolCallId')
+        if tid and tid in current_ids:
+            inflight_current.append(entry)
+            validation_tools.append(entry)
+        elif tid and tid in predecessor_ids:
+            continue
+        elif prior_user_start is not None and prior_user_start <= idx < prior_user_end:
+            continue
+        else:
+            ambiguous_tools.append(entry)
+            validation_tools.append(entry)
+
+    for entry in turn_replay:
+        if entry.get('sessionUpdate') == 'tool_call':
+            validation_tools.append(entry)
+
+    return dict(
+        inflight_current=inflight_current,
+        turn_replay=turn_replay,
+        ambiguous_tools=ambiguous_tools,
+        validation_tools=validation_tools,
+    )
+
+
+def _split_attempt_for_turn(attempt_updates, *, resumed=False, baseline=None, prompt_text=None,
+                            known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                            boundary_confirmed=None):
+    """Separate Attempt #1 session/load entries into (inflight_live, turn_replay) via unified attribution."""
+    attr = _attribute_attempt_updates(
+        attempt_updates,
+        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+        known_current_ids=known_current_ids, known_predecessor_ids=known_predecessor_ids,
+        dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+    )
+    return attr['inflight_current'], attr['turn_replay']
+
+
+def _collect_reconcile_tools(drained, retry_state=None, *, resumed=False, baseline=None, prompt_text=None,
+                             known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                             boundary_confirmed=None):
+    """Collect live pipe-drained and current/ambiguous retry tool frames in wire order without historical replay."""
+    if retry_state is None:
+        return [e for e in (drained or ()) if e.get('sessionUpdate') == 'tool_call']
+    effective_current_ids = set(known_current_ids or ()) | _retry_pipe_tool_ids(retry_state, drained)
+    out = []
+    def _walk(state):
+        if not isinstance(state, dict):
+            return
+        if state.get('prior') is not None:
+            _walk(state['prior'])
+        for entry in (state.get('d1_updates') or ()):
+            if entry.get('sessionUpdate') == 'tool_call':
+                out.append(entry)
+        attr = _attribute_attempt_updates(
+            state.get('attempt_updates'),
+            resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+            known_current_ids=effective_current_ids, known_predecessor_ids=known_predecessor_ids,
+            dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+        )
+        for entry in attr['validation_tools']:
+            out.append(dict(entry, _retry_create=(entry.get('tool_event') == 'tool_call')))
+        for entry in (state.get('d2_updates') or ()):
+            if entry.get('sessionUpdate') == 'tool_call':
+                out.append(entry)
+    _walk(retry_state)
+    return out
+
+
 def _reconcile_drained_tools(drained, history, *, call_site='drain_reconcile', interaction_seq=0):
     """Validate raw drained and retry tool frames in wire order without collapsing via snapshot()."""
     history_tools = {e['toolCallId']: e for e in history if e.get('sessionUpdate') == 'tool_call'}
@@ -1184,10 +1581,19 @@ def _reconcile_retry_messages(retry_state, history_msgs, reconciled_msgs, prior_
 
 
 def _reconcile_drained(drained, history, fresh, recovered, *, retry_state=None, prior_messages=(),
-                       persisted_prior_slots=(), call_site='drain_reconcile', interaction_seq=0):
+                       persisted_prior_slots=(), call_site='drain_reconcile', interaction_seq=0,
+                       resumed=False, baseline=None, prompt_text=None,
+                       known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                       boundary_confirmed=None):
     if not drained and retry_state is None:
         return
-    _reconcile_drained_tools(drained, history, call_site=call_site, interaction_seq=interaction_seq)
+    tool_entries = _collect_reconcile_tools(
+        drained, retry_state,
+        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+        known_current_ids=known_current_ids, known_predecessor_ids=known_predecessor_ids,
+        dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+    )
+    _reconcile_drained_tools(tool_entries, history, call_site=call_site, interaction_seq=interaction_seq)
     recovered_msgs = [
         dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=suffix))
         for _, suffix, _ in recovered if suffix
@@ -1209,6 +1615,41 @@ def _reconcile_drained(drained, history, fresh, recovered, *, retry_state=None, 
 
 
 
+
+
+def _harvest_post_message_wake_ids(wire_entries, validated_entries, wake_post_tool_ids):
+    """Fold validated ID-local post_message wake markers from wire frames before drain clear."""
+    persisted_by_id = {
+        e['toolCallId']: e for e in (validated_entries or ())
+        if isinstance(e, dict) and e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId')
+    }
+    wire_wake = {}
+    for e in (wire_entries or ()):
+        if not isinstance(e, dict) or e.get('sessionUpdate') != 'tool_call':
+            continue
+        tid = e.get('toolCallId')
+        if not tid:
+            continue
+        persisted = persisted_by_id.get(tid)
+        if persisted is None or persisted.get('title') != 'post_message':
+            continue
+        if 'swarm_wake_handoff' in e:
+            wire_wake[tid] = bool(e['swarm_wake_handoff'])
+        elif 'post_message_wake_handoff' in e:
+            wire_wake[tid] = bool(e['post_message_wake_handoff'])
+    for tid, persisted in persisted_by_id.items():
+        if persisted.get('title') != 'post_message':
+            continue
+        if 'swarm_wake_handoff' in persisted:
+            if persisted['swarm_wake_handoff']:
+                wake_post_tool_ids.add(tid)
+            else:
+                wake_post_tool_ids.discard(tid)
+        elif tid in wire_wake:
+            if wire_wake[tid]:
+                wake_post_tool_ids.add(tid)
+            else:
+                wake_post_tool_ids.discard(tid)
 
 
 def dialogue_body(task, entry):
@@ -1253,10 +1694,16 @@ def brief(task, policy):
     preference = ('Requested worker model preference: '+task['agy_worker_model']+'.\n'
                   if task.get('agy_worker_model') else '')
     mode = task.get('agy_mode', 'swarm')
-    bridge = ('Native delegation acknowledgements (invoke_subagent/send_message/ask_question) are progress, not final results. '
-              'Use CALLCLI_STAGE for delegation or ongoing work and CALLCLI_QUESTION Q<n> for questions needed from the original source. '
-              'Return the actual final public result only when ready; do not return a delegation acknowledgement as the final answer.\n'
-              if mode == 'teamwork' else '')
+    if mode == 'teamwork':
+        bridge = ('Native delegation acknowledgements (invoke_subagent/send_message/ask_question) are progress, not final results. '
+                  'Use CALLCLI_STAGE for delegation or ongoing work and CALLCLI_QUESTION Q<n> for questions needed from the original source. '
+                  'Return the actual final public result only when ready; do not return a delegation acknowledgement as the final answer.\n')
+    elif mode == 'swarm':
+        bridge = ('Native swarm launch or board status notices (swarm add/status, Run /swarm board) are progress, not final results. '
+                  'Use CALLCLI_STAGE for launch or ongoing board work and CALLCLI_QUESTION Q<n> for questions needed from the original source. '
+                  'Return the actual final public result only when ready; do not return a launch or waiting acknowledgement as the final answer.\n')
+    else:
+        bridge = ''
     return '/'+mode+'\n'+protocol_prompt(policy+guidance(task)+bridge+preference+task['prompt'])
 
 
@@ -1274,20 +1721,247 @@ _DEGRADABLE_HISTORY_REASONS = {
     'resumed_boundary_missing',
 }
 try:
-    from .agy import AGY_FATAL_LINE as _AGY_FATAL_CONST, BOARD_HINT_RE as _BOARD_HINT_RE
+    from .agy import (
+        AGY_FATAL_LINE as _AGY_FATAL_CONST,
+        BOARD_HINT_RE as _BOARD_HINT_RE,
+        is_standalone_incomplete_diagnostic as _is_standalone_incomplete_diagnostic,
+    )
 except ImportError:
-    from agy import AGY_FATAL_LINE as _AGY_FATAL_CONST, BOARD_HINT_RE as _BOARD_HINT_RE
+    from agy import (
+        AGY_FATAL_LINE as _AGY_FATAL_CONST,
+        BOARD_HINT_RE as _BOARD_HINT_RE,
+        is_standalone_incomplete_diagnostic as _is_standalone_incomplete_diagnostic,
+    )
 
 
-def _iter_retry_streams(retry_state):
+_SWARM_CLAUSE_SPLIT_RE = re.compile(r'[\r\n;!?！？。]+|\.(?:\s+|$)')
+_SWARM_WAITING_PROGRESS_RE = re.compile(
+    r'\b(?:'
+    r'waiting\s+(?:on|for)|'
+    r'(?:will|continu(?:e|es|ed|ing)\s+to)\s+wait\s+(?:on|for)|'
+    r'awaiting(?:\s+(?:its|their|his|her|the|a|an|worker|workers|swarm|board|confirmation|deliverable|deliverables|result|results|output|outputs|reply|replies|response|responses|completion|finish|patch|report|verification|follow[- ]up))?|'
+    r'still\s+(?:working|running|pending|in\s+progress|processing|awaiting|waiting)|'
+    r'remains?\s+(?:working|running|pending|in\s+progress)|'
+    r'(?:work|worker|workers|right|left|verifier|task|swarm)\s+(?:is|are)\s+(?:still\s+)?(?:working|running|pending|in\s+progress)|'
+    r'not\s+(?:yet\s+)?(?:ready|done|finished|completed)|'
+    r'will\s+(?:report|update|reply|finish|proceed|write|combine)\s+(?:once|when|after)'
+    r')\b'
+    r'|(?:'
+    r'等待.{0,24}(?:完成|结果|交付|回复|确认|更新|返回|就绪)|'
+    r'等待(?:中|完成|结果|交付|回复|确认)|'
+    r'仍在(?:运行|处理|工作|等待|执行)|'
+    r'尚未(?:完成|就绪|结束)|'
+    r'暂未(?:完成|就绪)|'
+    r'正在(?:等待|处理|执行)'
+    r')',
+    re.IGNORECASE,
+)
+_SWARM_NEGATED_WAIT_RE = re.compile(
+    r'\b(?:'
+    r'no\s+longer\s+(?:waiting|awaiting|working|running|pending)|'
+    r'not\s+(?:waiting|awaiting)|'
+    r'without\s+waiting|'
+    r'finished\s+waiting|'
+    r'done\s+waiting|'
+    r'no\s+workers?\s+(?:are|is)\s+(?:still\s+)?(?:working|running|pending)'
+    r')\b'
+    r'|(?:不再等待|无需等待|不需要等待|没有.{0,8}仍在运行)',
+    re.IGNORECASE,
+)
+_SWARM_LAUNCH_ACK_RE = re.compile(
+    r'\b(?:'
+    r'(?:launched|spawned|dispatched|started|added|assigned|delegated|messaged|notified|pinged|nudged|re-dispatched|re-assigned|switched|reassigned|redispatched)\b|'
+    r'(?:sent|posted)\s+(?:a\s+|the\s+)?(?:follow[- ]up|brief|task|message|instructions|update|ping|nudge|prompt|request)\b'
+    r')'
+    r'|(?:已启动|已派发|已分配|已创建|已添加|已通知|已发送|已指派|已拉起|已切换)',
+    re.IGNORECASE,
+)
+_SWARM_EXPLICIT_DISPATCH_ACK_RE = re.compile(
+    r'\b(?:'
+    r'(?:launched|spawned|dispatched|delegated|messaged|notified|pinged|nudged|re-dispatched|re-assigned|reassigned|redispatched)\b|'
+    r'(?:sent|posted)\s+(?:a\s+|the\s+)?(?:follow[- ]up|brief|task|message|instructions|update|ping|nudge|prompt|request)\b'
+    r')'
+    r'|(?:已派发|已分配|已指派|已拉起|已通知|已发送)',
+    re.IGNORECASE,
+)
+_SWARM_TARGET_CONTEXT_RE = re.compile(
+    r'\b(?:worker|workers|swarm|board|subagent|subagents|agent|agents|member|members|roster|slice|slices|task|tasks|brief|briefs)\b'
+    r'|@[a-z0-9][a-z0-9_-]*'
+    r'|(?:worker|成员|看板|任务|并行|分工|子任务|代理)',
+    re.IGNORECASE,
+)
+_SWARM_FINAL_DELIVERABLE_RE = re.compile(
+    r'\b(?:'
+    r'verified|'
+    r'final\s+(?:result|results|answer|output|report|deliverable|summary)|'
+    r'(?:all\s+|\d+(?:/\d+)?\s+)(?:tests?|checks?)\s+passed|'
+    r'ran\s+\d+\s+tests?\s+in|'
+    r'swarm\s+complete|'
+    r'dialogue\s+(?:terminal\s+)?resolved|'
+    r'requested\s+analysis\s+is\s+complete'
+    r')\b'
+    r'|^(?:#{1,6}\s*|\*\*)?(?:actual\s+results?|verification|test\s+results?|remaining\s+issues?|final\s+(?:result|results|answer|output|report|deliverable|summary))(?:\*\*)?\s*(?:[:：]|$)'
+    r'|^(?:#{1,6}\s*|\*\*)?(?:实际结果|验证|验证结果|测试结果|剩余问题|最终结果|最终报告|最终交付|结论)(?:\*\*)?\s*(?:[:：]|$)'
+    r'|(?:全部|\d+(?:/\d+)?\s*(?:项|个)?)(?:测试|检查|用例)(?:均已|已)?通过'
+    r'|(?<![尚未暂未未])已完成(?:全部|所有)?(?:修复|实现|改造|改动|任务|交付|汇总|校验|验收)'
+    r'|(?:已完成并验证|最终结果|已验证)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_swarm_waiting_progress_text(body):
+    for clause in _SWARM_CLAUSE_SPLIT_RE.split(body or ''):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if _SWARM_WAITING_PROGRESS_RE.search(clause) and not _SWARM_NEGATED_WAIT_RE.search(clause):
+            return True
+    return False
+
+
+def _is_swarm_launch_ack_text(body, *, strict=False):
+    stripped = (body or '').strip()
+    if not stripped:
+        return False
+    if _SWARM_FINAL_DELIVERABLE_RE.search(stripped):
+        return False
+    if not strict and len(stripped) <= 1200:
+        return bool(_SWARM_LAUNCH_ACK_RE.search(stripped))
+    window = (stripped[:1200] + '\n' + stripped[-400:]) if len(stripped) > 1200 else stripped
+    has_window_context = bool(_SWARM_TARGET_CONTEXT_RE.search(window))
+    for clause in _SWARM_CLAUSE_SPLIT_RE.split(window):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if _SWARM_EXPLICIT_DISPATCH_ACK_RE.search(clause) and (len(stripped) <= 1200 or has_window_context):
+            return True
+        if _SWARM_LAUNCH_ACK_RE.search(clause) and _SWARM_TARGET_CONTEXT_RE.search(clause):
+            return True
+    return False
+
+
+def _classify_swarm_slice(entries, text, *, wake_post_tool_ids=(), after_prior_handoff=False,
+                          exclude_handoff_ids=None, exclude_status_ids=None, allow_empty_handoff_hold=False):
+    """Classify one Swarm public slice without blocking non-waiting finals."""
+    items = list(entries or ())
+    last_handoff_idx = max(
+        (
+            i for i, e in enumerate(items)
+            if _is_handoff_tool(e, 'swarm', wake_post_tool_ids=wake_post_tool_ids)
+            and (exclude_handoff_ids is None or e.get('toolCallId') not in exclude_handoff_ids)
+        ),
+        default=-1,
+    )
+    last_dispatch_idx = max(
+        (
+            i for i, e in enumerate(items)
+            if _is_dispatch_handoff_tool(e, 'swarm', wake_post_tool_ids=wake_post_tool_ids)
+            and (exclude_handoff_ids is None or e.get('toolCallId') not in exclude_handoff_ids)
+        ),
+        default=-1,
+    )
+    has_terminal_after_handoff = (
+        last_handoff_idx >= 0
+        and any(
+            _is_positive_terminal_swarm_status(e)
+            and (exclude_status_ids is None or e.get('toolCallId') not in exclude_status_ids)
+            for e in items[last_handoff_idx + 1:]
+        )
+    )
+    has_unresolved_handoff = (last_handoff_idx >= 0) and (not has_terminal_after_handoff)
+    has_terminal_after_dispatch = (
+        last_dispatch_idx >= 0
+        and any(
+            _is_positive_terminal_swarm_status(e)
+            and (exclude_status_ids is None or e.get('toolCallId') not in exclude_status_ids)
+            for e in items[last_dispatch_idx + 1:]
+        )
+    )
+    has_unresolved_dispatch = (last_dispatch_idx >= 0) and (not has_terminal_after_dispatch)
+    after_wait = has_unresolved_handoff and (last_handoff_idx > last_dispatch_idx)
+    has_non_swarm_work_after_handoff = (
+        last_handoff_idx >= 0
+        and any(
+            isinstance(e, dict)
+            and e.get('sessionUpdate') == 'tool_call'
+            and e.get('status') == 'completed'
+            and e.get('title') not in _SWARM_COORDINATION_TOOLS
+            for e in items[last_handoff_idx + 1:]
+        )
+    )
+    latest_status_idx = -1
+    latest_status_pending = None
+    for idx, entry in enumerate(items):
+        if (
+            _is_completed_swarm_status(entry)
+            and (exclude_status_ids is None or entry.get('toolCallId') not in exclude_status_ids)
+        ):
+            latest_status_idx = idx
+            latest_status_pending = entry.get('native_work_pending')
+    has_fresh_working_status = (latest_status_idx >= 0 and latest_status_pending is True)
+    has_fresh_terminal_status = (
+        latest_status_idx >= 0
+        and latest_status_pending is False
+        and latest_status_idx > last_handoff_idx
+    )
+
+    if _is_standalone_incomplete_diagnostic(text) is not None:
+        interim = False
+    else:
+        raw_lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+        body = '\n'.join(line for line in raw_lines if not _BOARD_HINT_RE.fullmatch(line)).strip()
+        if not raw_lines:
+            interim = bool(allow_empty_handoff_hold and has_unresolved_handoff)
+        elif not body:
+            interim = bool(has_unresolved_handoff)
+        else:
+            swarm_work_context = (
+                (after_prior_handoff and not has_fresh_terminal_status)
+                or has_unresolved_handoff
+                or has_fresh_working_status
+            )
+            if not swarm_work_context:
+                interim = False
+            elif _is_swarm_waiting_progress_text(body):
+                interim = True
+            elif has_unresolved_dispatch and not has_non_swarm_work_after_handoff and _is_swarm_launch_ack_text(body, strict=after_wait):
+                interim = True
+            else:
+                interim = False
+    return dict(
+        interim=interim,
+        has_unresolved_handoff=has_unresolved_handoff,
+        has_fresh_terminal_status=has_fresh_terminal_status,
+    )
+
+
+def _iter_retry_streams(retry_state, *, resumed=False, baseline=None, prompt_text=None,
+                        known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                        boundary_confirmed=None):
     if not isinstance(retry_state, dict):
         return
-    if retry_state.get('prior') is not None:
-        yield from _iter_retry_streams(retry_state['prior'])
-    for key in ('d1_updates', 'attempt_updates', 'd2_updates'):
-        stream = retry_state.get(key)
-        if stream:
-            yield stream
+    effective_current_ids = set(known_current_ids or ()) | _retry_pipe_tool_ids(retry_state)
+    def _walk(state):
+        if not isinstance(state, dict):
+            return
+        if state.get('prior') is not None:
+            yield from _walk(state['prior'])
+        if state.get('d1_updates'):
+            yield state['d1_updates']
+        if state.get('attempt_updates'):
+            attr = _attribute_attempt_updates(
+                state['attempt_updates'],
+                resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                known_current_ids=effective_current_ids, known_predecessor_ids=known_predecessor_ids,
+                dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+            )
+            if attr['inflight_current']:
+                yield attr['inflight_current']
+            if attr['turn_replay']:
+                yield attr['turn_replay']
+        if state.get('d2_updates'):
+            yield state['d2_updates']
+    yield from _walk(retry_state)
 
 
 def _has_completed_fatal_line(updates, *, require_terminated=False):
@@ -1318,6 +1992,36 @@ def _updates_have_fatal(updates, fatal_fn=None, *, require_terminated=False):
     if fatal_fn is not None and not require_terminated:
         text = ''.join(_entry_text(e) or '' for e in (updates or ()) if e.get('sessionUpdate') == 'agent_message_chunk')
         return bool(text) and fatal_fn(text)
+    return False
+
+
+def _has_attributed_load_fatal(owner, turn_history, *, fatal_fn, resumed=False, baseline=None, prompt_text=None,
+                               known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                               boundary_confirmed=True, extra_streams=()):
+    """Shared fatal attribution across foreground/pipe guards, retry streams, and validated current turn replay."""
+    if getattr(owner, 'fatal_observed', False):
+        return True
+    if _updates_have_fatal(getattr(owner, 'pending_drained', ()), fatal_fn, require_terminated=True):
+        return True
+    retry_state = getattr(owner, 'pending_retry_state', None)
+    if retry_state is not None:
+        for stream in _iter_retry_streams(
+            retry_state,
+            resumed=resumed,
+            baseline=baseline,
+            prompt_text=prompt_text,
+            known_current_ids=known_current_ids,
+            known_predecessor_ids=known_predecessor_ids,
+            dialogue_texts=dialogue_texts,
+            boundary_confirmed=boundary_confirmed,
+        ):
+            if _updates_have_fatal(stream, fatal_fn):
+                return True
+    if turn_history is not None and _updates_have_fatal(turn_history, fatal_fn):
+        return True
+    for stream in (extra_streams or ()):
+        if _updates_have_fatal(stream, fatal_fn):
+            return True
     return False
 
 
@@ -1355,7 +2059,10 @@ def _salvage_wire_signals(updates):
 
 
 def _iter_salvage_slices(retry_state, pending_drained, *, current_interaction, baseline=None,
-                         prompt_text=None, task=None, commands=None, pre_dialogue_history=None, resumed=False):
+                         prompt_text=None, task=None, commands=None, pre_dialogue_history=None, resumed=False,
+                         known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                         boundary_confirmed=None, section_splitter=None):
+    effective_current_ids = set(known_current_ids or ()) | _retry_pipe_tool_ids(retry_state, pending_drained)
     def _walk_retry(r_state):
         if not isinstance(r_state, dict):
             return
@@ -1365,38 +2072,38 @@ def _iter_salvage_slices(retry_state, pending_drained, *, current_interaction, b
             yield current_interaction, r_state['d1_updates'], True
         att = r_state.get('attempt_updates')
         if att:
-            first_user = next((i for i, e in enumerate(att) if e.get('sessionUpdate') == 'user_message_chunk'), None)
-            if first_user is None:
-                yield current_interaction, att, True
-            else:
-                if first_user > 0:
-                    yield current_interaction, att[:first_user], True
-                saved_part = list(att[first_user:])
-                if (baseline or resumed) and prompt_text:
-                    sliced = _slice_after_prompt_boundary(saved_part, prompt_text)
-                    turn_part = sliced[1] if sliced is not None else []
-                else:
-                    turn_part = saved_part
-                if turn_part:
-                    if task is not None and commands is not None:
-                        try:
-                            att_secs = history_sections(turn_part, task, commands)
-                        except ProtocolError:
-                            att_secs = {current_interaction: turn_part}
-                    else:
+            attr = _attribute_attempt_updates(
+                att,
+                resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                known_current_ids=effective_current_ids, known_predecessor_ids=known_predecessor_ids,
+                dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+            )
+            inflight = attr['inflight_current']
+            turn_part = attr['turn_replay']
+            if inflight:
+                yield current_interaction, inflight, True
+            if turn_part:
+                if section_splitter is not None:
+                    att_secs = section_splitter(turn_part)
+                elif task is not None and commands is not None:
+                    try:
+                        att_secs = history_sections(turn_part, task, commands)
+                    except ProtocolError:
                         att_secs = {current_interaction: turn_part}
-                    if current_interaction > 0 and current_interaction not in att_secs and att_secs:
-                        m_seq = max(att_secs)
-                        pre_p, post_p = _extract_post_dialogue_entries(att_secs[m_seq], pre_dialogue_history or ())
-                        att_secs[m_seq] = pre_p
-                        att_secs[current_interaction] = post_p
-                    for a_seq, a_sec in sorted(att_secs.items()):
-                        if a_sec:
-                            yield a_seq, a_sec, False
+                else:
+                    att_secs = {current_interaction: turn_part}
+                if current_interaction > 0 and current_interaction not in att_secs and att_secs:
+                    m_seq = max(att_secs)
+                    pre_p, post_p = _extract_post_dialogue_entries(att_secs[m_seq], pre_dialogue_history or ())
+                    att_secs[m_seq] = pre_p
+                    att_secs[current_interaction] = post_p
+                for a_seq, a_sec in sorted(att_secs.items()):
+                    if a_sec:
+                        yield a_seq, a_sec, False
         if r_state.get('d2_updates'):
             yield current_interaction, r_state['d2_updates'], True
     yield from _walk_retry(retry_state)
-    if pending_drained:
+    if pending_drained and retry_state is None:
         yield current_interaction, pending_drained, True
 
 
@@ -1447,11 +2154,20 @@ def _reconcile_resumed_live_tools(deg_sections, history, *, call_site='resumed_l
                     entry.update({k: v for k, v in persisted.items() if k != 'sessionUpdate'})
 
 
-def _check_degraded_drained_tools(drained, history, *, call_site='drain_reconcile', interaction_seq=0):
+def _check_degraded_drained_tools(drained, history, *, call_site='drain_reconcile', interaction_seq=0,
+                                  retry_state=None, resumed=False, baseline=None, prompt_text=None,
+                                  known_current_ids=(), known_predecessor_ids=(), dialogue_texts=None,
+                                  boundary_confirmed=None):
     """Enforce tool conflict, status regression, and vanished failed-tool safety even under compacted history."""
     history_tools = {e['toolCallId']: e for e in history if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId')}
     seen_tools = {}
-    for entry in (drained or ()):
+    tool_entries = _collect_reconcile_tools(
+        drained, retry_state,
+        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+        known_current_ids=known_current_ids, known_predecessor_ids=known_predecessor_ids,
+        dialogue_texts=dialogue_texts, boundary_confirmed=boundary_confirmed,
+    )
+    for entry in tool_entries:
         if entry.get('sessionUpdate') != 'tool_call':
             continue
         tid = entry.get('toolCallId')
@@ -1593,19 +2309,35 @@ def _extract_post_dialogue_entries(entries, pre_history):
     return pre_part, list(pending_users) + list(entries[idx:])
 
 
-def _slice_after_prompt_boundary(history, prompt_text):
+def _slice_after_prompt_boundary(history, prompt_text, *, dialogue_texts=None, predecessor_ids=(), current_ids=()):
     if not prompt_text:
         return None
+    history = _coalesce_user_chunks(history)
+    pred_only = set(predecessor_ids or ()) - set(current_ids or ())
     for i in range(len(history) - 1, -1, -1):
         e = history[i]
-        if e.get('sessionUpdate') == 'user_message_chunk':
-            utext = e.get('content', {}).get('text', '')
-            if utext == prompt_text or utext.endswith(prompt_text):
-                prefix = utext[:-len(prompt_text)] if utext != prompt_text else ''
-                base = list(history[:i])
-                if prefix:
-                    base.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=prefix)))
-                return base, list(history[i:])
+        if e.get('sessionUpdate') != 'user_message_chunk':
+            continue
+        utext = e.get('content', {}).get('text', '')
+        if not isinstance(utext, str) or not utext:
+            continue
+        if dialogue_texts is not None:
+            if utext in dialogue_texts:
+                continue
+        elif utext.startswith('CALLCLI_DIALOGUE '):
+            continue
+        if utext == prompt_text or utext.endswith(prompt_text):
+            if pred_only and any(
+                item.get('sessionUpdate') == 'tool_call' and item.get('toolCallId') in pred_only
+                for item in history[i + 1:]
+            ):
+                return None
+            prefix = utext[:-len(prompt_text)] if utext != prompt_text else ''
+            base = list(history[:i])
+            if prefix:
+                base.append(dict(sessionUpdate='user_message_chunk', content=dict(type='text', text=prefix)))
+            return base, list(history[i:])
+        return None
     return None
 
 
@@ -1777,6 +2509,9 @@ def run_native(store, task, emit, policy):
             resumed = False
             if task.get('native_session_id'):
                 owner.session_id = task['native_session_id']
+                caps = task.get('native_capabilities', {})
+                if caps.get('session_id') == owner.session_id:
+                    owner.available_commands.update(caps.get('advertised_commands', []))
                 if task.get('native_resume_session_id') == owner.session_id:
                     resumed = True
                     metadata = owner.resume()
@@ -1791,21 +2526,26 @@ def run_native(store, task, emit, policy):
                 _, baseline = owner.load()
             mode = task.get('agy_mode', 'swarm')
             native_command = 'run-workflow' if mode == 'dynamic' else mode
-            if resumed:
-                caps = task.get('native_capabilities', {})
-                if caps.get('session_id') == owner.session_id:
-                    owner.available_commands.update(caps.get('advertised_commands', []))
-            if native_command not in owner.available_commands:
-                owner.request(None, dict(command=native_command), timeout=1)
-            if native_command not in owner.available_commands and (mode in {'dynamic','teamwork'} or owner.created_session or owner.available_commands):
-                raise ProtocolError('Native '+native_command+' command not advertised; no prompt or fallback')
-            store.update(task['id'], native_capabilities=dict(load_session=True, close_supported=True,
-                resume_supported=owner.resume_supported, session_id=owner.session_id,
-                advertised_commands=sorted(owner.available_commands)))
             selected = owner.select(metadata, allow_load=not resumed)
             task = store.update(task['id'], **selected)
             if owner.created_session:
                 _, baseline = owner.load()
+            advertised = owner.ensure_command_advertised(native_command)
+            adv_count = getattr(owner, 'commands_advertised_count', 0)
+            store.update(task['id'], native_capabilities=dict(load_session=True, close_supported=True,
+                resume_supported=owner.resume_supported, session_id=owner.session_id,
+                advertised_commands=sorted(owner.available_commands),
+                commands_advertised_count=adv_count))
+            if not advertised and (mode in {'dynamic', 'teamwork'} or owner.created_session or owner.available_commands or adv_count > 0):
+                obs = dict(store.get(task['id']).get('native_observation') or {})
+                obs.update(
+                    turn=task['turn'],
+                    commands_advertised_count=adv_count,
+                    observed_commands_count=len(owner.available_commands),
+                    command_advertisement_state=('advertised_missing' if adv_count > 0 else 'not_received_timeout'),
+                )
+                store.native_owner_diagnostics(*binding, native_observation=obs)
+                raise ProtocolError('Native '+native_command+' command not advertised; no prompt or fallback')
             emit('model', json.dumps(selected))
             try:
                 task = stage(store, task, emit)
@@ -1911,6 +2651,8 @@ def run_native(store, task, emit, policy):
                     return
                 key = tid or f'_anon_{len(tool_last_status)}'
                 prev = tool_last_status.get(key)
+                if prev is not None and _TOOL_STATUS_RANK[status] < _TOOL_STATUS_RANK[prev]:
+                    return
                 tool_last_status[key] = status
                 if status == 'failed' and prev != 'failed':
                     unrecovered_live_tool_failure = True
@@ -1982,25 +2724,82 @@ def run_native(store, task, emit, policy):
             if getattr(owner, 'fatal_observed', False) or fatal_error(decoder.text):
                 raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
             fg_ans = decoder.final_answer.strip()
-            live_interaction_answers[0] = (
-                '' if (is_board_navigation_only(fg_ans) or is_standalone_incomplete_diagnostic(fg_ans) is not None) else fg_ans
-            )
             pre_dialogue_history = []
             previous_public = snapshot([e for e in live_updates if e['sessionUpdate'] != 'user_message_chunk'])
+            wake_post_tool_ids = set()
+            _harvest_post_message_wake_ids(live_updates, previous_public, wake_post_tool_ids)
+            applied_handoff_ids = set()
+            applied_status_ids = set()
+            swarm_handoff_observed = False
             # A completed handoff RPC and its foreground acknowledgement are not
             # the delegated result. Only later public output can supply that result.
-            handoff_names = {'invoke_subagent', 'send_message', 'ask_question'}
-            response_floor = previous_public if mode == 'teamwork' and any(
-                e.get('title') in handoff_names for e in previous_public if e['sessionUpdate']=='tool_call') else []
+            handoff_names = _TEAMWORK_HANDOFF_NAMES
+            fg_diag = is_standalone_incomplete_diagnostic(fg_ans)
+            if mode == 'teamwork':
+                response_floor = previous_public if any(
+                    _is_handoff_tool(e, 'teamwork') for e in previous_public) else []
+            elif mode == 'swarm':
+                if not unrecovered_live_tool_failure:
+                    fg_slice = _classify_swarm_slice(
+                        previous_public, fg_ans,
+                        wake_post_tool_ids=wake_post_tool_ids,
+                        after_prior_handoff=False,
+                        allow_empty_handoff_hold=True,
+                    )
+                    if fg_slice['has_unresolved_handoff']:
+                        swarm_handoff_observed = True
+                    elif fg_slice['has_fresh_terminal_status']:
+                        swarm_handoff_observed = False
+                    response_floor = previous_public if fg_slice['interim'] else []
+                else:
+                    response_floor = []
+                for e in previous_public:
+                    tid = e.get('toolCallId')
+                    if not tid:
+                        continue
+                    if _is_handoff_tool(e, 'swarm', wake_post_tool_ids=wake_post_tool_ids):
+                        applied_handoff_ids.add(tid)
+                    elif _is_completed_swarm_status(e):
+                        applied_status_ids.add(tid)
+            else:
+                response_floor = []
+            if response_floor:
+                live_wire_answers_by_seq[0] = []
+            live_interaction_answers[0] = (
+                '' if (response_floor or is_board_navigation_only(fg_ans) or fg_diag is not None) else fg_ans
+            )
             previous = None
             last_semantic_change = None
             dialogue_public = None
             deferred_questions = []
             interaction_body = None
             resumed_boundary_confirmed = not resumed
+            predecessor_tool_ids = _prior_turn_tool_ids(store, task, baseline=baseline) if (resumed or baseline) else set()
             live_turn_updates_by_seq = {
                 0: [e for e in live_updates if e.get('sessionUpdate') != 'user_message_chunk']
             }
+            def _current_dialogue_texts(cmds=None):
+                src = cmds if cmds is not None else store.get(task['id']).get('commands', {})
+                return {
+                    dialogue_body(task, c) for c in (src or {}).values()
+                    if c.get('kind') == 'dialogue' and c.get('turn') == task['turn'] and c.get('status') == 'returned'
+                }
+            def _known_current_tool_ids(confirmed_turn_history=None):
+                ids = {
+                    e['toolCallId']
+                    for entries in live_turn_updates_by_seq.values()
+                    for e in entries
+                    if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId')
+                }
+                for src in (live_updates, previous_public, dialogue_public, confirmed_turn_history):
+                    for e in (src or ()):
+                        if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId'):
+                            ids.add(e['toolCallId'])
+                for key in tool_last_status:
+                    if key and not key.startswith('_anon_'):
+                        ids.add(key)
+                ids.update(_retry_pipe_tool_ids(getattr(owner, 'pending_retry_state', None), owner.pending_drained))
+                return ids
 
             blocker_notice = None
             while True:
@@ -2034,8 +2833,18 @@ def run_native(store, task, emit, policy):
                             and history[index+1]['sessionUpdate'] in {'tool_call', 'user_message_chunk'}))
                         comparison[index] = history[index]
                 try:
+                    commands = store.get(task['id']).get('commands', {})
+                    cur_dialogues = _current_dialogue_texts(commands)
                     if not resumed_boundary_confirmed:
-                        sliced = _slice_after_prompt_boundary(history, prompt_text) if previous is None else None
+                        sliced = (
+                            _slice_after_prompt_boundary(
+                                history, prompt_text,
+                                dialogue_texts=cur_dialogues,
+                                predecessor_ids=predecessor_tool_ids,
+                                current_ids=_known_current_tool_ids(),
+                            )
+                            if previous is None else None
+                        )
                         if sliced is None:
                             raise ProtocolError(
                                 'Native resumed turn boundary missing; reconciliation required',
@@ -2048,15 +2857,31 @@ def run_native(store, task, emit, policy):
                                 ),
                             )
                         baseline, _ = sliced
+                        for p_entry in baseline:
+                            if p_entry.get('sessionUpdate') == 'tool_call' and p_entry.get('toolCallId'):
+                                predecessor_tool_ids.add(p_entry['toolCallId'])
                         resumed_boundary_confirmed = True
                     turn_history = additions(baseline, history, background_growth=True,
                         call_site='baseline', interaction_seq=0)
+                    if _has_attributed_load_fatal(
+                        owner, turn_history,
+                        fatal_fn=fatal_error,
+                        resumed=resumed,
+                        baseline=baseline,
+                        prompt_text=prompt_text,
+                        known_current_ids=_known_current_tool_ids(turn_history),
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=True,
+                    ):
+                        owner.fatal_observed = True
+                        owner.review_blocked = True
+                        raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
                     public_history = turn_history
                     if previous is None:
                         fresh_sections = {0: first_replay(previous_public, public_history,
                             call_site='initial_replay', interaction_seq=0)}
                     else:
-                        commands = store.get(task['id']).get('commands', {})
                         old_sections = history_sections(comparison, task, commands)
                         new_sections = history_sections(history, task, commands)
                         if not old_sections.keys() <= new_sections.keys():
@@ -2086,7 +2911,22 @@ def run_native(store, task, emit, policy):
                         prior_messages=prior_messages,
                         persisted_prior_slots=persisted_prior_slots,
                         call_site='drain_reconcile', interaction_seq=current_interaction,
+                        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                        known_current_ids=_known_current_tool_ids(turn_history),
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=True,
                     )
+                    reconciled_wire_tools = _collect_reconcile_tools(
+                        owner.pending_drained,
+                        getattr(owner, 'pending_retry_state', None),
+                        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                        known_current_ids=_known_current_tool_ids(turn_history),
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=True,
+                    )
+                    _harvest_post_message_wake_ids(reconciled_wire_tools, turn_history, wake_post_tool_ids)
                     owner.pending_drained.clear()
                     owner.pending_retry_state = None
                     owner.drained_public_text = ''
@@ -2147,6 +2987,28 @@ def run_native(store, task, emit, policy):
                     if reason not in _DEGRADABLE_HISTORY_REASONS or unresumed_reused_baseline:
                         raise
                     commands = store.get(task['id']).get('commands', {})
+                    cur_dialogues = _current_dialogue_texts(commands)
+                    confirmed_turn_h = None
+                    if resumed_boundary_confirmed:
+                        if resumed or baseline:
+                            sliced_h = _slice_after_prompt_boundary(
+                                history, prompt_text,
+                                dialogue_texts=cur_dialogues,
+                                predecessor_ids=predecessor_tool_ids,
+                                current_ids=_known_current_tool_ids(),
+                            )
+                            if sliced_h is not None:
+                                for p_entry in sliced_h[0]:
+                                    if p_entry.get('sessionUpdate') == 'tool_call' and p_entry.get('toolCallId'):
+                                        predecessor_tool_ids.add(p_entry['toolCallId'])
+                                confirmed_turn_h = sliced_h[1]
+                            att_boundary_confirmed = (confirmed_turn_h is not None)
+                        else:
+                            confirmed_turn_h = history
+                            att_boundary_confirmed = True
+                    else:
+                        att_boundary_confirmed = False
+                    cur_ids = _known_current_tool_ids(confirmed_turn_h)
                     salvage_slices = list(_iter_salvage_slices(
                         getattr(owner, 'pending_retry_state', None),
                         owner.pending_drained,
@@ -2157,34 +3019,55 @@ def run_native(store, task, emit, policy):
                         commands=commands,
                         pre_dialogue_history=pre_dialogue_history,
                         resumed=resumed,
+                        known_current_ids=cur_ids,
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=att_boundary_confirmed,
                     ))
                     if resumed_boundary_confirmed:
-                        for stream in _iter_retry_streams(getattr(owner, 'pending_retry_state', None)):
-                            if _updates_have_fatal(stream, fatal_error):
-                                owner.fatal_observed = True
-                        if resumed:
-                            sliced_h = _slice_after_prompt_boundary(history, prompt_text)
-                            history_for_fatal = sliced_h[1] if sliced_h is not None else []
-                        else:
-                            history_for_fatal = history
-                        if (getattr(owner, 'fatal_observed', False)
-                                or _updates_have_fatal(owner.pending_drained, fatal_error, require_terminated=True)
-                                or _updates_have_fatal(history_for_fatal, fatal_error)):
+                        history_for_fatal = confirmed_turn_h if confirmed_turn_h is not None else ([] if resumed else history)
+                        if _has_attributed_load_fatal(
+                            owner, history_for_fatal,
+                            fatal_fn=fatal_error,
+                            resumed=resumed,
+                            baseline=baseline,
+                            prompt_text=prompt_text,
+                            known_current_ids=cur_ids,
+                            known_predecessor_ids=predecessor_tool_ids,
+                            dialogue_texts=cur_dialogues,
+                            boundary_confirmed=att_boundary_confirmed,
+                        ):
                             owner.fatal_observed = True
+                            owner.review_blocked = True
                             raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
                     else:
-                        if any(_updates_have_fatal(s_stream, fatal_error) for _, s_stream, _ in salvage_slices):
+                        if (
+                            _has_attributed_load_fatal(
+                                owner, None,
+                                fatal_fn=fatal_error,
+                                resumed=resumed,
+                                baseline=baseline,
+                                prompt_text=prompt_text,
+                                known_current_ids=cur_ids,
+                                known_predecessor_ids=predecessor_tool_ids,
+                                dialogue_texts=cur_dialogues,
+                                boundary_confirmed=False,
+                                extra_streams=[s_stream for _, s_stream, _ in salvage_slices] + list(live_turn_updates_by_seq.values()),
+                            )
+                            or fatal_error(decoder.text)
+                        ):
                             owner.fatal_observed = True
-                        if any(_updates_have_fatal(stream, fatal_error) for stream in live_turn_updates_by_seq.values()):
-                            owner.fatal_observed = True
-                        if (getattr(owner, 'fatal_observed', False)
-                                or _updates_have_fatal(owner.pending_drained, fatal_error, require_terminated=True)
-                                or fatal_error(decoder.text)):
-                            owner.fatal_observed = True
+                            owner.review_blocked = True
                             raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
                     _check_degraded_drained_tools(
                         owner.pending_drained, history,
                         call_site='drain_reconcile', interaction_seq=current_interaction,
+                        retry_state=getattr(owner, 'pending_retry_state', None),
+                        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                        known_current_ids=cur_ids,
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=att_boundary_confirmed,
                     )
                     diag = dict(h_diag, turn=task['turn'])
                     if diag.get('interaction_seq') is None:
@@ -2195,9 +3078,17 @@ def run_native(store, task, emit, policy):
                     owner.last_history_diagnostic = diag
                     for s_seq, s_stream, s_live in salvage_slices:
                         if s_live:
-                            live_turn_updates_by_seq.setdefault(s_seq, []).extend(
-                                e for e in s_stream if e.get('sessionUpdate') != 'user_message_chunk'
-                            )
+                            for e in s_stream:
+                                if e.get('sessionUpdate') == 'user_message_chunk':
+                                    continue
+                                target_seq = s_seq
+                                if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId'):
+                                    tid = e['toolCallId']
+                                    for existing_seq, existing_entries in live_turn_updates_by_seq.items():
+                                        if any(x.get('sessionUpdate') == 'tool_call' and x.get('toolCallId') == tid for x in existing_entries):
+                                            target_seq = existing_seq
+                                            break
+                                live_turn_updates_by_seq.setdefault(target_seq, []).append(e)
                         for s_entry in s_stream:
                             if s_entry.get('sessionUpdate') == 'tool_call' and (s_live or s_seq == current_interaction):
                                 _note_tool_status(s_entry.get('toolCallId'), _safe_tool_status(s_entry), s_seq)
@@ -2224,8 +3115,7 @@ def run_native(store, task, emit, policy):
                         turn_history = [e for _, sec in sorted(deg_sections.items()) for e in sec]
                     else:
                         if baseline:
-                            sliced = _slice_after_prompt_boundary(history, prompt_text)
-                            turn_history = sliced[1] if sliced is not None else list(history)
+                            turn_history = list(confirmed_turn_h) if confirmed_turn_h is not None else list(history)
                         else:
                             turn_history = list(history)
                         try:
@@ -2309,6 +3199,20 @@ def run_native(store, task, emit, policy):
                                 emit(kind, text, interaction_seq=seq, _degraded_dedupe=True,
                                      _historical_prior_seq=(seq < current_interaction))
                     dialogue_public = None
+                    deg_wire_tools = _collect_reconcile_tools(
+                        owner.pending_drained,
+                        getattr(owner, 'pending_retry_state', None),
+                        resumed=resumed, baseline=baseline, prompt_text=prompt_text,
+                        known_current_ids=cur_ids,
+                        known_predecessor_ids=predecessor_tool_ids,
+                        dialogue_texts=cur_dialogues,
+                        boundary_confirmed=att_boundary_confirmed,
+                    )
+                    for _, s_stream, _ in salvage_slices:
+                        for s_entry in s_stream:
+                            if s_entry.get('sessionUpdate') == 'tool_call':
+                                deg_wire_tools.append(s_entry)
+                    _harvest_post_message_wake_ids(deg_wire_tools, turn_history, wake_post_tool_ids)
                     owner.pending_drained.clear()
                     owner.pending_retry_state = None
                     owner.drained_public_text = ''
@@ -2323,11 +3227,24 @@ def run_native(store, task, emit, policy):
                     last_semantic_change = now
                 if any(e.get('sessionUpdate') != 'user_message_chunk' for e in fresh) or has_recovery:
                     last_visible = time.monotonic()
+                effective_tool_ids = {
+                    e.get('toolCallId') for e in effective_history
+                    if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId')
+                }
+                missing_live_active = {}
+                for entries in live_turn_updates_by_seq.values():
+                    for e in snapshot_tolerant(entries):
+                        if e.get('sessionUpdate') != 'tool_call':
+                            continue
+                        tid = e.get('toolCallId')
+                        if (tid and tid not in effective_tool_ids
+                                and tool_last_status.get(tid) in {'pending', 'in_progress'}):
+                            missing_live_active[tid] = dict(e, status=tool_last_status[tid])
                 prior_obs = store.get(task['id']).get('native_observation') or {}
                 obs_payload = dict(turn=task['turn'], last_success_at=now,
                     last_semantic_change_at=last_semantic_change,
                     pending_tools=[dict(id=safe_tool_id(e['toolCallId']), name=safe_tool_name(e.get('title')), kind=safe_tool_kind(e.get('kind')),
-                        status=e['status']) for e in effective_history if e['sessionUpdate']=='tool_call'
+                        status=e['status']) for e in list(effective_history) + list(missing_live_active.values()) if e['sessionUpdate']=='tool_call'
                         and e.get('status') in {'pending', 'in_progress'}],
                     question_ids=store.get(task['id']).get('questions', []), input_available=True,
                     question_blockers=[dict(interaction_seq=d['interaction_seq'], reason='incomplete_question',
@@ -2423,10 +3340,8 @@ def run_native(store, task, emit, policy):
                             _note_usable_answer(current_interaction, text)
                         emit(kind, text)
                     d_ans = decoder.final_answer.strip()
-                    live_interaction_answers[current_interaction] = (
-                        '' if (is_board_navigation_only(d_ans) or is_standalone_incomplete_diagnostic(d_ans) is not None) else d_ans
-                    )
                     dialogue_public = snapshot([e for e in dialogue_live if e['sessionUpdate']!='user_message_chunk'])
+                    _harvest_post_message_wake_ids(dialogue_live, dialogue_public, wake_post_tool_ids)
                     live_turn_updates_by_seq[current_interaction] = [
                         e for e in dialogue_live if e.get('sessionUpdate') != 'user_message_chunk'
                     ]
@@ -2434,12 +3349,49 @@ def run_native(store, task, emit, policy):
                     if getattr(owner, 'fatal_observed', False) or fatal_error(decoder.text):
                         raise ProtocolError('AGY reported a fatal execution error; outcome unknown, no automatic replay')
                     emit('stage', 'Dialogue '+entry['command_id']+' returned; verify the requested result independently.')
-                    response_floor = dialogue_public if mode == 'teamwork' and any(
-                        e.get('title') in handoff_names for e in dialogue_public if e['sessionUpdate']=='tool_call') else []
+                    d_diag = is_standalone_incomplete_diagnostic(d_ans)
+                    if mode == 'teamwork':
+                        response_floor = dialogue_public if any(
+                            _is_handoff_tool(e, 'teamwork') for e in dialogue_public) else []
+                    elif mode == 'swarm':
+                        if not unrecovered_live_tool_failure:
+                            d_slice = _classify_swarm_slice(
+                                dialogue_public, d_ans,
+                                wake_post_tool_ids=wake_post_tool_ids,
+                                after_prior_handoff=swarm_handoff_observed,
+                                exclude_handoff_ids=applied_handoff_ids,
+                                exclude_status_ids=applied_status_ids,
+                                allow_empty_handoff_hold=True,
+                            )
+                            if d_slice['has_unresolved_handoff']:
+                                swarm_handoff_observed = True
+                            elif d_slice['has_fresh_terminal_status']:
+                                swarm_handoff_observed = False
+                            response_floor = dialogue_public if d_slice['interim'] else []
+                        else:
+                            response_floor = []
+                        for e in dialogue_public:
+                            tid = e.get('toolCallId')
+                            if not tid:
+                                continue
+                            if _is_handoff_tool(e, 'swarm', wake_post_tool_ids=wake_post_tool_ids):
+                                applied_handoff_ids.add(tid)
+                            elif _is_completed_swarm_status(e):
+                                applied_status_ids.add(tid)
+                    else:
+                        response_floor = []
+                    if response_floor:
+                        live_wire_answers_by_seq[current_interaction] = []
+                    live_interaction_answers[current_interaction] = (
+                        '' if (response_floor or is_board_navigation_only(d_ans) or d_diag is not None) else d_ans
+                    )
                     continue
                 current = store.get(task['id'])
-                active = any(e.get('status') not in {'completed','failed'} for e in turn_history
-                             if e['sessionUpdate']=='tool_call')
+                active = (
+                    any(e.get('status') not in {'completed','failed'} for e in turn_history
+                        if e['sessionUpdate']=='tool_call')
+                    or bool(missing_live_active)
+                )
 
                 response_history = turn_history
                 if not resumed_boundary_confirmed:
@@ -2453,9 +3405,9 @@ def run_native(store, task, emit, policy):
                         response_history = _extract_post_dialogue_entries(turn_history, pre_dialogue_history)[1]
                     else:
                         response_history = []
-                if mode == 'teamwork' and any(e.get('title') in handoff_names for e in fresh
-                        if e['sessionUpdate']=='tool_call'):
+                if mode == 'teamwork' and any(_is_handoff_tool(e, 'teamwork') for e in fresh):
                     response_floor = response_history
+                full_response_history = response_history
                 if response_floor:
                     try:
                         response_history = first_replay(response_floor, response_history,
@@ -2465,11 +3417,47 @@ def run_native(store, task, emit, policy):
                             raise
                         last_handoff = max(
                             (i for i, e in enumerate(response_history)
-                             if e.get('sessionUpdate') == 'tool_call' and e.get('title') in handoff_names),
+                             if _is_handoff_tool(e, mode, wake_post_tool_ids=wake_post_tool_ids)),
                             default=-1,
                         )
                         if last_handoff >= 0:
                             response_history = response_history[last_handoff + 1:]
+                if (mode == 'swarm' and not active and not unrecovered_live_tool_failure
+                        and not current.get('questions') and not pending_question(decoder)
+                        and response_history):
+                    slice_dec = EventDecoder()
+                    for item in response_history:
+                        slice_dec.feed(dict(params=dict(update=item)))
+                    slice_dec.finish()
+                    slice_ans = slice_dec.final_answer.strip()
+                    if slice_ans and not pending_question(slice_dec):
+                        load_slice = _classify_swarm_slice(
+                            response_history, slice_ans,
+                            wake_post_tool_ids=wake_post_tool_ids,
+                            after_prior_handoff=swarm_handoff_observed,
+                            exclude_handoff_ids=applied_handoff_ids,
+                            exclude_status_ids=applied_status_ids,
+                            allow_empty_handoff_hold=False,
+                        )
+                        if load_slice['has_unresolved_handoff']:
+                            swarm_handoff_observed = True
+                        elif load_slice['has_fresh_terminal_status']:
+                            swarm_handoff_observed = False
+                        for e in response_history:
+                            tid = e.get('toolCallId')
+                            if not tid:
+                                continue
+                            if _is_handoff_tool(e, 'swarm', wake_post_tool_ids=wake_post_tool_ids):
+                                applied_handoff_ids.add(tid)
+                            elif _is_completed_swarm_status(e):
+                                applied_status_ids.add(tid)
+                        if load_slice['interim']:
+                            response_floor = [
+                                e for e in full_response_history if e.get('sessionUpdate') != 'user_message_chunk'
+                            ]
+                            live_interaction_answers[current_interaction] = ''
+                            live_wire_answers_by_seq[current_interaction] = []
+                            response_history = []
                 result_decoder = EventDecoder()
                 for item in response_history:
                     result_decoder.feed(dict(params=dict(update=item)))

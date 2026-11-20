@@ -7,12 +7,13 @@ import uuid
 try:
     from .agy_native import (
         ProtocolError, snapshot, snapshot_tolerant, additions, first_replay, pending_question,
-        _DEGRADABLE_HISTORY_REASONS, _KNOWN_TOOL_STATUSES, _agent_chunks,
-        _check_degraded_drained_tools, _extract_post_dialogue_entries, _has_completed_fatal_line,
-        _iter_retry_streams, _reconcile_drained, _safe_tool_status, _salvage_wire_signals,
-        _slice_after_prompt_boundary, _updates_have_fatal,
+        _DEGRADABLE_HISTORY_REASONS, _KNOWN_TOOL_STATUSES, _TOOL_STATUS_RANK, _agent_chunks,
+        _check_degraded_drained_tools, _collect_reconcile_tools, _extract_post_dialogue_entries,
+        _has_attributed_load_fatal, _has_completed_fatal_line, _iter_retry_streams, _iter_salvage_slices,
+        _prior_turn_tool_ids, _reconcile_drained, _retry_pipe_tool_ids, _safe_tool_status,
+        _salvage_wire_signals, _slice_after_prompt_boundary, _updates_have_fatal,
     )
-    from .events import EventDecoder, safe_tool_id
+    from .events import EventDecoder, ReviewTracker, safe_tool_id
     from .transport import protocol_prompt
     from .skills import guidance
     from .backends import TurnResult
@@ -24,12 +25,13 @@ try:
 except ImportError:
     from agy_native import (
         ProtocolError, snapshot, snapshot_tolerant, additions, first_replay, pending_question,
-        _DEGRADABLE_HISTORY_REASONS, _KNOWN_TOOL_STATUSES, _agent_chunks,
-        _check_degraded_drained_tools, _extract_post_dialogue_entries, _has_completed_fatal_line,
-        _iter_retry_streams, _reconcile_drained, _safe_tool_status, _salvage_wire_signals,
-        _slice_after_prompt_boundary, _updates_have_fatal,
+        _DEGRADABLE_HISTORY_REASONS, _KNOWN_TOOL_STATUSES, _TOOL_STATUS_RANK, _agent_chunks,
+        _check_degraded_drained_tools, _collect_reconcile_tools, _extract_post_dialogue_entries,
+        _has_attributed_load_fatal, _has_completed_fatal_line, _iter_retry_streams, _iter_salvage_slices,
+        _prior_turn_tool_ids, _reconcile_drained, _retry_pipe_tool_ids, _safe_tool_status,
+        _salvage_wire_signals, _slice_after_prompt_boundary, _updates_have_fatal,
     )
-    from events import EventDecoder, safe_tool_id
+    from events import EventDecoder, ReviewTracker, safe_tool_id
     from transport import protocol_prompt
     from skills import guidance
     from backends import TurnResult
@@ -70,7 +72,7 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
     if baseline and not resumed:
         raise ProtocolError('Dynamic requires fresh empty history; restored workflow control unverified')
     interaction = 0
-    last_notice = started = time.monotonic()
+    review_tracker = ReviewTracker(time.monotonic(), interval=QUIET_NOTICE_SECONDS)
     approved_tools = {}
     native_skip = bool(task.get('execution_policy') == 'native-skip'
                        or task.get('agy_approval') == 'skip-permissions')
@@ -84,12 +86,11 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                 and stripped != AGY_INVALID_OUTPUT_LINE)
 
     def review():
-        nonlocal last_notice
         now = time.monotonic()
-        if not owner.review_blocked and now-last_notice >= QUIET_NOTICE_SECONDS and store.get(task['id'])['state']=='running':
-            emit('stage', 'Coordinator review requested (checkpoint): Dynamic pending; inspect exact task before control.',
-                 quiet_notice=True, notice_kind='checkpoint', elapsed=now-started, interaction_seq=interaction)
-            last_notice = now
+        if not owner.review_blocked and review_tracker.is_due(now) and store.get(task['id'])['state'] == 'running':
+            notice = review_tracker.build_notice(now)
+            emit('stage', notice['text'] + ' Dynamic pending.',
+                 quiet_notice=True, interaction_seq=interaction, **notice['metadata'])
 
     def permission(frame):
         params = frame['params']
@@ -125,6 +126,7 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
         emit('permission', 'Review exact proposed workflow script; choose allow_once or reject_once.',
              permission_id=ident, script=script, script_sha256=digest, interaction_seq=interaction,
              attention_required=True, notification_scope='originating-session')
+        review_tracker.record_event('permission', 'Review exact proposed workflow script; choose allow_once or reject_once.', time.monotonic())
         waiting_started = time.monotonic()
         while True:
             if check_cancel():
@@ -181,6 +183,8 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             return
         key = tid or f'_anon_{len(tool_last_status)}'
         prev = tool_last_status.get(key)
+        if prev is not None and _TOOL_STATUS_RANK[status] < _TOOL_STATUS_RANK[prev]:
+            return
         tool_last_status[key] = status
         if status == 'failed' and prev != 'failed':
             unrecovered_parent_tool_failure = True
@@ -219,12 +223,36 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
         emit(kind, text, interaction_seq=interaction_seq, **extra)
     if resumed:
         owner.resumed_prompt_boundary = initial_body
+    predecessor_tool_ids = _prior_turn_tool_ids(store, task, baseline=baseline) if (resumed or baseline) else set()
+    def _known_current_tool_ids(confirmed_turn_replay=None):
+        ids = set(known_segment_tools) | set(approved_tools) | set(owner.workflow_identity)
+        for src in (published, history, confirmed_turn_replay):
+            for e in (src or ()):
+                if e.get('sessionUpdate') == 'tool_call' and e.get('toolCallId'):
+                    ids.add(e['toolCallId'])
+        for key in tool_last_status:
+            if key and not key.startswith('_anon_'):
+                ids.add(key)
+        ids.update(_retry_pipe_tool_ids(getattr(owner, 'pending_retry_state', None), owner.pending_drained))
+        return ids
+    def _record_stream_activity(update, decoded_items):
+        if decoded_items:
+            now = time.monotonic()
+            for kind, text in decoded_items:
+                review_tracker.record_event(kind, text, now)
+        elif (update.get('sessionUpdate') == 'agent_message_chunk'
+              and isinstance(update.get('content'), dict)
+              and bool(update['content'].get('text'))):
+            review_tracker.record_visible(time.monotonic())
+
     while True:
         if body is not None:
             live = []
             def publish(update):
                 live.append(update)
-                for kind, text in decoder.feed(dict(params=dict(update=update))):
+                decoded_items = decoder.feed(dict(params=dict(update=update)))
+                _record_stream_activity(update, decoded_items)
+                for kind, text in decoded_items:
                     if kind == 'answer':
                         _record_live_answer(interaction, text)
                         _note_usable_answer(interaction, text)
@@ -253,6 +281,7 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                 if kind == 'answer':
                     _record_live_answer(interaction, text)
                     _note_usable_answer(interaction, text)
+                review_tracker.record_event(kind, text, time.monotonic())
                 _emit_tracked(kind, text, interaction_seq=interaction)
             if response.get('stopReason')!='end_turn' or getattr(owner, 'fatal_observed', False) or fatal_error(decoder.text):
                 raise ProtocolError('Dynamic foreground abnormal/fatal; retain HOLD')
@@ -290,18 +319,49 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             owner.last_history_diagnostic.setdefault('turn', task['turn'])
             if owner.last_history_diagnostic.get('interaction_seq') is None:
                 owner.last_history_diagnostic['interaction_seq'] = interaction
+        cur_dialogues = set(dialogue_boundaries.keys())
         if resumed:
-            sliced = _slice_after_prompt_boundary(replay, initial_body)
+            sliced = _slice_after_prompt_boundary(
+                replay, initial_body,
+                dialogue_texts=cur_dialogues,
+                predecessor_ids=predecessor_tool_ids,
+                current_ids=_known_current_tool_ids(),
+            )
             if sliced is None:
                 raise ProtocolError('Dynamic resumed turn boundary missing; retain HOLD')
-            _, turn_replay = sliced
+            predecessor_replay, turn_replay = sliced
+            for p_entry in predecessor_replay:
+                if p_entry.get('sessionUpdate') == 'tool_call' and p_entry.get('toolCallId'):
+                    predecessor_tool_ids.add(p_entry['toolCallId'])
         else:
             turn_replay = replay
-        if _has_completed_fatal_line(turn_replay):
+        cur_ids = _known_current_tool_ids(turn_replay)
+        if _has_attributed_load_fatal(
+            owner, turn_replay,
+            fatal_fn=fatal_error,
+            resumed=resumed,
+            baseline=baseline,
+            prompt_text=initial_body,
+            known_current_ids=cur_ids,
+            known_predecessor_ids=predecessor_tool_ids,
+            dialogue_texts=cur_dialogues,
+            boundary_confirmed=True,
+        ):
             owner.fatal_observed = True
+            owner.review_blocked = True
             raise ProtocolError('Dynamic replay fatal; retain HOLD')
         live_tools = {e['toolCallId']: e for e in published if e['sessionUpdate'] == 'tool_call'}
-        for d_entry in getattr(owner, 'pending_drained', ()):
+        for d_entry in _collect_reconcile_tools(
+            getattr(owner, 'pending_drained', ()),
+            getattr(owner, 'pending_retry_state', None),
+            resumed=resumed,
+            baseline=baseline,
+            prompt_text=initial_body,
+            known_current_ids=cur_ids,
+            known_predecessor_ids=predecessor_tool_ids,
+            dialogue_texts=cur_dialogues,
+            boundary_confirmed=True,
+        ):
             if d_entry.get('sessionUpdate') == 'tool_call' and d_entry.get('toolCallId'):
                 live_tools.setdefault(d_entry['toolCallId'], d_entry)
         replay_tools = {e['toolCallId']: e for e in turn_replay if e['sessionUpdate'] == 'tool_call'}
@@ -333,6 +393,11 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                 prior_messages=prior_messages,
                 persisted_prior_slots=persisted_prior_slots,
                 call_site='dynamic_drain_reconcile', interaction_seq=interaction,
+                resumed=resumed, baseline=baseline, prompt_text=initial_body,
+                known_current_ids=cur_ids,
+                known_predecessor_ids=predecessor_tool_ids,
+                dialogue_texts=cur_dialogues,
+                boundary_confirmed=True,
             )
             owner.pending_drained.clear()
             owner.pending_retry_state = None
@@ -341,7 +406,9 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             appended = turn_replay[len(history):]
             for update in delta:
                 is_appended = update in appended
-                for kind, text in decoder.feed(dict(params=dict(update=update)), text_boundary=is_appended or not history):
+                decoded_items = decoder.feed(dict(params=dict(update=update)), text_boundary=is_appended or not history)
+                _record_stream_activity(update, decoded_items)
+                for kind, text in decoded_items:
                     if kind == 'answer':
                         _record_live_answer(interaction, text)
                         _note_usable_answer(interaction, text)
@@ -359,55 +426,30 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             reason = h_diag.get('reason_code') if isinstance(h_diag, dict) else None
             if reason not in _DEGRADABLE_HISTORY_REASONS:
                 raise
-            def _split_attempt_stream(entries):
-                items = list(entries or ())
-                if not items:
-                    return [], []
-                def _is_session_user(entry):
-                    if entry.get('sessionUpdate') != 'user_message_chunk':
-                        return False
-                    utext = entry.get('content', {}).get('text', '')
-                    if not isinstance(utext, str) or utext in dialogue_boundaries or utext.startswith('CALLCLI_DIALOGUE '):
-                        return False
-                    if resumed and (utext == initial_body or utext.endswith(initial_body)):
-                        return False
-                    return True
-                first_session_user = next((i for i, e in enumerate(items) if _is_session_user(e)), None)
-                inflight = items[:first_session_user] if first_session_user is not None and first_session_user > 0 else []
-                replay_part = items[first_session_user:] if first_session_user is not None else items
-                if resumed:
-                    if any(e.get('sessionUpdate') == 'user_message_chunk' for e in replay_part):
-                        sliced_att = _slice_after_prompt_boundary(replay_part, initial_body)
-                        replay_part = sliced_att[1] if sliced_att is not None else []
-                    else:
-                        replay_part = []
-                return inflight, replay_part
-            def _iter_current_retry_streams(state):
-                if not isinstance(state, dict):
-                    return
-                if state.get('prior') is not None:
-                    yield from _iter_current_retry_streams(state['prior'])
-                if state.get('d1_updates'):
-                    yield state['d1_updates']
-                if state.get('attempt_updates'):
-                    inflight, replay_part = _split_attempt_stream(state['attempt_updates'])
-                    if inflight:
-                        yield inflight
-                    if replay_part:
-                        yield replay_part
-                if state.get('d2_updates'):
-                    yield state['d2_updates']
-            for stream in _iter_current_retry_streams(getattr(owner, 'pending_retry_state', None)):
-                if _updates_have_fatal(stream, fatal_error):
-                    owner.fatal_observed = True
-            if (getattr(owner, 'fatal_observed', False)
-                    or _updates_have_fatal(owner.pending_drained, fatal_error, require_terminated=True)
-                    or _updates_have_fatal(turn_replay, fatal_error)):
+            retry_state = getattr(owner, 'pending_retry_state', None)
+            if _has_attributed_load_fatal(
+                owner, turn_replay,
+                fatal_fn=fatal_error,
+                resumed=resumed,
+                baseline=baseline,
+                prompt_text=initial_body,
+                known_current_ids=cur_ids,
+                known_predecessor_ids=predecessor_tool_ids,
+                dialogue_texts=cur_dialogues,
+                boundary_confirmed=True,
+            ):
                 owner.fatal_observed = True
+                owner.review_blocked = True
                 raise ProtocolError('Dynamic replay fatal; retain HOLD')
             _check_degraded_drained_tools(
                 owner.pending_drained, turn_replay,
                 call_site='dynamic_drain_reconcile', interaction_seq=interaction,
+                retry_state=retry_state,
+                resumed=resumed, baseline=baseline, prompt_text=initial_body,
+                known_current_ids=cur_ids,
+                known_predecessor_ids=predecessor_tool_ids,
+                dialogue_texts=cur_dialogues,
+                boundary_confirmed=True,
             )
             diag = dict(h_diag, turn=task['turn'])
             if diag.get('interaction_seq') is None:
@@ -416,38 +458,20 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
             diag.setdefault('load_retried', getattr(owner, 'last_load_retried', False))
             owner.history_degraded = True
             owner.last_history_diagnostic = diag
-            def _walk_salvage_slices(state):
-                if not isinstance(state, dict):
-                    return
-                if state.get('prior') is not None:
-                    yield from _walk_salvage_slices(state['prior'])
-                if state.get('d1_updates'):
-                    yield interaction, state['d1_updates'], 'drain'
-                if state.get('attempt_updates'):
-                    inflight, replay_part = _split_attempt_stream(state['attempt_updates'])
-                    if inflight:
-                        yield interaction, inflight, 'inflight'
-                    if replay_part:
-                        secs = _dynamic_sections(replay_part, dialogue_boundaries)
-                        if interaction > 0 and interaction not in secs and secs:
-                            m_seq = max(secs)
-                            pre_p, post_p = _extract_post_dialogue_entries(secs[m_seq], pre_dialogue_history)
-                            secs[m_seq] = pre_p
-                            secs[interaction] = post_p
-                        for a_seq, a_sec in sorted(secs.items()):
-                            if a_sec:
-                                yield a_seq, a_sec, 'replay'
-                if state.get('d2_updates'):
-                    yield interaction, state['d2_updates'], 'drain'
-            retry_state = getattr(owner, 'pending_retry_state', None)
-            salvage_slices = list(_walk_salvage_slices(retry_state))
-            if owner.pending_drained:
-                if retry_state is None:
-                    salvage_slices.append((interaction, owner.pending_drained, 'drain'))
-                else:
-                    drained_tools = [e for e in owner.pending_drained if e.get('sessionUpdate') == 'tool_call']
-                    if drained_tools:
-                        salvage_slices.append((interaction, drained_tools, 'drain'))
+            salvage_slices = list(_iter_salvage_slices(
+                retry_state,
+                owner.pending_drained,
+                current_interaction=interaction,
+                baseline=baseline,
+                prompt_text=initial_body,
+                pre_dialogue_history=pre_dialogue_history,
+                resumed=resumed,
+                known_current_ids=cur_ids,
+                known_predecessor_ids=predecessor_tool_ids,
+                dialogue_texts=cur_dialogues,
+                boundary_confirmed=True,
+                section_splitter=lambda part: _dynamic_sections(part, dialogue_boundaries),
+            ))
             def _iter_stream_steps(entries):
                 buf = []
                 for item in (entries or ()):
@@ -460,8 +484,7 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                 if buf:
                     for sig in _salvage_wire_signals(buf):
                         yield 'signal', sig
-            for s_seq, stream, s_source in salvage_slices:
-                is_live_slice = s_source in {'drain', 'inflight'}
+            for s_seq, stream, is_live_slice in salvage_slices:
                 for step_kind, payload in _iter_stream_steps(stream):
                     if step_kind == 'tool':
                         s_entry = payload
@@ -471,10 +494,17 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                                 if tid:
                                     known_segment_tools.add(tid)
                                 _reset_live_answer_segment(s_seq)
+                        if is_live_slice:
+                            prev_st = tool_last_status.get(tid) if tid else None
+                            next_st = _safe_tool_status(s_entry)
+                            if next_st in _KNOWN_TOOL_STATUSES and next_st != prev_st and s_entry.get('title') != 'run_workflow':
+                                review_tracker.record_event('tool', f"{tid or 'tool'} {next_st}", time.monotonic())
                         if is_live_slice or s_seq == interaction:
                             _note_tool_status(tid, _safe_tool_status(s_entry), s_entry.get('title'), s_seq)
                     else:
                         sig_kind, sig_text = payload
+                        if is_live_slice and (sig_kind, sig_text) not in emitted_signals_by_seq.get(s_seq, ()):
+                            review_tracker.record_event(sig_kind, sig_text, time.monotonic())
                         _emit_tracked(sig_kind, sig_text, interaction_seq=s_seq, _degraded_dedupe=True)
                         if is_live_slice and sig_kind == 'answer':
                             if _record_live_answer(s_seq, sig_text, dedupe_in_segment=True):
@@ -526,6 +556,8 @@ def run_dynamic(store, task, owner, emit, policy, binding, token, baseline, unlo
                 for kind, text in sec_dec.feed(dict(params=dict(update=d_item)), text_boundary=(idx < len(cur_sec) - 1)):
                     if kind == 'answer':
                         _note_dyn_deg(text, idx > last_failed_idx)
+                    if (kind, text) not in emitted_signals_by_seq.get(interaction, ()):
+                        review_tracker.record_event(kind, text, time.monotonic())
                     _emit_tracked(kind, text, interaction_seq=interaction, _degraded_dedupe=True,
                                   _suppress_prior_question=collapsed)
                 if d_item.get('sessionUpdate') == 'tool_call':

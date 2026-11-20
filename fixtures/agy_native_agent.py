@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import uuid
 
@@ -55,8 +56,12 @@ def review_gate(name):
     return False
 
 
+_send_lock = threading.Lock()
+
+
 def send(value):
-    print(json.dumps(dict(jsonrpc='2.0', **value)), flush=True)
+    with _send_lock:
+        print(json.dumps(dict(jsonrpc='2.0', **value)), flush=True)
 
 def metadata():
     if (root/'catalog.json').exists():
@@ -88,6 +93,72 @@ def update(value):
 def text(value):
     update(dict(sessionUpdate='agent_message_chunk', content=dict(type='text', text=value)))
 
+
+def _test_cmd_target():
+    if os.environ.get('AGY_DYNAMIC_FIXTURE'):
+        return 'run-workflow'
+    if os.environ.get('AGY_TEAMWORK_THIN'):
+        return 'teamwork'
+    return 'swarm'
+
+
+def _emit_cmd_update(names):
+    try:
+        send(dict(
+            method='session/update',
+            params=dict(
+                sessionId=session,
+                update=dict(
+                    sessionUpdate='available_commands_update',
+                    availableCommands=[dict(name=n) for n in names],
+                ),
+            ),
+        ))
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+
+
+def _schedule_cmd_update(names, delay):
+    timer = threading.Timer(delay, lambda: _emit_cmd_update(names))
+    timer.daemon = True
+    timer.start()
+
+
+def _apply_test_cmd_hook(event, config_id=None):
+    mode = os.environ.get('AGY_TEST_CMD_MODE')
+    if not mode:
+        return False
+    target = _test_cmd_target()
+    delay = float(os.environ.get('AGY_TEST_CMD_DELAY', '1.35'))
+    if event in {'new', 'resume'}:
+        if mode == 'delay':
+            _schedule_cmd_update([target], delay)
+        elif mode in {'missing_other', 'refresh_on_model', 'refresh_on_model_async'}:
+            _emit_cmd_update(['other'])
+        elif mode == 'missing_empty':
+            _emit_cmd_update([])
+        elif mode == 'drop_on_model':
+            _emit_cmd_update([target])
+        elif mode == 'two_batch':
+            _schedule_cmd_update(['other'], 0.1)
+            _schedule_cmd_update(['other', target], 0.3)
+        elif mode == 'load_empty':
+            pass
+        return True
+    if event == 'set_config' and config_id == 'model':
+        if mode == 'refresh_on_model':
+            _emit_cmd_update([target])
+        elif mode == 'refresh_on_model_async':
+            _schedule_cmd_update([target], float(os.environ.get('AGY_TEST_CMD_DELAY', '0.25')))
+        elif mode == 'drop_on_model':
+            _emit_cmd_update(['other'])
+        return True
+    if event == 'load':
+        if mode == 'load_empty':
+            _emit_cmd_update([])
+        return True
+    return False
+
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get('method')
@@ -103,14 +174,15 @@ for line in sys.stdin:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
             continue
         result = metadata()
-        if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
-            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
-        if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
-            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
-        if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
-            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
-        if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
-            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
+        if not _apply_test_cmd_hook('resume'):
+            if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
+                update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
+            if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
+                update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
+            if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
+                update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
+            if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
+                update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
     elif method == 'session/new':
         if closed:
             session = str(uuid.uuid4())
@@ -118,14 +190,15 @@ for line in sys.stdin:
             saved = []
             (root/'closed-session').unlink()
         result = metadata()
-        if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
-            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
-        if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
-            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
-        if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
-            update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
-        if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
-            update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
+        if not _apply_test_cmd_hook('new'):
+            if os.environ.get('AGY_DYNAMIC_FIXTURE') and os.environ['AGY_DYNAMIC_FIXTURE']!='no-command':
+                update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='run-workflow')]))
+            if os.environ.get('AGY_TEAMWORK_THIN') and os.environ['AGY_TEAMWORK_THIN']!='no-command':
+                update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='teamwork')]))
+            if not os.environ.get('AGY_DYNAMIC_FIXTURE') and not os.environ.get('AGY_TEAMWORK_THIN') and os.environ.get('AGY_SWARM_THIN') != 'no-command':
+                update(dict(sessionUpdate='available_commands_update',availableCommands=[dict(name='swarm')]))
+            if os.environ.get('AGY_NATIVE_HISTORY_RACE'):
+                update(dict(sessionUpdate='available_commands_update', availableCommands=[dict(name='swarm'), dict(name='teamwork')]))
     elif method == 'session/set_config_option':
         if closed:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
@@ -135,6 +208,7 @@ for line in sys.stdin:
         else:
             effort = msg['params']['value']
         result = metadata()
+        _apply_test_cmd_hook('set_config', config_id=msg['params'].get('configId'))
     elif method == 'session/prompt':
         prompted = True
         if os.environ.get('AGY_TEAMWORK_THIN'):
@@ -336,7 +410,10 @@ for line in sys.stdin:
                     update(dict(sessionUpdate='user_message_chunk',content=dict(type='text',text=body)))
                 label='revised' if body.startswith('CALLCLI_DIALOGUE ') else 'initial'
                 (root/'result.txt').write_text(label)
-                text('Native final '+label+': documentation includes Run /swarm board\n' if fault=='final-board-mention' else 'Native final '+label+'\n')
+                if body.startswith('CALLCLI_DIALOGUE ') and os.environ.get('CALLCLI_TEST_DIALOGUE_TEXT'):
+                    text(os.environ['CALLCLI_TEST_DIALOGUE_TEXT']+'\n')
+                else:
+                    text('Native final '+label+': documentation includes Run /swarm board\n' if fault=='final-board-mention' else 'Native final '+label+'\n')
             saved=captured
             captured=None
             send(dict(id=msg['id'],result=dict(stopReason='end_turn')))
@@ -609,6 +686,7 @@ for line in sys.stdin:
         if closed:
             send(dict(id=msg['id'], error=dict(code=-32602, message='Session not found')))
             continue
+        _apply_test_cmd_hook('load')
         captured = []
         if os.environ.get('AGY_TEAMWORK_THIN'):
             fault = os.environ['AGY_TEAMWORK_THIN']

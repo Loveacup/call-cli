@@ -109,16 +109,19 @@ class Collaboration:
     def start(self, client, *, prompt, cwd, device='local', agent='codex',
               remote_shell='posix', write=False, resource='', timeout=None, model=None, effort=None,
               agy_approval=None, agy_swarm=None, agy_worker_model=None, agy_mode=None, skills=None,
-              group=None, _origin_context=None):
+              group=None, backend=None, _origin_context=None):
         from transport import device_identity
         origin = self.origin(client)
         if remote_shell not in {'posix', 'powershell'}:
             raise ValueError('Invalid agent or remote shell')
+        if backend == 'oar' and device != 'local':
+            raise ValueError('OAR backend is supported only on device=local')
         if (not prompt.strip() or not cwd or (timeout is not None and
                 (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 86400))):
             raise ValueError('Nonempty prompt/cwd and optional timeout in (0,86400] required')
         fields = prepare_start(agent, model, effort, agy_approval,
-                               agy_swarm=agy_swarm, agy_worker_model=agy_worker_model, agy_mode=agy_mode)
+                               agy_swarm=agy_swarm, agy_worker_model=agy_worker_model, agy_mode=agy_mode,
+                               backend=backend)
         if fields.get('agy_swarm') == 'native' and timeout is not None:
             raise ValueError('Native swarm has no hard execution deadline; use explicit off for legacy timeout')
         from pathlib import PurePosixPath, PureWindowsPath
@@ -290,6 +293,8 @@ def main(argv=None):
     start.add_argument('--agy-swarm', choices=['native', 'off'], help='AGY route override for advertised IDs; must match shorthand (bare=off, s=native)')
     start.add_argument('--agy-mode', choices=['single', 'swarm', 'teamwork', 'dynamic'], help='Explicit AGY execution mode; native modes require their advertised command')
     start.add_argument('--agy-worker-model', help='Optional native worker-model preference forwarded to AGY; no per-member completion gate')
+    start.add_argument('--backend', choices=['acpx', 'oar'], default=None,
+                       help='Explicit execution backend override (AGY local only for oar; omitted preserves default routing)')
     start.add_argument('--cwd', required=True)
     start.add_argument('--remote-shell', choices=['posix', 'powershell'], default='posix')
     start.add_argument('--write', action='store_true',

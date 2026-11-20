@@ -241,7 +241,7 @@ def public_close_receipt(receipt):
 
 
 def _is_settled_missing_final(task):
-    if task.get('state') != 'unknown' or not _runner_inactive(task):
+    if task.get('state') != 'unknown' or task.get('backend') == 'oar' or not _runner_inactive(task):
         return False
     ts = task.get('turn_settlement')
     req = task.get('backend_request_id')
@@ -264,7 +264,9 @@ def _is_settled_missing_final(task):
 def recovery_card(task, db_path=None, seq=0, host=None):
     surface = task.get('initiating_surface', host or 'unknown')
     exact_reconcile = (task['state'] == 'unknown' and task['device'] == 'local'
-                       and bool(task.get('acpx_record_id')) and task.get('agy_swarm') != 'native')
+                       and bool(task.get('acpx_record_id'))
+                       and task.get('agy_swarm') != 'native'
+                       and task.get('backend') != 'oar')
     settled_missing_final = exact_reconcile and _is_settled_missing_final(task)
     if task['state'] == 'unknown':
         if not exact_reconcile:
@@ -278,7 +280,11 @@ def recovery_card(task, db_path=None, seq=0, host=None):
             next_action = action + ' exact record without replay'
         else:
             next_action = 'retain HOLD pending exact-record probe-only reconciliation through an authorized available entry point; no replay'
-        if task.get('agy_swarm') == 'native':
+        if task.get('backend') == 'oar':
+            action = 'reconcile' if host == 'hermes-native' else 'close (receipt-only)'
+            next_action = ('retain OAR HOLD; ' + action + ' validates an existing OAR single-owner cleanup receipt only (never ACPX); '
+                'no second owner or cross-backend replay; missing receipt requires explicit release_only(task_id, expected_turn, abandon=true)')
+        elif task.get('agy_swarm') == 'native':
             action = 'reconcile' if host=='hermes-native' else 'close (receipt-only)'
             next_action = ('retain native worker HOLD; '+action+' validates an existing owner cleanup receipt only; '
                 'no new owner, load or repeated close; missing receipt requires authorized native evidence, not ACPX')

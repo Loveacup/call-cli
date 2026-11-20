@@ -388,6 +388,40 @@ def close_task(store, origin, task_id, expected_turn=None, backend=None):
         receipt.update(source='native-single-owner-cleanup', external_close_attempted=False)
     if task['state'] == 'closed':
         return receipt
+    if task.get('backend') == 'oar':
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = Store._owned(store, db, task_id, origin)
+            if current != task:
+                raise ValueError('OAR close snapshot changed')
+            if current['state'] not in {'completed', 'cancelled', 'unknown'}:
+                raise ValueError('OAR task must settle before close')
+            never_started = (
+                current['state'] == 'cancelled'
+                and not current.get('oar_turn_started')
+                and ((current['turn'] == 1 and not current.get('oar_session'))
+                     or current.get('oar_previous_cleanup_verified') is True)
+            )
+            verified = never_started or bool(store.oar_cleanup_verified(db, current) and not current.get('runner_pid'))
+            if not verified:
+                if current['state'] in {'completed', 'cancelled'} and store._has_conflicting_writer(db, current):
+                    current['resource_state'] = 'superseded'
+                current['state'] = 'unknown'
+                store._save(db, current)
+                return dict(state='unknown', phase='hold', stage='oar-proof',
+                            reason_code='oar_cleanup_unproven', task=task_id,
+                            external_close_attempted=False, arbitraryDetachedDescendantsProven=False)
+            receipt.update(
+                source='session-creation-never-attempted' if never_started else 'oar-single-owner-cleanup',
+                external_close_attempted=False,
+                arbitraryDetachedDescendantsProven=False,
+            )
+            current.update(state='closed', prompt='', release_epoch=1)
+            Release.install(db)
+            db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
+                       (task_id, 1, json.dumps(current), canonical(receipt)))
+            Release._publish(db, current, receipt)
+        return receipt
     if task.get('agy_swarm') == 'native':
         # The ACP owner records this turn's observable worker/session settlement,
         # not proof that arbitrary descendant processes died.
@@ -511,9 +545,21 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
                     risk='Native owner may still be active; use release_only with abandon=true to explicitly accept this risk')
             if abandon:
                 return release_resources(db, current, source='explicit-abandonment', actor=dataclasses.asdict(origin))
+            if current.get('backend') == 'oar':
+                return dict(state='unknown', phase='hold', stage='resolve', reason_code='oar_cleanup_unproven',
+                    external_close_attempted=False, arbitraryDetachedDescendantsProven=False,
+                    risk='OAR session or detached work may still be active; explicitly use abandon=true to release ownership without stop proof')
             if current.get('agy_swarm') == 'native' or current['device'] != 'local' or not current.get('acpx_record_id'):
                 return dict(state='unknown', phase='hold', stage='resolve', reason_code='exact_close_unavailable',
                     risk='Native session or detached work may still be active; explicitly use abandon=true to release ownership without stop proof')
+    if native.get('backend') == 'oar':
+        if type(expected_turn) is not int or native['turn'] != expected_turn:
+            raise ValueError('OAR recovery requires observed expected_turn')
+        if operation not in {'close', 'reconcile'}:
+            raise ValueError('Unsupported OAR recovery operation')
+        if operation == 'reconcile' and native['state'] not in {'unknown', 'closed'}:
+            raise ValueError('OAR reconcile requires unknown/HOLD')
+        return close_task(store, origin, task_id, expected_turn)
     if native.get('agy_swarm') == 'native':
         if type(expected_turn) is not int or native['turn']!=expected_turn:
             raise ValueError('Native recovery requires observed expected_turn')

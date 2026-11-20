@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as ompExt from './omp-extension.mjs';
 import register, {createAdapter} from './omp-extension.mjs';
 
 function fixture(override) {
@@ -430,7 +431,7 @@ test('late prior-turn unknown cannot block current-turn snapshot attention', asy
   await f.timers.shift()();
   assert.equal(f.sent.length,2);
   const events=JSON.parse(f.sent[1].message.content).events;
-  assert.deepEqual(events.map(e=>e.kind),['stage','question','answer','skill','unknown']);
+  assert.deepEqual(events.map(e=>e.kind),['stage','question','answer','unknown']);
   assert.equal(events.at(-1).turn,2);
   assert.equal(events.at(-1).source,'task_snapshot');
   assert.equal(f.timers.length,0);
@@ -491,10 +492,12 @@ for (const previouslyNotified of [true,false]) test(`historical turn attention $
   const delivered=f.sent.flatMap(s=>JSON.parse(s.message.content).events);
   assert.deepEqual(delivered.filter(e=>e.kind==='unknown').map(e=>e.turn),previouslyNotified ? [1,2] : [2,1]);
   assert.deepEqual(JSON.parse(f.sent.at(-1).message.content).events.filter(e=>e.kind!=='unknown').map(e=>e.kind),
-    ['stage','question','answer','skill']);
+    ['stage','question','answer']);
   f.setPacket({task:{...task,turn:3,state:'running'},events:[{seq:6,kind:'unknown',turn:1,text:'repeat late turn one'}]});
+  assert.equal(f.calls.at(-1).args.after,0);
   const count=f.sent.length;
   await f.timers.shift()();
+  assert.equal(f.calls.at(-1).args.after,5,'cursor must advance past suppressed routine skill seq 5');
   assert.equal(f.sent.length,count,'a delivered old turn is now remembered too');
   f.adapter.detach();
 });
@@ -1359,4 +1362,162 @@ print(json.dumps({'task_id': t['id']}))
     else process.env.CALL_CLI_PYTHON = previous;
     await rm(root, {recursive: true, force: true});
   }
+});
+
+test('routine diagnostics and routine skills are suppressed without stalling cursor while attention events deliver', async () => {
+  const f = fixture();
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'noise filter'}, f.ctx);
+  f.setPacket({
+    task: {id: 'task-a', state: 'running', turn: 1},
+    events: [
+      {seq: 1, turn: 1, kind: 'diagnostic', reason_code: 'record_observed', text: 'record observed'},
+      {seq: 2, turn: 1, kind: 'diagnostic', reason_code: 'submission_attempted', text: 'submission attempted'},
+      {seq: 3, turn: 1, kind: 'diagnostic', reason_code: 'acceptance_observed', text: 'acceptance observed'},
+      {seq: 4, turn: 1, kind: 'diagnostic', reason_code: 'result_observed', text: 'result observed'},
+      {seq: 5, turn: 1, kind: 'skill', text: 'skill-1 read'},
+    ],
+  });
+  await f.timers.shift()();
+  assert.equal(f.sent.length, 0, 'routine noise must not wake model');
+
+  f.setPacket({
+    task: {id: 'task-a', state: 'running', turn: 1},
+    events: [
+      {seq: 6, turn: 1, kind: 'diagnostic', reason_code: 'turn_failed', text: 'non-routine failure diagnostic'},
+      {seq: 7, turn: 1, kind: 'skill', attention_required: true, text: 'skill-1 unavailable'},
+      {seq: 8, turn: 1, kind: 'stage', quiet_notice: true, notice_kind: 'tool_churn_only', tool_churn_only: true, elapsed: 601, text: 'Coordinator review requested (tool_churn_only)'},
+    ],
+  });
+  await f.timers.shift()();
+  assert.equal(f.calls.at(-1).args.after, 5, 'cursor must advance past suppressed routine events');
+  assert.equal(f.sent.length, 1);
+  const delivered = JSON.parse(f.sent[0].message.content).events;
+  assert.deepEqual(delivered.map(e => e.seq), [6, 7, 8]);
+  assert.equal(delivered[2].notice_kind, 'tool_churn_only');
+  assert.equal(delivered[2].tool_churn_only, true);
+  f.adapter.detach();
+});
+
+test('omp extension does not export duplicate project-stop classifier', () => {
+  assert.equal(Object.hasOwn(ompExt, 'classifyWorkStop'), false);
+});
+
+test('normal completed and waiting_reply turns deliver durable terminal verbatim without false global stop', async () => {
+  let starts = 0;
+  const packets = new Map();
+  const f = fixture(async r => {
+    if (r.action === 'bind') return {capability: 'cap'};
+    if (r.args.action === 'start') {
+      const id = `task-${++starts}`;
+      return {task: {id, state: 'queued', turn: 1, agent: 'omp'}};
+    }
+    return packets.get(r.args.task_id) || {task: {id: r.args.task_id, state: 'running', turn: 1, agent: 'omp'}, events: []};
+  });
+
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'complete cleanly'}, f.ctx);
+  packets.set('task-1', {
+    task: {id: 'task-1', agent: 'omp', state: 'completed', turn: 1, stop_reason: 'end_turn'},
+    events: [
+      {seq: 1, kind: 'answer', turn: 1, text: 'DONE_OK'},
+      {seq: 2, kind: 'completed', turn: 1, text: 'Prompt exited 0', answer_tail: 'DONE_OK\n'},
+    ],
+  });
+  await f.timers.shift()();
+  const msg1 = JSON.parse(f.sent[0].message.content);
+  assert.equal(msg1.task_id, 'task-1');
+  assert.deepEqual(msg1.events.map(e => e.kind), ['answer', 'completed']);
+  assert.equal(msg1.events[0].text, 'DONE_OK');
+  assert.equal(msg1.events[1].seq, 2);
+  assert.equal(Object.hasOwn(msg1, 'work_stop'), false);
+  assert.equal(f.sent[0].message.content.includes('工作已停，未完成'), false);
+  assert.equal(f.sent[0].message.content.includes('global_stopped'), false);
+  assert.equal(f.timers.length, 0);
+
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'ask question'}, f.ctx);
+  packets.set('task-2', {
+    task: {id: 'task-2', agent: 'omp', state: 'waiting_reply', turn: 1, question_id: '1:1', questions: ['1:1']},
+    events: [
+      {seq: 3, kind: 'question', turn: 1, text: 'Q1 Proceed?'},
+      {seq: 4, kind: 'waiting_reply', turn: 1, text: 'Prompt exited 0', question_ids: ['1:1']},
+    ],
+  });
+  await f.timers.shift()();
+  const msg2 = JSON.parse(f.sent[1].message.content);
+  assert.equal(msg2.task_id, 'task-2');
+  assert.deepEqual(msg2.events.map(e => e.kind), ['question', 'waiting_reply']);
+  assert.deepEqual(msg2.events[1].question_ids, ['1:1']);
+  assert.equal(Object.hasOwn(msg2, 'work_stop'), false);
+  assert.equal(f.sent[1].message.content.includes('工作已停，未完成'), false);
+  assert.equal(f.sent[1].message.content.includes('global_stopped'), false);
+  assert.equal(f.timers.length, 0);
+  f.adapter.detach();
+});
+
+test('real unknown event and task_snapshot fallback still flow back with unrelated running and queued tasks', async () => {
+  let starts = 0;
+  const packets = new Map();
+  const f = fixture(async r => {
+    if (r.action === 'bind') return {capability: 'cap'};
+    if (r.args.action === 'start') {
+      const id = `task-${++starts}`;
+      return {task: {id, state: 'queued', turn: 1, agent: 'omp'}};
+    }
+    return packets.get(r.args.task_id) || {task: {id: r.args.task_id, state: 'running', turn: 1, agent: 'omp'}, events: []};
+  });
+
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'failing event task'}, f.ctx);
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'unrelated running'}, f.ctx);
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'unrelated queued'}, f.ctx);
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'failing snapshot task'}, f.ctx);
+
+  packets.set('task-1', {
+    task: {id: 'task-1', agent: 'omp', state: 'unknown', turn: 1},
+    events: [{seq: 1, kind: 'unknown', turn: 1, attention_required: true, text: 'OMP task-1 turn 1 needs attention'}],
+  });
+  packets.set('task-2', {task: {id: 'task-2', agent: 'omp', state: 'running', turn: 1}, events: []});
+  packets.set('task-3', {task: {id: 'task-3', agent: 'omp', state: 'queued', turn: 1}, events: []});
+  packets.set('task-4', {
+    task: {id: 'task-4', agent: 'omp', state: 'unknown', turn: 1, settlement_note: 'missing final answer'},
+    events: [],
+  });
+
+  await f.timers.shift()();
+  assert.equal(f.sent.length, 2);
+  const msg1 = JSON.parse(f.sent[0].message.content);
+  assert.equal(msg1.task_id, 'task-1');
+  assert.equal(msg1.events.length, 1);
+  assert.equal(msg1.events[0].kind, 'unknown');
+  assert.equal(msg1.events[0].attention_required, true);
+  assert.equal(Object.hasOwn(msg1, 'work_stop'), false);
+  assert.equal(f.sent[0].message.content.includes('branch_stopped'), false);
+  assert.equal(f.sent[0].message.content.includes('工作已停，未完成'), false);
+
+  const msg4 = JSON.parse(f.sent[1].message.content);
+  assert.equal(msg4.task_id, 'task-4');
+  assert.equal(msg4.events.length, 1);
+  assert.equal(msg4.events[0].kind, 'unknown');
+  assert.equal(msg4.events[0].source, 'task_snapshot');
+  assert.equal(msg4.events[0].attention_required, true);
+  assert.equal(msg4.events[0].turn, 1);
+  assert.equal(Object.hasOwn(msg4, 'work_stop'), false);
+  assert.equal(f.sent[1].message.content.includes('branch_stopped'), false);
+  assert.equal(f.sent[1].message.content.includes('工作已停，未完成'), false);
+  f.adapter.detach();
+});
+
+test('cancelled with pending intervention delivers terminal verbatim and keeps polling without work_stop', async () => {
+  const f = fixture();
+  await f.adapter.execute({action: 'start', agent: 'omp', cwd: '/work', prompt: 'intervened task'}, f.ctx);
+  f.setPacket({
+    task: {id: 'task-a', agent: 'omp', state: 'cancelled', turn: 1, intervention: {status: 'pending'}},
+    events: [{seq: 1, kind: 'cancelled', turn: 1, text: 'Prompt exited 0', next_action: 'Retry intervene or call wait'}],
+  });
+  await f.timers.shift()();
+  assert.equal(f.sent.length, 1);
+  const msg = JSON.parse(f.sent[0].message.content);
+  assert.equal(msg.task_id, 'task-a');
+  assert.deepEqual(msg.events.map(e => e.kind), ['cancelled']);
+  assert.equal(Object.hasOwn(msg, 'work_stop'), false);
+  assert.equal(f.timers.length, 1, 'polling must remain active for pending intervention target');
+  f.adapter.detach();
 });

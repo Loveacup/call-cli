@@ -5,7 +5,8 @@ const actions = new Set(['start', 'list', 'status', 'events', 'reply', 'dialogue
 const readOnlyActions = new Set(['list', 'status', 'events', 'recovery_status']);
 const fields = new Set(['action', 'task_id', 'agent', 'device', 'cwd', 'prompt', 'write', 'resource', 'clear_timeout', 'model', 'effort', 'agy_approval', 'agy_swarm', 'agy_worker_model', 'agy_mode', 'remote_shell', 'skills', 'group', 'question_id', 'question_ids', 'blocker_interaction_seq', 'command_id', 'target_command_id', 'withdraw', 'expected_turn', 'after', 'permission_id', 'script_sha256', 'decision', 'abandon']);
 const terminal = new Set(['completed', 'cancelled', 'unknown', 'closed']);
-const visible = new Set(['stage', 'question', 'permission', 'diagnostic', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown', 'skill']);
+const visible = new Set(['stage', 'question', 'permission', 'diagnostic', 'answer', 'completed', 'waiting_reply', 'cancelled', 'unknown']);
+const routineDiagnosticReasons = new Set(['record_observed', 'submission_attempted', 'acceptance_observed', 'result_observed']);
 
 function bridgeRequest(request) {
   return new Promise((resolve, reject) => {
@@ -65,10 +66,15 @@ export function createAdapter(pi, {request = bridgeRequest, db = process.env.CAL
             const events = packet.events.filter(event => event.seq > track.cursor);
             const answers = [...track.answers, ...events.filter(event => event.kind === 'answer')];
             const stage = events.findLast(event => event.kind === 'stage' && !event.quiet_notice);
-            const meaningful = events.filter(event => visible.has(event.kind) && event.kind !== 'answer'
-              && (event.kind !== 'stage' || event.quiet_notice === true || (event === stage && event.text !== track.lastStage))
-              && !(event.kind === 'unknown' && (event.turn ?? packet.task?.turn) !== undefined
-                && track.attentionTurns.has(event.turn ?? packet.task?.turn)));
+            const meaningful = events.filter(event => {
+              if (event.kind === 'skill') return event.attention_required === true;
+              if (!visible.has(event.kind) || event.kind === 'answer') return false;
+              if (event.kind === 'diagnostic' && !event.attention_required && routineDiagnosticReasons.has(event.reason_code)) return false;
+              if (event.kind === 'stage' && event.quiet_notice !== true && (event !== stage || event.text === track.lastStage)) return false;
+              if (event.kind === 'unknown' && (event.turn ?? packet.task?.turn) !== undefined
+                && track.attentionTurns.has(event.turn ?? packet.task?.turn)) return false;
+              return true;
+            });
             if (events.some(event => terminal.has(event.kind) || event.kind === 'waiting_reply')) {
               meaningful.push(...answers);
               meaningful.sort((a, b) => a.seq - b.seq);

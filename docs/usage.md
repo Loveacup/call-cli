@@ -21,10 +21,11 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 - `--runtime` 取 `omp/codex/pi/hermes`：是发起方声明，不是认证。AGY 仅作执行端，不作为发起端或待验入口。
 - `--agent` 仍取 omp/codex/pi/agy。新 AGY 默认 `ocs`，不按任务自动换模型；小写 `oc/oa/4c/4a/4h` 裸简称全部 off，加 s 为 native Swarm，加 t 为 native Teamwork 源码路径（须有命令广告，无 fallback）。简称与显式模式／路由冲突拒绝，完整 advertised ID/family 保持兼容。详见[简称与模式合同](../skill/references/agy-models.md)。旧任务不回填、其他 CLI 不变；源码、部署和真实业务验收分开报告。
 - `--write` 声明已授权编辑／测试与单 writer 目录占用互斥。**新启动**的 OMP/Codex/Pi/AGY 默认启用 `execution_policy: native-skip`（AGY 默认 `agy_approval: skip-permissions`；OMP/AGY 在 POSIX 与 Windows 均原生传参跳过审批与 CLI 目录限制，仅 ACPX Shared Runtime `fs/*` 回调仍受 `cwd` 子树限制，作为待 PM/用户决策的公开上游缺口），同时保留业务范围与任务/controller 身份隔离；仅 AGY 支持显式 `--agy-approval approve-all|approve-reads` 退回传统审批。缺 `execution_policy` 的既有运行中与历史任务不扩权，续轮保留各自原策略；源码改动在受支持部署与重载前不对运行中宿主生效。
+- `--backend oar` 是可选实验入口，仅用于新建本机 AGY 单代理任务。将 `CALL_CLI_OAR_DIST` 指向包含 `dist/` 的 `@botiverse/oar` 包根目录（已验证的集成夹具版本：0.121.0，Node.js 24+）。不指定时维持原路由，依赖缺失时不换后端或重跑。同一任务不能中途换后端。默认测试不要求 OAR；设置 `CALL_CLI_OAR_TEST_DIST` 指向上述包根后运行 `python3 -B -m unittest -q test_oar_coexist`，可验证真实 OAR 库和模拟执行端的集成，不等于真实 AGY 验收。
 - `--resource` 可显式标识跨设备同步工作区；不同别名、路径或 DB 不得用于绕过单写者约束。
 - 常规协作省略执行 timeout，先由发起 agent 复核再决定介入或取消。Hermes/OMP 模型工具拒绝 timeout（包括旧缓存参数）；这不是 shell 权限边界。CLI `start --timeout SECONDS|none` 与 Python `start(timeout=...)` 保留非常规显式硬预算能力：旧值不自动清除，仍作用于 SDK timeoutMs、runner T+90 取消及 Hermes 存量轮 terminal T+180，不是提醒或精确总墙钟/费用上限。无预算轮等待 prompt 接受最多 120s，超出请求取消并保留 unknown/占用；连接与控制限时不变。
 - native 不设硬执行 timeout。Swarm／Teamwork 正常请求依公开 end_turn、完整 load、无活动工具／待答问题和当前结果，再精确 unload 与负向读回，不要求逐成员 add/kill。Teamwork 委派 RPC completed 不是业务完成；异步问题及修改沿同 owner 的 dialogue，带 expected_turn／稳定 command_id／问题原 question_id。取消只转达一次 native cancel，停止未证如实 unknown、不重放／强杀；不把旧 cleanup 样本当新薄桥证明。详见[模式合同](../skill/references/agy-models.md)和[验收索引](../VERIFICATION.md#current-acceptance-index)。
-- 公共 runner 在原单循环每 600s 至多发一条协调者复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 stage + quiet_notice，附 notice_kind（quiet/checkpoint）、elapsed、turn、seq；原生输出另含 task_id。最近公开状态供发起 agent 核查，不能凭活跃/静默判成败或卡死。提醒不自动 cancel/close/resume，不要求逐条发给用户；OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
+- 面向用户的汇报严格由事件与实质进展驱动（产物、已验证结论、阻塞、待答问题、风险、带明确建议的重大取舍），**绝不按固定时间间隔刷消息**；授权内常规可逆工程选择由协调者自主处理，明显挤占主线或重大取舍带明确建议升级用户。公共 runner 在原单循环每 600s 至多发一条 `quiet_notice` 复核请求，即使持续活跃也会触发；静默与活跃检查点共享冷却，取消/结算后不再提醒。事件沿用 `stage + quiet_notice`，附 `notice_kind`（`quiet`/`checkpoint`）、`elapsed`、`turn`、`seq`（**本版本源码** Slice A 经共享 `events.ReviewTracker` 另附脱敏 `review_facts`，含 `progress_state`: `substantive_progress`/`tool_churn_only`/`quiet` 及 `substantive_count_since_review`/`tool_count_since_review`/`failed_tool_count_since_review`/`substantive_idle_seconds`/`last_stage`）；原生输出另含 `task_id`。触发复核时协调者**必须**核查精确 `task/turn/seq`、`review_facts.progress_state`（显式识破只忙工具无实质推进的 `tool_churn_only`）与真实产物，再明确作出“继续等待 / 自主可逆纠偏或介入 / 带建议升级”判断，绝不自动 cancel/close/resume，也不必逐条转给用户；Hermes 机器轮仅在确认消费且无新增义务后才精确回复 `[SILENT]`。OMP followUp 入队、Hermes heartbeat 唤醒均不等于已消费，通用 CLI 必须持续 wait/events，owner 消失时不保证介入或终止。
 - 匹配的权威终态界定本轮输入：先按接收顺序消费其前全部有限帧（含答案／问题），再有界等待本地传输退出（默认 2s），不以清理计时丢弃业务尾帧，也不无限等待 EOF。超界保守记 unknown、保留诊断与占用；只终止本轮直接创建的本地传输子进程，不杀进程组／后代／共享 queue owner，也不把本地清理当远端取消成功。
 - `--skill MODE=PATH`、`--target-skill MODE=PATH` 或 `--skills-json ARRAY` 在 start 选择 required/optional/reference 技能；Hermes 用同一 `skills` 数组。选择、本地优先发现、固定版本、目标文件读取和逐轮 `CALLCLI_SKILL` 回执见[技能传递](../skill/references/skill-passing.md)。缺 required 回执仅标未验证，不降低已有效完成的业务状态。
 
@@ -45,7 +46,7 @@ python3 /absolute/call-cli/collab.py --db /absolute/private/tasks.sqlite3 \
 
 保存返回的 `after`，下一次接续它。观察状态、轮次与公开事件：
 
-runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标相同；截尾或重新接入后用 `events(after=seq)` 补读，按任务、轮次与 event ID 去重，不把重复宿主回执当成新派工。重要 stage、answer、question 与终态仍通知；started/version/model/permissions 只入库。工具仅保留安全 ID/name/category/status，同一工具重复状态不再产出事件；每轮最多通知 12 条普通工具状态，失败不受此上限，全部变化仍可 events 查询。不是逐 token 通知或 exactly-once 宿主投递承诺。
+runner 通知携带 `task_id/turn/event_id/seq`，`seq` 与持久事件表游标相同；截尾或重新接入后用 `events(after=seq)` 补读，按任务、轮次与 event ID 去重，不把重复宿主回执当成新派工。重要 `stage`、`answer`、`question` 与终态仍保持事件记录；`started/version/model/permissions` 只入库。在**本版本源码**（Slice A `events.classify_event_delivery` + `ROUTINE_DIAGNOSTIC_REASONS`）中，SQLite `Store.events` 仍保持 100% 原始持久化，而 `runner.py:publish()` 实时 stdout（附 `delivery_class`: `action_required`/`milestone`/`review_checkpoint`/`terminal`/`activity`）与 `omp-extension.mjs` 会静默常规诊断面包屑、流式中间 `answer` 帧（终态 `settled` 仍保留 `answer_tail`）与连续重复非 `quiet_notice` `stage`，同时照常投递异常诊断、`question`/`permission`、`quiet_notice` 与终态。工具仅保留安全 ID/name/category/status，同一工具重复状态不再产出事件；每轮最多通知 12 条普通工具状态，失败不受此上限，全部变化仍可 `events` 查询。不是逐 token 通知或 exactly-once 宿主投递承诺。
 
 终态通知携带 `question_ids` 和最近 1000 字公开回答 `answer_tail`；有 pending 介入时附带下一步动作。宿主截尾仍可能丢内容，应补读 events，不用占位回答代替读取。宿主/Telegram 的静默消费与真实路由须独立验收，不能据此关闭 issue #1。
 
@@ -207,6 +208,53 @@ Python 传输错误报告 `transport_failed/payload_delivery_failed/transport_ob
 
 Shared Runtime 客户端 shutdown 只是 detach，不是取消执行。恢复既有顺序：先发 terminal，再 detach；不以清理诊断替换已收到的业务结果或增加成功门禁。Python 既有本地退出清理保留 2s 界；超界或非零退出仍可能 unknown/HOLD，但保留原 stopReason 和公开答案，这不是本片新增的结算策略。终态后非零退出仅报告 `prompt_result/post_result_exit_nonzero`，不猜测一定是 shutdown 失败。新增诊断字段非字符串或不在白名单时忽略，仍消费合法 `errorCategory/errorSource`。没有自动重试、重放或释放；创建已尝试却无 record 仍不能当作 never-created。隔离合成验证不等于部署、现场根因或所有 provider 场景通过。
 
+## Hermes 透明 Git/worktree 薄辅助 git_worktree.py（未部署源码候选）
+
+> **状态说明**：本节文档化的 `git_worktree.py` 与配合规则均为**本版本源码**（仅存在于当前候选源码，不表示主仓已合入或现役 `current`/宿主插件已部署生效）。
+
+- **定位与边界**：`git_worktree.py` 为纯 Python 标准库薄原语（无后台 daemon、不写 SQLite，不修改 `bridge.py` 写锁语义及 `call_cli` / `call_cli_omp` 工具 Schema）。不在代码中造“策略选择状态机”；是否采用普通目录（不强行 Git 化，仅授权任务目录确需隔离时按需 `init-repo`）、单仓直写（保护用户既有改动）或**仓外同级** worktree 隔离由协调者/Hermes 依据任务自然判断，通过既有 `cwd` 派发，并保持正常成功链路简洁。
+- **仓外同级隔离与相对目录**：`bridge.py:_check_writers` 检测相等与父子路径重叠，仓内 `.agents/worktrees/*` 会与仓根互锁；因此强制使用**仓外同级目录**，保留 `--subdir`（`target_subdir`）相对偏移到有效 `cwd`。worktree 仅隔离已检出文件，不是权限沙箱，也不继承主仓未提交脏文件或未跟踪文件。
+- **Fail-Closed 与透明告知**：`init-repo` 拒绝 `/`、`$HOME` 及宿主系统根目录或已有 Git 仓；`prepare` 若遇到仓内/仓根/仓父目录、非法 `--subdir`（绝对路径或 `..` 越界或基线缺失）、复用分支不匹配或 Git 失败，直接抛 `WorktreeError`（CLI 返回退出码 `1` 与 stderr JSON `{"error":"WorktreeError","message":...}`），**严禁静默回退写入原工作区**。派工与用户通告写明 **“Git/worktree 由 Hermes 管理”**、`worktree_root`/有效 `cwd`、`branch`、`device`、检出 `HEAD` 基线 `base_commit` 与收敛目标。返工或续作在确认前序停写后通过 `--reuse` 串行复用同一检出。
+
+```sh
+# 0. 可选：在授权的普通任务目录初始化 Git 基线（拒绝 /、$HOME 及系统根目录或已有仓）
+python3 /absolute/call-cli/git_worktree.py init-repo \
+  --dir /absolute/task-dir --branch main
+
+# 1. 创建或串行复用仓外同级 worktree（输出单行 JSON；失败 exit 1 且不回退原工作区）
+python3 /absolute/call-cli/git_worktree.py prepare \
+  --repo /absolute/repo --worktree /absolute/wt-sibling \
+  --branch feat/topic --start-point HEAD --subdir packages/app --device local
+# 返工/续作复用已停写的同一检出：追加 --reuse
+
+# 2. 四态独立交付检查（branch_commits / uncommitted_files / integrated / verified）
+python3 /absolute/call-cli/git_worktree.py inspect \
+  --worktree /absolute/wt-sibling --base-commit BASE_SHA \
+  --target-ref feat/integrated
+# 如已完成实测验证可显式附 --verified；未传 --target-ref 时 integrated 为 null
+
+# 3. 单独收获切片分支中的已修改/未跟踪成果（自动跳过 __pycache__/.pytest_cache/.DS_Store/*.pyc/*.pyo，禁止主工作区）
+python3 /absolute/call-cli/git_worktree.py harvest \
+  --worktree /absolute/wt-sibling --base-commit BASE_SHA --allowed-path packages/app
+
+# 4. 串行收束闭环：harvest -> 保护目标用户改动 -> --no-ff 合入 -> 目标复验 -> 默认非强删清理（或明因保留）
+python3 /absolute/call-cli/git_worktree.py converge \
+  --worktree /absolute/wt-sibling --target-dir /absolute/repo \
+  --base-commit BASE_SHA --verify-cmd "python3 -m unittest ..."
+
+# 5. 非强制安全清理门禁与执行（整合+复验后默认清理，否则返回 retained_with_reason；严禁 --force/-f/-D）
+python3 /absolute/call-cli/git_worktree.py check-cleanup \
+  --worktree /absolute/wt-sibling --target-ref main
+python3 /absolute/call-cli/git_worktree.py cleanup \
+  --worktree /absolute/wt-sibling --target-ref main
+```
+
+- **Python 原语**：`WorktreeError`、`init_task_repo(task_dir, *, branch='main', commit_existing=True, message='chore: init task baseline')`、`prepare_sibling_worktree(repo_root, worktree_dir, *, branch=None, start_point='HEAD', target_subdir='', reuse=False, device='local')`、`inspect_worktree_state(worktree_root, *, base_commit, target_ref=None, verified=False)`、`harvest_worktree_deliverables(worktree_root, *, message=..., allowed_paths=None, base_commit=None)`、`converge_worktree_to_target(worktree_root, *, target_dir, base_commit=None, target_branch=None, harvest_message=None, allowed_paths=None, verify_cmd=None, verified=False, cleanup_on_success=True, delete_branch=True, has_active_writer=False)`、`verify_cleanup_safe(worktree_root, *, target_ref, has_active_writer=False, verified=True)`、`cleanup_worktree(worktree_root, *, target_ref, has_active_writer=False, verified=True, delete_branch=True)`。
+- **收束保护、四态与安全清理**：
+  - `inspect` 返回 `{worktree_root, repo_root, branch, head_commit, base_commit, target_ref, uncommitted_files, clean, branch_commits, integrated, verified}`：严格分开 `uncommitted_files`、`branch_commits`、`integrated` 与 `verified`（绝不从 commit 推定）。
+  - `converge` 在合入前先 `harvest`（过滤未跟踪缓存噪声，校验 `allowed_paths`）；合入前核查 `target_dir` 是否存在 `MERGE_HEAD`、暂存区（staged）改动或与传入文件路径重叠的未提交/未跟踪改动，存在即停手并返回 `disposition: "retained_with_reason"` 与 `escalation_required: true`（**绝不执行 `git stash`/`reset`/`clean`**，无重叠的非冲突用户改动原样保留）。若 `git merge --no-ff` 触发真冲突，**保留冲突现场与 worktree 而不机械执行 `git merge --abort`**（返回 `status: "merge_conflict"`, `merge_in_progress: true`, `conflicted_files`, `recommendation`）。仅在合入并经 `verify_cmd`（或显式 `verified=True`）复验通过且 `cleanup_on_success=True` 时，执行非强删 `git worktree remove` + `git branch -d` 并返回 `status: "converged"`, `disposition: "cleaned"`；其余情况明确返回 `disposition: "retained_with_reason"` 与非空 `retain_reasons`。
+  - `check-cleanup` / `cleanup` 返回 `disposition`（`"ready_to_clean"`/`"cleaned"` vs `"retained_with_reason"`）与 `retain_reasons`，校验无活跃 writer、非主工作区、未锁定、工作区干净、`HEAD` 已合入 `target_ref` 且 `verified=True`，且绝不使用 `--force`/`-f`/`-D`。
+
 ## 回报完成
 
-说明整体目标是否完成、真实结果、所在设备／版本／入口、测试范围、是否已收尾及剩余阻塞。已部署与仅改源码分开，局部 GREEN 与完整交付分开。保留必要的私有验收证据，公开仓库只保存脱敏摘要，不上传原始思维流、会话、认证或用户任务数据。
+说明整体目标是否完成、真实结果、所在设备／版本／入口、测试范围、是否已收尾及剩余阻塞。使用 worktree 隔离时（**本版本源码**），交付区分四态：**分支提交（`branch_commits`）／未提交改动（`uncommitted_files`）／已集成（`integrated`，相对实际整合目标 ref 且工作区干净）／已验证（`verified`，绝不从 commit 推定）**；授权范围内由 Hermes 完成 harvest→用户改动保护→串行整合→目标复验→整合复验后默认清理（或明确说明保留原因）而非甩给用户合并。已部署与仅改源码（及本地隔离集成 vs 主仓合入/`current` 部署）分开，局部 GREEN 与完整交付分开。保留必要的私有验收证据，公开仓库只保存脱敏摘要，不上传原始思维流、会话、认证或用户任务数据。

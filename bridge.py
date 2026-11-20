@@ -191,7 +191,10 @@ class Store:
                      or bool(other.get('native_resume_session_id'))
                      or (other.get('agy_swarm') == 'native'
                          and bool(other.get('native_session_id'))
-                         and not other.get('native_cleanup', {}).get('session_unloaded')))
+                         and not other.get('native_cleanup', {}).get('session_unloaded'))
+                     or (other.get('backend') == 'oar'
+                         and bool(other.get('oar_turn_started'))
+                         and not other.get('oar_cleanup', {}).get('process_exited')))
             )
             if (not other['write'] or other.get('resource_state') in {'released', 'superseded'}
                     or (other['state'] not in {'queued','running','waiting_reply','cancelling','closing','unknown'}
@@ -229,8 +232,17 @@ class Store:
         current = json.loads(db.execute('SELECT data FROM tasks WHERE id=?', (task['id'],)).fetchone()[0])
         if current['state'] == 'closed' or current.get('release_epoch'):
             raise ValueError('Task is permanently fenced')
+        if (('backend' in current or current.get('launch_id') or current['state'] != 'queued')
+                and task.get('backend') != current.get('backend')):
+            raise ValueError('Task backend is immutable once bound')
         if current['turn'] != task['turn']:
             task.pop('close_diagnostic',None)
+        if task.get('backend') == 'oar' and current['turn'] != task['turn']:
+            task['oar_previous_cleanup_verified'] = bool(current.get('oar_cleanup', {}).get('process_exited') is True)
+            task['oar_turn_started'] = False
+            for key in ('oar_cleanup', 'native_input', 'interaction_seq', 'native_interaction_next',
+                        'oar_outside_turn_activity', 'oar_steer_audit'):
+                task.pop(key, None)
         if task.get('agy_swarm') == 'native' and current['turn'] != task['turn']:
             if current.get('native_cleanup', {}).get('session_unloaded') is True:
                 task['native_predecessor_session_id'] = current.get('native_session_id')
@@ -445,7 +457,7 @@ class Store:
             binding = self._native_binding(task)
             if (task.get('release_epoch') or task['state'] != 'running'):
                 raise ValueError('Native dialogue unavailable or fenced; retain HOLD')
-            if (task['agent'] != 'agy' or task.get('agy_swarm') != 'native'
+            if (task['agent'] != 'agy' or (task.get('agy_swarm') != 'native' and task.get('backend') != 'oar')
                     or not task.get('runner_pid') or not binding['launch_id']
                     or not cap.get('accepting') or any(cap.get(k) != v for k,v in binding.items())):
                 raise ValueError('Native dialogue unsupported: no live bound owner input capability')
@@ -676,6 +688,55 @@ class Store:
         receipt = json.loads(row[0]) if row else {}
         if (not receipt or receipt != task.get('native_cleanup') or receipt.get('session_id')!=task.get('native_session_id')
                 or receipt.get('session_unloaded') is not True):
+            return None
+        return receipt
+
+    def oar_cleanup_owner(self, task_id, turn, launch_id, epoch):
+        token = uuid.uuid4().hex
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._native_owned(db, task_id, turn, launch_id, epoch)
+            db.execute('CREATE TABLE IF NOT EXISTS oar_cleanup_receipts (task TEXT, turn INTEGER, launch TEXT, epoch INTEGER, token_hash TEXT, receipt TEXT, PRIMARY KEY(task,turn,launch,epoch))')
+            db.execute('INSERT INTO oar_cleanup_receipts VALUES (?,?,?,?,?,?)',
+                       (task_id, turn, launch_id, epoch, hashlib.sha256(token.encode()).hexdigest(), '{}'))
+        return token
+
+    def oar_cleanup_commit(self, task_id, turn, launch_id, epoch, token, receipt):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            task = self._native_owned(db, task_id, turn, launch_id, epoch)
+            row = db.execute('SELECT token_hash,receipt FROM oar_cleanup_receipts WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                             (task_id, turn, launch_id, epoch)).fetchone()
+            expected_sid = (task.get('oar_session') or {}).get('session_id')
+            if (not row or row['token_hash'] != hashlib.sha256(token.encode()).hexdigest() or row['receipt'] != '{}'
+                    or not expected_sid
+                    or any(receipt.get(k) != v for k, v in dict(task=task_id, turn=turn, launch_id=launch_id, epoch=epoch,
+                                                                 session_id=expected_sid).items())
+                    or receipt.get('process_exited') is not True
+                    or receipt.get('session_closed') is not True
+                    or receipt.get('arbitraryDetachedDescendantsProven') is not False):
+                raise ValueError('OAR cleanup owner evidence mismatch')
+            task['oar_cleanup'] = receipt
+            db.execute('UPDATE oar_cleanup_receipts SET receipt=? WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                       (json.dumps(receipt), task_id, turn, launch_id, epoch))
+            self._save(db, task)
+
+    @staticmethod
+    def oar_cleanup_verified(db, task):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='oar_cleanup_receipts'").fetchone():
+            return None
+        row = db.execute('SELECT receipt FROM oar_cleanup_receipts WHERE task=? AND turn=? AND launch=? AND epoch=?',
+                         (task['id'], task['turn'], task.get('launch_id'), task.get('control_epoch', 1))).fetchone()
+        receipt = json.loads(row[0]) if row else {}
+        expected_sid = (task.get('oar_session') or {}).get('session_id')
+        if (not receipt or receipt != task.get('oar_cleanup') or not expected_sid
+                or receipt.get('session_id') != expected_sid
+                or receipt.get('turn') != task.get('turn')
+                or receipt.get('launch_id') != task.get('launch_id')
+                or receipt.get('epoch') != task.get('control_epoch', 1)
+                or receipt.get('process_exited') is not True
+                or receipt.get('session_closed') is not True
+                or receipt.get('arbitraryDetachedDescendantsProven') is not False):
             return None
         return receipt
 
@@ -986,9 +1047,10 @@ class Store:
                     if task['state'] == 'queued':
                         task.update(state='cancelled', prompt='')
             elif task['state']=='running':task['state']='cancelling'
-            if task.get('agy_swarm')=='native' and task['state']=='cancelling':
+            if (task.get('agy_swarm')=='native' or task.get('backend')=='oar') and task['state']=='cancelling':
                 task.setdefault('native_input', {})['accepting']=False
-                task.setdefault('native_cancel_id',uuid.uuid4().hex)
+                if task.get('agy_swarm')=='native':
+                    task.setdefault('native_cancel_id',uuid.uuid4().hex)
             self._save(db,task)
         return task
 

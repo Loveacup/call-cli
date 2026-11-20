@@ -1,6 +1,29 @@
 """Public ACP event normalization; no raw tool bodies or private reasoning."""
 import re
 
+QUIET_REVIEW_SECONDS = 600
+ROUTINE_DIAGNOSTIC_REASONS = frozenset({
+    'record_observed',
+    'submission_attempted',
+    'acceptance_observed',
+    'result_observed',
+})
+SUPPRESSED_SETUP_KINDS = frozenset({
+    'started',
+    'version',
+    'model',
+    'permissions',
+    'skill_staged',
+    'skill_cleanup',
+})
+TERMINAL_EVENT_KINDS = frozenset({
+    'completed',
+    'waiting_reply',
+    'cancelled',
+    'unknown',
+    'closed',
+})
+
 def safe_tool_name(value):
     # Titles may contain command arguments or paths; retain identifiers only.
     return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.:-]{0,79}', value) else ''
@@ -181,3 +204,191 @@ class EventDecoder:
         self.pending = ''
         self.pending_overflow = False
         return out
+
+
+def is_routine_diagnostic(extra=None):
+    """Return True only for routine lifecycle diagnostics without attention_required."""
+    meta = extra if isinstance(extra, dict) else {}
+    if meta.get('attention_required') is True:
+        return False
+    return meta.get('reason_code') in ROUTINE_DIAGNOSTIC_REASONS
+
+
+def classify_event_delivery(kind, text='', *, extra=None, last_stage=None, tool_notices=0):
+    """Decide whether a persisted event should emit live stdout or stay SQLite-only."""
+    meta = extra if isinstance(extra, dict) else {}
+    next_last_stage = last_stage
+    next_tool_notices = tool_notices
+
+    if kind in TERMINAL_EVENT_KINDS:
+        return dict(deliver=True, tier='terminal', reason='terminal_settlement',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if meta.get('attention_required') is True:
+        return dict(deliver=True, tier='attention', reason='attention_required',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind in {'question', 'permission'}:
+        return dict(deliver=True, tier='attention', reason=kind,
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind in SUPPRESSED_SETUP_KINDS:
+        return dict(deliver=False, tier='store_only', reason='routine_setup',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind == 'diagnostic':
+        if is_routine_diagnostic(meta):
+            return dict(deliver=False, tier='store_only', reason='routine_diagnostic',
+                        next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+        return dict(deliver=True, tier='attention', reason='non_routine_diagnostic',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind == 'skill':
+        return dict(deliver=False, tier='store_only', reason='routine_skill',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind == 'answer':
+        return dict(deliver=False, tier='store_only', reason='intermediate_answer',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    if kind == 'stage':
+        if meta.get('quiet_notice') is True:
+            return dict(deliver=True, tier='attention', reason='review_notice',
+                        next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+        if last_stage is not None and text == last_stage:
+            return dict(deliver=False, tier='store_only', reason='repeated_stage',
+                        next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+        return dict(deliver=True, tier='substantive', reason='stage_change',
+                    next_last_stage=text, next_tool_notices=next_tool_notices)
+    if kind == 'tool':
+        next_tool_notices = tool_notices + 1
+        if isinstance(text, str) and text.endswith(' failed'):
+            return dict(deliver=True, tier='attention', reason='tool_failed',
+                        next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+        if next_tool_notices > 12:
+            return dict(deliver=False, tier='store_only', reason='tool_cap',
+                        next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+        return dict(deliver=True, tier='tool', reason='tool_status',
+                    next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+    return dict(deliver=True, tier='substantive', reason='other',
+                next_last_stage=next_last_stage, next_tool_notices=next_tool_notices)
+
+
+class ReviewTracker:
+    """Track 600s review cooldown while separating substantive progress from tool churn."""
+
+    def __init__(self, started_at, *, interval=QUIET_REVIEW_SECONDS):
+        self.started_at = started_at
+        self.interval = interval
+        self.last_notice = started_at
+        self.last_visible = started_at
+        self.last_substantive_at = started_at
+        self.last_stage = None
+        self.last_summary = 'No stage or tool status observed.'
+        self.substantive_since_notice = False
+        self.tool_events_since_substantive = 0
+        self.tool_events_since_notice = 0
+
+    def record_visible(self, now, *, summary=None):
+        """Record visible non-substantive activity with an explicit monotonic timestamp."""
+        self.last_visible = now
+        if isinstance(summary, str) and summary.strip():
+            self.last_summary = summary[:500]
+
+    def record_event(self, kind, text, now, *, extra=None):
+        """Record an emitted event, distinguishing substantive changes from tool churn."""
+        meta = extra if isinstance(extra, dict) else {}
+        if kind in SUPPRESSED_SETUP_KINDS:
+            return
+        if kind == 'diagnostic' and is_routine_diagnostic(meta):
+            return
+        if kind == 'stage' and meta.get('quiet_notice') is True:
+            return
+        self.last_visible = now
+        if kind == 'stage':
+            if isinstance(text, str) and text:
+                self.last_summary = text[:500]
+            if text != self.last_stage:
+                self.last_stage = text
+                self.last_substantive_at = now
+                self.substantive_since_notice = True
+                self.tool_events_since_substantive = 0
+        elif kind in {'question', 'permission'}:
+            if isinstance(text, str) and text:
+                self.last_summary = text[:500]
+            self.last_substantive_at = now
+            self.substantive_since_notice = True
+            self.tool_events_since_substantive = 0
+        elif kind == 'answer':
+            if isinstance(text, str) and text.strip():
+                self.last_substantive_at = now
+                self.substantive_since_notice = True
+                self.tool_events_since_substantive = 0
+        elif kind == 'tool':
+            if isinstance(text, str) and text:
+                self.last_summary = text[:500]
+            self.tool_events_since_substantive += 1
+            self.tool_events_since_notice += 1
+
+    def is_due(self, now):
+        return (now - self.last_notice) >= self.interval
+
+    def inspect(self, now):
+        elapsed = int(now - self.started_at)
+        quiet_seconds = int(now - self.last_visible)
+        since_substantive_seconds = int(now - self.last_substantive_at)
+        is_quiet = (now - self.last_visible) >= self.interval
+        tool_churn_only = (
+            (not is_quiet)
+            and ((now - self.last_substantive_at) >= self.interval)
+            and (self.tool_events_since_substantive > 0)
+        )
+        substantive_progress = (
+            (not is_quiet)
+            and ((now - self.last_substantive_at) < self.interval)
+            and self.substantive_since_notice
+        )
+        notice_kind = 'quiet' if is_quiet else ('tool_churn_only' if tool_churn_only else 'checkpoint')
+        return dict(
+            elapsed=elapsed,
+            quiet_seconds=quiet_seconds,
+            since_substantive_seconds=since_substantive_seconds,
+            is_quiet=is_quiet,
+            tool_churn_only=tool_churn_only,
+            substantive_progress=substantive_progress,
+            notice_kind=notice_kind,
+            last_stage=self.last_stage,
+        )
+
+    def build_notice(self, now):
+        """Construct the 600s review stage payload and advance the cooldown."""
+        state = self.inspect(now)
+        self.last_notice = now
+        self.substantive_since_notice = False
+        self.tool_events_since_notice = 0
+        notice_kind = state['notice_kind']
+        elapsed = state['elapsed']
+        detail = ''
+        if notice_kind == 'tool_churn_only':
+            detail = (
+                f"Tool activity observed without substantive stage or answer change for "
+                f"{state['since_substantive_seconds']}s. "
+            )
+        elif not state['is_quiet'] and not state['substantive_progress'] and state['since_substantive_seconds'] >= self.interval:
+            detail = (
+                f"No substantive stage or answer change observed for "
+                f"{state['since_substantive_seconds']}s. "
+            )
+        text = (
+            f"Coordinator review requested ({notice_kind}); elapsed {elapsed}s. "
+            + detail
+            + 'Inspect this task and its events, then choose to keep waiting, explicitly intervene, or cancel. '
+            + 'Activity or silence alone does not establish success or a hang. '
+            + 'No cancellation or closure requested. Last visible status: '
+            + self.last_summary
+        )
+        return dict(
+            text=text,
+            metadata=dict(
+                notice_kind=notice_kind,
+                elapsed=elapsed,
+                quiet_seconds=state['quiet_seconds'],
+                since_substantive_seconds=state['since_substantive_seconds'],
+                last_stage=state['last_stage'],
+                tool_churn_only=state['tool_churn_only'],
+                substantive_progress=state['substantive_progress'],
+            ),
+        )

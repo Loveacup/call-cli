@@ -40,3 +40,22 @@ class NavigationProtocolTests(unittest.TestCase):
                     self.assertEqual(status['state'],'completed')
                     self.assertIn('all checks passed',status['native_result']['result'])
                     self.assertEqual(c.close(client,task['id'])['state'],'closed')
+        with patch.dict(os.environ,CALLCLI_TEST_BOARD_TEXT=NAV+'\nWorkers still running on board.',
+                        CALLCLI_TEST_DIALOGUE_TEXT=NAV+'\nRequested analysis: all checks passed.'):
+            with self.workspace('board-working') as (root,c,client,task,thread):
+                deadline=time.monotonic()+4
+                while not any(e['kind']=='answer' for e in c.events(client,task['id'])):
+                    if time.monotonic()>deadline: self.fail('navigation progress not published')
+                    time.sleep(.01)
+                time.sleep(.2)
+                status=c.status(client,task['id'])
+                self.assertEqual(status['state'],'running')
+                self.assertTrue(thread.is_alive())
+                self.assertNotIn('native_cleanup',status)
+                c.dialogue(client,task['id'],'deliver verified result',expected_turn=1,command_id='nav-mixed-final')
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+                final=c.status(client,task['id'])
+                self.assertEqual(final['state'],'completed')
+                self.assertIn('all checks passed',final['native_result']['result'])
+                self.assertEqual(c.close(client,task['id'])['state'],'closed')
