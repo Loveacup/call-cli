@@ -177,7 +177,7 @@ See [`docs/integrations.md`](docs/integrations.md) (简体中文) for entry-spec
 
 We're preparing to move the **execution layer** toward [Open Agent Runtime (OAR)](https://github.com/botiverse/oar). The goal is to see what an agent is doing while it runs and, where the target runtime supports it, change course without cancelling and restarting the turn. The initiating agent (such as Hermes) still owns the task, the conversation it returns to, and final review.
 
-**Today:** OAR is an experimental opt-in (`--backend oar`) for **new local single-agent AGY tasks only**. Existing defaults, including ACPX-backed routes, and native AGY Swarm are unchanged. See [usage (简体中文)](docs/usage.md) for prerequisites and scope.
+**Today:** OAR is experimental. Opt in through `collab.py start --backend oar` for **new local single-agent AGY tasks only**; the Hermes and OMP host tools do not expose this switch. Existing defaults, including ACPX-backed routes, and native AGY Swarm are unchanged. See [usage (简体中文)](docs/usage.md) for prerequisites and scope.
 
 <a id="evidence-and-boundaries"></a>
 ## Evidence layers & verification boundaries

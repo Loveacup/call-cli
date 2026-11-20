@@ -176,7 +176,7 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
 
 我们正准备把**执行底座**转向 [Open Agent Runtime（OAR）](https://github.com/botiverse/oar)。目标是让协调者更清楚地看到执行中的活动，并在执行端支持时直接调整方向，不必取消后再接续。任务归属、回到哪个会话以及最终验收，仍由 Hermes 等发起端负责。
 
-**目前**：OAR 是实验性选项，需显式指定 `--backend oar`，**仅用于新建的本机 AGY 单代理任务**。包括 ACPX 在内的现有默认路径和 AGY 原生 Swarm 不变。前置条件和适用范围见[使用指南](docs/usage.md)。
+**目前**：OAR 仍处于实验阶段。可通过 `collab.py start --backend oar` 显式选用，**仅用于新建的本机 AGY 单代理任务**；Hermes 和 OMP 的宿主工具暂不提供这个开关。包括 ACPX 在内的现有默认路径和 AGY 原生 Swarm 不变。前置条件和适用范围见[使用指南](docs/usage.md)。
 
 <a id="证据与边界"></a>
 <a id="evidence-and-boundaries"></a>
