@@ -6,16 +6,16 @@
 
 <a href="README.md"><strong>English</strong></a> · <a href="README.zh-CN.md">简体中文</a>
 
-<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/transport-ACPX%200.22%2B-49c5b6?style=flat-square&amp;labelColor=161b22" alt="Powered by ACPX Shared Runtime"></a>
+<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/shared%20runtime-ACPX-49c5b6?style=flat-square&amp;labelColor=161b22" alt="ACPX shared runtime"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8cbaff?style=flat-square&amp;labelColor=161b22" alt="MIT license"></a>
 
-[Quick start](#quick-start) · [Choose your entry](#choose-your-entry) · [Core capabilities](#capabilities) · [Architecture & lifecycle](#how-it-works) · [Evidence & boundaries](#evidence-and-boundaries) · [Documentation](#documentation)
+[Quick start](#quick-start) · [Choose your entry](#choose-your-entry) · [Core capabilities](#capabilities) · [Architecture & lifecycle](#how-it-works) · [OAR roadmap](#oar-roadmap) · [Evidence & boundaries](#evidence-and-boundaries) · [Documentation](#documentation)
 
 </div>
 
 ---
 
-Call CLI is a lightweight POSIX coordination bridge connecting **OMP, Codex, Pi and AGY** (with optional Hermes host integration), **locally or over existing SSH connections**. The **initiating CLI coordinates** fresh target sessions, receives **progress, numbered questions and results back in the originating session**, sends **mid-run adjustments** (`dialogue` or explicit `cancel+resume` `intervene`) in flight, and runs **independent acceptance and cleanup (`close`)**—while letting each target CLI exercise **native autonomy internally without a second task platform or always-on daemon**.
+Call CLI is a lightweight POSIX bridge for delegating work to **OMP, Codex, Pi and AGY**, locally or over existing SSH connections, with optional **Hermes** integration. The initiating agent follows progress, answers questions and reviews results **in the conversation that started the task**. Each target CLI runs its own session and manages its own internal collaboration.
 
 **What it is not:** No mandatory Hermes dependency, always-on daemon or scheduler. No hot `steer` disguised as lossless editing. No takeover of manually opened terminal, TUI or desktop GUI sessions. Initiators are **OMP, Codex, Pi and Hermes**; **AGY is execution-only**.
 
@@ -171,6 +171,13 @@ See [`docs/integrations.md`](docs/integrations.md) (简体中文) for entry-spec
 *Conceptual lifecycle diagram (not a live screenshot): [open full-resolution lifecycle diagram](docs/assets/call-cli-lifecycle.png) on mobile to zoom.*
 
 **Control semantics:** Public ACPX 0.22.0 rejects in-turn `steer`, and `queue` waits rather than redirecting mid-flight. Call CLI `intervene` therefore performs explicit **cancel-and-resume** (`command_id`), while `dialogue` queues serial follow-ups on active AGY native owners without cancelling the session.
+
+<a id="oar-roadmap"></a>
+## OAR roadmap
+
+We're preparing to move the **execution layer** toward [Open Agent Runtime (OAR)](https://github.com/botiverse/oar). The goal is to see what an agent is doing while it runs and, where the target runtime supports it, change course without cancelling and restarting the turn. The initiating agent (such as Hermes) still owns the task, the conversation it returns to, and final review.
+
+**Today:** OAR is an experimental opt-in (`--backend oar`) for **new local single-agent AGY tasks only**. Existing defaults, including ACPX-backed routes, and native AGY Swarm are unchanged. See [usage (简体中文)](docs/usage.md) for prerequisites and scope.
 
 <a id="evidence-and-boundaries"></a>
 ## Evidence layers & verification boundaries

@@ -6,16 +6,16 @@
 
 <a href="README.md">English</a> · <a href="README.zh-CN.md"><strong>简体中文</strong></a>
 
-<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/transport-ACPX%200.22%2B-49c5b6?style=flat-square&amp;labelColor=161b22" alt="基于 ACPX Shared Runtime"></a>
+<a href="https://github.com/openclaw/acpx"><img src="https://img.shields.io/badge/shared%20runtime-ACPX-49c5b6?style=flat-square&amp;labelColor=161b22" alt="ACPX 共享运行时"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8cbaff?style=flat-square&amp;labelColor=161b22" alt="MIT 许可证"></a>
 
-[快速开始](#快速开始) · [选择接入方式](#选择接入方式) · [核心能力](#核心能力) · [架构与协作周期](#工作原理) · [证据分层与边界](#证据与边界) · [文档导览](#文档)
+[快速开始](#快速开始) · [选择接入方式](#选择接入方式) · [核心能力](#核心能力) · [架构与协作周期](#工作原理) · [OAR 路线](#oar-roadmap) · [证据分层与边界](#证据与边界) · [文档导览](#文档)
 
 </div>
 
 ---
 
-Call CLI 是连接 **OMP、Codex、Pi 与 AGY**（可选集成 Hermes 宿主）的轻量级 POSIX 协作桥，**支持本机协作或复用现有 SSH 连接跨设备运行**。**发起端 CLI 负责统筹**新建目标会话，在**原会话持续接收进展、编号提问与结果回流**，执行期发送**动态调整**（`dialogue` 或显式 `cancel+resume` 的 `intervene`），并在完成后做**独立验收与收尾清理（`close`）**；同时让各目标 CLI 在内部保持**原生自治，不另造第二套任务平台或常驻后台服务**。
+Call CLI 是一座轻量的 POSIX 协作桥，让你把任务交给 **OMP、Codex、Pi 或 AGY**，在本机或通过已有 SSH 连接运行，也可接入 **Hermes**。发起端在**最初发起任务的会话**里跟进进度、回答问题并验收结果。执行端各自运行自己的会话，内部协作仍由各 CLI 原生管理。
 
 **明确边界（不做什么）：** 不强制依赖 Hermes，不新增常驻后台服务或调度器，不把 `cancel+resume` 包装成热插 `steer`，也不接管手动打开的终端、TUI 或桌面 GUI 会话。发起端为 **OMP、Codex、Pi 与 Hermes**；**AGY 仅作执行端**。
 
@@ -170,6 +170,13 @@ AFTER="$(printf '%s' "$WAIT_JSON" | python3 -c 'import json,sys; print(json.load
 *概念生命周期图（非实时运行截图）：手机端可[打开高清协作生命周期图](docs/assets/call-cli-lifecycle.png)缩放查看。*
 
 **控制语义：** 公开 ACPX 0.22.0 拒绝执行期 `steer`，`queue` 只排队不中断改向。因此 `intervene` 使用显式**取消并续轮（cancel-and-resume）**（`command_id`），而 `dialogue` 在不取消活跃 AGY 原生会话的前提下将同轮输入串行排队发送。
+
+<a id="oar-roadmap"></a>
+## OAR 路线
+
+我们正准备把**执行底座**转向 [Open Agent Runtime（OAR）](https://github.com/botiverse/oar)。目标是让协调者更清楚地看到执行中的活动，并在执行端支持时直接调整方向，不必取消后再接续。任务归属、回到哪个会话以及最终验收，仍由 Hermes 等发起端负责。
+
+**目前**：OAR 是实验性选项，需显式指定 `--backend oar`，**仅用于新建的本机 AGY 单代理任务**。包括 ACPX 在内的现有默认路径和 AGY 原生 Swarm 不变。前置条件和适用范围见[使用指南](docs/usage.md)。
 
 <a id="证据与边界"></a>
 <a id="evidence-and-boundaries"></a>
