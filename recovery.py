@@ -13,7 +13,7 @@ _ALLOWED_RECEIPT_STATES = frozenset({
     'released', 'unknown', 'not_prepared',
 })
 _ALLOWED_RECEIPT_OPERATIONS = frozenset({
-    'release-only', 'release_only', 'explicit-abandonment',
+    'release-only', 'release_only', 'explicit-abandonment', 'unlaunched-queue-retirement',
     'preprompt-failure', 'native-recovery', 'close', 'reconcile',
     'probe', 'resolve',
 })

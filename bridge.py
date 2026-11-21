@@ -165,6 +165,10 @@ class Store:
                     resource=resource, state='queued', turn=1, process_id='', question_id='', questions=[], answers={},
                     controller=dataclasses.asdict(origin), control_epoch=1, initiating_surface=surface,
                     group=group, origin_context=context)
+        if surface == 'standalone':
+            # Persist the pre-launch facts in the first commit, not in a later
+            # preparation transaction that an interrupted caller may never reach.
+            data.update(needs_session=True, acpx_created=False, session_creation_attempted=False)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             self._check_writers(db, data)

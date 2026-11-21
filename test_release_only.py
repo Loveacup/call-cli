@@ -11,6 +11,83 @@ class ReleaseOnlyTests(unittest.TestCase):
     start = fixtures.EndedOwnerTests.start
     action = fixtures.EndedOwnerTests.action
 
+    def queued_standalone(self):
+        owner = self.mod.Origin('standalone', 'private-client', 'private-client', 'hermes')
+        task = self.store.create(owner, 'local', 'omp', str(self.root), 'private-prompt', False,
+                                 initiating_surface='standalone')
+        return self.store.update(task['id'], needs_session=True, acpx_created=False,
+                                 session_creation_attempted=False)
+
+    def test_force_retires_never_launched_standalone_without_owner_or_backend(self):
+        task = self.queued_standalone()
+        with self.assertRaises(ValueError):
+            self.action('release_only', task, expected_turn=1)
+        release = importlib.import_module('callcli_plugin.release')
+        with patch.object(release, 'NativeBackend') as backend:
+            result = self.action('release_only', task, expected_turn=1, abandon=True)
+            self.assertEqual(result, self.action('release_only', task, expected_turn=1, abandon=True))
+            backend.assert_not_called()
+        recovery = self.action('recovery_status', task)['resource_recovery']
+        self.assertEqual(recovery['business_state'], 'cancelled')
+        self.assertEqual(recovery['resource_state'], 'released')
+        self.assertEqual(recovery['receipt']['operation'], 'unlaunched-queue-retirement')
+        self.assertFalse(recovery['receipt']['external_close_attempted'])
+        self.assertNotIn('private-client', repr(result))
+        self.assertNotIn('private-prompt', repr(result))
+        self.assertNotIn(str(self.root), repr(result))
+        self.assertEqual(self.store.get(task['id'])['origin'], task['origin'])
+        with self.assertRaises(ValueError):
+            self.store.claim_launch(task['id'], 1)
+
+    def test_force_never_retires_a_claimed_or_unproven_queue(self):
+        for fields in ({'process_id': 'attempt'}, {'write': True},
+                       {'session_creation_attempted': True}, {'turn': 2}, {'device': 'remote'}):
+            with self.subTest(fields=fields):
+                task = self.queued_standalone()
+                before = self.store.update(task['id'], **fields)
+                with self.assertRaises(ValueError):
+                    self.action('release_only', task, expected_turn=before['turn'], abandon=True)
+                self.assertEqual(self.store.get(task['id']), before)
+        task = self.queued_standalone()
+        self.store.event(task['id'], 'started', 'started', 'claimed externally')
+        with self.assertRaises(ValueError):
+            self.action('release_only', task, expected_turn=1, abandon=True)
+        with self.assertRaises(ValueError):
+            self.action('release_only', self.queued_standalone(), expected_turn=2, abandon=True)
+
+    def test_standalone_exit_after_first_commit_leaves_a_retirable_task(self):
+        from collab import Collaboration
+        facade = Collaboration(db=self.store.path)
+        client = facade.connect('hermes')['client_id']
+        create = facade.store.create
+        def exit_after_create(*args, **kwargs):
+            create(*args, **kwargs)
+            raise InterruptedError('standalone caller exited after first commit')
+        with patch.object(facade.store, 'create', side_effect=exit_after_create):
+            with self.assertRaises(InterruptedError):
+                facade.start(client, agent='omp', cwd=str(self.root), prompt='unlaunched')
+        task, = facade.list(client)
+        result = self.action('release_only', task, expected_turn=1, abandon=True)
+        self.assertEqual(result['resource_recovery']['business_state'], 'cancelled')
+        self.assertEqual(result['resource_recovery']['resource_state'], 'released')
+
+    def test_launch_claim_wins_before_dispatch_even_without_a_process(self):
+        task = self.queued_standalone()
+        claimed = self.store.claim_launch(task['id'], 1)
+        with self.assertRaises(ValueError):
+            self.action('release_only', task, expected_turn=1, abandon=True)
+        self.assertEqual(self.store.get(task['id']), claimed)
+
+    def test_queue_retirement_requires_trusted_host(self):
+        from collab import Collaboration
+        facade = Collaboration(db=self.store.path)
+        client = facade.connect('hermes')['client_id']
+        with patch.object(facade, '_dispatch'):
+            task = facade.start(client, agent='omp', cwd=str(self.root), prompt='unlaunched')
+        with self.assertRaises(ValueError):
+            facade.release_only(client, task['id'], expected_turn=1, abandon=True)
+        self.assertEqual(facade.status(client, task['id']), task)
+
     def test_explicit_unknown_release_closes_once_without_business_success(self):
         task = self.start(write=True)
         self.store.update(task['id'], state='unknown', runner_pid=0,

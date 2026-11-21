@@ -332,7 +332,7 @@ class Release:
         return receipt
 
 
-def release_resources(db, task, *, source, actor):
+def release_resources(db, task, *, source, actor, risk=None):
     """Release coordination ownership only; preserve business/native observations."""
     Release.install(db)
     row = db.execute('SELECT receipt FROM release_fences WHERE task=?', (task['id'],)).fetchone()
@@ -350,7 +350,7 @@ def release_resources(db, task, *, source, actor):
         business_state=task['state'], resource_state='released', released_at=time.time(),
         external_close_attempted=any(a.get('operation') == 'close' for a in previous.get('attempts', [])),
         arbitraryDetachedDescendantsProven=False,
-        risk='Native session or detached work may still be active; release is not stop or business success')
+        risk=risk or 'Native session or detached work may still be active; release is not stop or business success')
     if not row:
         db.execute('INSERT INTO release_fences VALUES (?,?,?,?)',
                    (task['id'], task['release_epoch'], json.dumps(task), canonical(receipt)))
@@ -363,6 +363,30 @@ def check_release_task(task):
         raise ValueError('Release-only requires unknown/HOLD; active writers must settle first')
     if not _runner_inactive(task):
         raise ValueError('Runner activity unverified or still active; retain reservation')
+
+
+def _retire_unlaunched_queue(db, task, origin):
+    """A never-admitted first turn can be retired without touching any runner."""
+    if (origin.profile in {'standalone', 'omp-extension'}
+            or task.get('initiating_surface') != 'standalone'
+            or task.get('origin', {}).get('profile') != 'standalone'
+            or task.get('controller') != task.get('origin')
+            or task.get('device') != 'local' or task.get('write') is not False
+            or task['turn'] != 1 or task.get('control_epoch') != 1
+            or task.get('needs_session') is not True or task.get('acpx_created') is not False
+            or task.get('session_creation_attempted') is not False
+            or task.get('resource_state') not in (None, 'queued')
+            or any(task.get(key) for key in (
+                'launch_turn', 'launch_id', 'process_id', 'runner_pid', 'acpx_record_id',
+                'acpx_session_id', 'native_session_id', 'native_resume_session_id',
+                'backend_request_id', 'intervention', 'commands', 'questions', 'answers',
+                'skills', 'release_epoch'))
+            or db.execute('SELECT 1 FROM events WHERE task=? LIMIT 1', (task['id'],)).fetchone()):
+        raise ValueError('Queued task is not proven never launched; retain it for its owner')
+    from dataclasses import asdict
+    task.update(state='cancelled', prompt='')
+    return release_resources(db, task, source='unlaunched-queue-retirement', actor=asdict(origin),
+                             risk='Cancelled before launch; no backend action or business success')
 
 
 def release_only_task(store, origin, task_id, expected_turn, *, backend=None, abandon=False):
@@ -538,7 +562,14 @@ def recover_native(store, origin, task_id, expected_turn, operation, backend=Non
             row = (db.execute('SELECT receipt FROM release_fences WHERE task=?', (task_id,)).fetchone()
                 if db.execute("SELECT 1 FROM sqlite_master WHERE name='release_fences'").fetchone() else None)
             if row and json.loads(row[0]).get('state') == 'released':
-                return json.loads(row[0])
+                receipt = json.loads(row[0])
+                if (receipt.get('operation') == 'unlaunched-queue-retirement'
+                        and origin.profile in {'standalone', 'omp-extension'}):
+                    raise PermissionError('Queue retirement requires the trusted Hermes host')
+                return receipt
+            # The same SQLite writer lock serializes this with claim_launch.
+            if current['state'] == 'queued' and abandon:
+                return _retire_unlaunched_queue(db, current, origin)
             check_release_task(current)
             if current.get('native_owner_exit', {}).get('kind') == 'stdio-closed-exit-unverified' and not abandon:
                 return dict(state='unknown', phase='hold', stage='runner', reason_code='native_exit_unverified',

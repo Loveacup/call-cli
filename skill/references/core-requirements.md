@@ -119,6 +119,8 @@ Native local exact-record close/reconcile reuses the P2 durable fence. Recovery 
 
 ### 写占用恢复合同
 
+未启动队列与运行资源分开：受信 Hermes 入口显式 `release_only`（`abandon: true` + 实读轮次）可定点取消从未认领的本地只读 standalone 首轮。必须无进程、会话、执行事件或待执行命令；取消与启动认领由同一事务锁串行。成功保留原归属，登记 `cancelled` / `released` 与 `unlaunched-queue-retirement`，不启动、关闭或接管执行端，仅返回脱敏回执。不开放给 standalone 或 OMP 调用者，不放宽任何活跃 writer 的释放门槛。
+
 `resource_state` 与业务状态独立。真实活跃 writer 必须互斥：queued/running/cancelling 或 runner 仍存活时拒绝释放。AGY native 的准备失败仅在 fresh 独占创建、空历史、已证无 prompt、精确 unload 且 owner 已退出全部成立时自动围栏释放资源，保留 unknown 业务诊断；reused／创建不明仍 HOLD，不证明所有后代停止。ACPX 准备失败本候选未增加自动关闭／释放，仍通过显式严格 release_only 恢复，严格证明不可得时再显式 abandon。
 
 当前真实授权调用者可针对精确旧任务显式 `release_only`，不伪造身份、不转移 owner/controller、不派发业务：同 profile 的当前 Hermes 宿主可跨旧 route/session 或本地 standalone/OMP 来源释放；设备本地 CLI capability 或真实 OMP 宿主 capability 可释放旧任务。审计实际 actor，原始来源和 controller 不变。严格路径仅适用于已结算非 native、本地 exact record：持久 SQL fence 阻止迟到写入，至多一次外部 close，严格核验 closed-record/request/no-session；已有不确定尝试只 probe，失败保持 HOLD，不自动降级。**本版本源码；不自动释放既有任务锁**：恢复卡片与严格 `release_only` 共用同一非活跃与失终态结算判定——runner 仅在 `runner_pid` 缺失/整 `0` 或 `os.kill(pid, 0)` 抛出 `ProcessLookupError` 时判为非活跃（活跃/畸形/布尔/负数/`PermissionError` 或不可核验/复用 PID 仍 HOLD，死 PID 本身不证明后端已结算）；已结算 `unknown` 须同时满足 runner 非活跃及匹配 `turn`/`backend_request_id`/`launch_id` 的 `turn_settlement.protocol_settled=True`（畸形或未结算对象不回退旧推断），或本地非 native ACPX exact record 上 `turn_settlement is None` 且整 `exit_code == 0`、`stop_reason in {'end_turn', 'cancelled'}`、已存 `backend_request_id == '<task_id>:<turn>'`（不伪造缺失字段）。满足该共用判据且既有 probe-only fence 尚无 `close` 尝试时，严格 `release_only` 允许执行至多一次严格外部 `close` 并校验 `closed`/request/`no-session` 读回，回执保留 `business_state='unknown'`；后续重试仍仅 probe。

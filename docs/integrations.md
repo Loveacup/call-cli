@@ -130,6 +130,8 @@ All public `close` actions now share `release.close_task`, including same-contro
 
 显式 `release_only` 的严格路径、跨来源授权与可选风险接受式 abandonment 以[权威恢复合同](../skill/references/core-requirements.md#写占用恢复合同)为准；[调用示例](usage.md#旧任务资源恢复)区分两者，严格失败不自动降级。
 
+对从未启动的本地只读 standalone 排队任务，受信 Hermes 入口可用 `release_only`、`abandon: true` 和实读的 `expected_turn` 定点取消。取消和启动认领在同一事务边界互斥；一旦存在认领、会话或执行事件就拒绝。此路径不调用执行端、不接管原任务，只返回 `cancelled` / `released` 的脱敏回执。
+
 Native no-question reply is an explicit data-version compatibility boundary: new tasks store `continuation_version=2` and require a caller-observed `expected_turn` plus stable `command_id`; read status first and retain the same intent fields on retry. Existing tasks without the field or at version 1 keep legacy same-controller requests, without claiming the new stale-intent protection. Question-ID replies remain compatible. Cross-controller continuation always uses observed-turn/command admission. No database rewrite/migration is required or performed; never substitute a fresh server-side latest turn for a stale caller intent.
 
 Task and settlement receipts include a recovery card with exact task/turn/controller/epoch, event cursor, question/command identities, write reservation and device/session/record, but no private DB path or command prompt text. The creating surface is persisted and reused by runner events. Notification return is marked configured, not delivery-verified, for native Hermes; exit interception and successor handoff remain uncovered. The OMP adapter redacts session and agent IDs while preserving its opaque host binding.

@@ -17,7 +17,7 @@ SCHEMA={
     'name':'call_cli',
     'description':'Coordinate OMP, Codex, Pi or AGY via ACPX. Starts a native tracked background task with progress/completion returned to this exact Hermes session/topic. Use task_id for status/events/reply/intervene/cancel/close; never guess the latest session.',
     'parameters':{'type':'object','properties':{
-        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only','recovery_status'], 'description':'list/status/events/recovery_status are strictly read-only. recovery_status: read-only exact-task resource_recovery and closed-set diagnostic projection for current authorized release profile; no business content, paths, routes, or control. intervene: retry with the same command_id after cancellation settles to launch the successor turn. release_only: current authorized caller releases an exact unknown task using observed expected_turn. For a settled local non-native exact record, close at most once and verify strictly; uncertainty retains HOLD. Only abandon=true explicitly releases ownership without stop proof when strict recovery is unavailable or remains HOLD; native/detached work may still be active. No business continuation or success claim'},
+        'action':{'type':'string','enum':['start','list','status','events','reply','dialogue','permission','intervene','cancel','close','reconcile','release_only','recovery_status'], 'description':'list/status/events/recovery_status are strictly read-only. recovery_status: read-only exact-task resource_recovery and closed-set diagnostic projection for current authorized release profile; no business content, paths, routes, or control. intervene: retry with the same command_id after cancellation settles to launch the successor turn. release_only: release an exact unknown task using observed expected_turn, or explicitly retire a proven unlaunched local read-only standalone queue entry with abandon=true. For a settled local non-native exact record, close at most once and verify strictly; uncertainty retains HOLD. For unknown tasks, abandon=true releases ownership without stop proof; native/detached work may still be active. No business continuation or success claim'},
         'task_id':{'type':'string'},
         'permission_id':{'type':'string'},
         'script_sha256':{'type':'string'},
@@ -191,6 +191,8 @@ class Coordinator:
                 from .skills import cleanup
                 cleanup(store,task)
             current = store.release_target(task['id'],origin) if action=='release_only' else store.get(task['id'],origin)
+            if action=='release_only' and receipt.get('operation') == 'unlaunched-queue-retirement':
+                return {'resource_recovery':resource_recovery_projection(current,receipt)}
             return {'task':self.public(current),'receipt':receipt}
         raise ValueError('Unknown action')
 
